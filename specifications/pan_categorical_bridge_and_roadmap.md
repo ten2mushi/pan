@@ -117,7 +117,8 @@ dataflow is the semantic model; ship graph-of-nodes (desktop) + hand-fused multi
 
 ## 3. Testing methodology (keep + extend) and the Yoneda gates
 
-**Keep** the SciPy/NumPy gold-vector oracle (`generate.py` → `vectors/` → `BlockTester`) — it tests
+**Keep** the SciPy/NumPy gold-vector oracle (`generate.py` → `vectors/` → `GoldVectorTester`, pinned
+in [`pan_testing_and_vector_contract.md`](pan_testing_and_vector_contract.md)) — it tests
 intent against an independent mathematical truth (Rule 9). **Extend** with:
 - **Dual-mux testing** — every block under push *and* pull (`PullTestSampleMux`); catches surface
   leaks at the `Map`/`Rate` seam.
@@ -168,7 +169,7 @@ criterion** (Rule 4) strong enough to loop on independently.
 
 | # | Prototype | Proves | Success criterion |
 |---|---|---|---|
-| 1 | **Vertical slice:** CoreAudio sink + LPCM source + a 3-block pure `Map` chain (gain → biquad → pan) on **Tier A + pool mode B**. | The `PullSampleMux` + the callback render path. | Sub-5 ms measured round-trip on M3; zero xruns over 10 min; output bit-matches the SciPy oracle. |
+| 1 | **Vertical slice:** CoreAudio sink + LPCM source + a 3-block pure `Map` chain (gain → biquad → pan) on **Tier A + pool mode B**. | The `PullSampleMux` + the callback render path. | Sub-5 ms measured round-trip on M3; zero xruns over 10 min; output **matches the SciPy oracle within the declared tolerance** (bit-exact for fixed-point) — see [`pan_testing_and_vector_contract.md`](pan_testing_and_vector_contract.md). |
 | 2 | **Format negotiation** (rate/precision/channels/N) + **lock-free control plane** with one ramped parameter. | Negotiation/coercion insertion + RT-safe parameter update. | A wired rate-mismatch auto-inserts a resampler; a parameter sweep is zipper-free; no audio-thread lock. |
 | 3 | **Feedback primitive** (delay → comb reverb). | The `z⁻¹` split, SCC-has-delay validator, persistent buffers. | A delay-free loop is rejected at commit (`error.DelayFreeLoop`); the reverb tail is stable; denormals don't spike CPU (FTZ set). |
 | 4 | **Pool mode C (coloring)** behind the same `getBuffer` interface; **B≡C differential test**. | The colorer is correct and a drop-in optimization. | C output is bit-identical to B across the corpus; pool size = max-live-edges; paranoid mode finds no aliasing. |

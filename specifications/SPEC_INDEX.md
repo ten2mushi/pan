@@ -23,6 +23,18 @@ fork a definition locally; update the catalog and the citing sections together.
    Numeric trait, precision / N / W parameters, and format negotiation.
 5. [pan_io_realtime_and_pipeline.md](pan_io_realtime_and_pipeline.md) — I/O HAL,
    drift / ASRC, the control plane, RT hygiene, and transport.
+5a. [pan_concurrency_and_memory_ordering.md](pan_concurrency_and_memory_ordering.md) —
+   the lock-free control plane pinned to exact Zig 0.16 atomic orderings: the SPSC
+   command ring (`schedule`), atomic scalars (`set`), the RCU plan swap
+   (`edit`→`commit`), and the H1 wait-freedom argument. Detail under catalog §10/§11.
+5b. [pan_commit_pass_algorithms.md](pan_commit_pass_algorithms.md) — the graph-commit
+   pass to pseudocode precision: topo-sort, liveness, per-class interval coloring,
+   SCC-has-delay, PDC longest-path DP, op-list emission, with worked examples and
+   footprint arithmetic. Detail under catalog §7/§8.
+5c. [pan_testing_and_vector_contract.md](pan_testing_and_vector_contract.md) — the
+   gold-vector contract (allclose for float, bit-exact for fixed-point), generate-on-
+   demand vectors, the dual-mux / B≡C / aliasing / latency-contract / state-granularity
+   harnesses, and the Yoneda test-writer plug-in contract. Detail under catalog §4/§7.5/§12.
 6. [pan_categorical_bridge_and_roadmap.md](pan_categorical_bridge_and_roadmap.md) —
    the categorical bridge (load-bearing vs framing), block taxonomy & combinators,
    resolved open questions, and the de-risking prototype plan.

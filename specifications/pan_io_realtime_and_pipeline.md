@@ -114,7 +114,7 @@ can block on):
 - **SPSC command ring** (UI/automation thread → audio thread) drained at each callback boundary, for
   *sequences* (graph edits, MIDI, parameter events).
 - **`atomic<T>`** for individual scalar parameters (lock-free on M3/x86/ARM).
-- **Atomic-pointer / RCU triple-buffer** to publish bulk state — including a newly-compiled **render
+- **Atomic-pointer RCU** to publish bulk state (pinned to exact orderings in [`pan_concurrency_and_memory_ordering.md` §4](pan_concurrency_and_memory_ordering.md): **single-pointer RCU + epoch-based reclamation** for the plan; a triple-buffer is the option for fixed-size parameter snapshots) — including a newly-compiled **render
   op-list** (graph edit, [exec §4.3](pan_execution_model.md)) or a parameter snapshot: build off-thread,
   swap one pointer at a block boundary.
 Every continuous parameter (gain, cutoff) is **per-block smoothed/ramped** across the buffer to avoid

@@ -32,6 +32,19 @@
 > 5. [`pan_categorical_bridge_and_roadmap.md`](pan_categorical_bridge_and_roadmap.md) — mapping to
 >    the categorical spec, block taxonomy & combinators, open questions, prototype plan, success
 >    criteria.
+>
+> **Implementation specs (LOCKED — the sprint-zero layer that pins the above to code):**
+> - [`pan_concurrency_and_memory_ordering.md`](pan_concurrency_and_memory_ordering.md) — the
+>   lock-free control plane at exact Zig 0.16 atomic-ordering precision (SPSC ring, atomic scalars,
+>   RCU plan swap, the H1 wait-freedom argument).
+> - [`pan_commit_pass_algorithms.md`](pan_commit_pass_algorithms.md) — the graph-commit pass to
+>   pseudocode precision (topo / liveness / interval-coloring / SCC-has-delay / PDC) with worked
+>   examples and footprint arithmetic.
+> - [`pan_testing_and_vector_contract.md`](pan_testing_and_vector_contract.md) — the gold-vector
+>   contract, tolerance policy, the dual-mux / B≡C / latency-contract harnesses, and the Yoneda
+>   test-writer plug-in contract.
+>
+> Full index and reading order: [`SPEC_INDEX.md`](SPEC_INDEX.md).
 
 ---
 

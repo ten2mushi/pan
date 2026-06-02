@@ -1,0 +1,13 @@
+{
+  "name": "gain_f32",
+  "block": "Gain",
+  "params": { "gain_db": -6.0 },
+  "format": { "sample_rate": 48000, "precision": "f32", "channels": 1, "block_size": 256 },
+  "in_ports":  [{ "name": "in",  "element_type": "Sample(f32)" }],
+  "out_ports": [{ "name": "out", "element_type": "Sample(f32)" }],
+  "out_per_in": "1:1",
+  "algorithmic_latency": 0,
+  "tolerance": { "atol": 1e-6, "rtol": 1e-5 },
+  "seed": 1,
+  "n_frames": 1024
+}
