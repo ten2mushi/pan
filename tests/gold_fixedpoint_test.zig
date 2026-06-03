@@ -27,7 +27,6 @@ const gain_q15_json = @embedFile("vectors/gain_q15.json");
 const pan_q15_json = @embedFile("vectors/pan_q15.json");
 const num_q15 = pan.numericFor(.i16, .{});
 const SampleQ15 = pan.types.Sample(i16);
-const StereoQ15 = pan.types.Frame(i16, .stereo);
 
 /// Read a cwd-relative blob, i16-aligned; `null` on FileNotFound (the
 /// generate-on-demand skip), other I/O errors propagate.
@@ -119,17 +118,20 @@ test "GoldVector: ConstantPowerPan(q15) ≡ the NumPy fixed-point oracle blob, B
 
     const input: []const SampleQ15 = @alignCast(std.mem.bytesAsSlice(SampleQ15, in_bytes));
     const expected: []const i16 = @alignCast(std.mem.bytesAsSlice(i16, exp_bytes));
+    const n = input.len;
 
-    const out = try gpa.alloc(StereoQ15, input.len);
-    defer gpa.free(out);
+    // pan renders into a PLANE-MAJOR q15 stereo buffer ([L-plane(n)][R-plane(n)]).
+    const out_lanes = try gpa.alloc(i16, 2 * n);
+    defer gpa.free(out_lanes);
+    const out = pan.Planar(i16, .stereo).fromBase(out_lanes.ptr, n);
 
     // Drive the q15 pan with the EXACT integer gains (the embedded / bit-exact
     // path), not a runtime cos. Pan is stateless → a whole-buffer render suffices.
     var panner = pan.spatial.ConstantPowerPan(num_q15){ .gains_q = .{ lq, rq } };
     panner.process(input, out);
 
-    // The stereo output is AoS [L0,R0,L1,R1,…] — exactly the oracle's interleaved
-    // q15 layout.
-    const got: []const i16 = @alignCast(std.mem.bytesAsSlice(i16, std.mem.sliceAsBytes(out)));
+    // The planar output is [L-plane][R-plane] — exactly the oracle's plane-major
+    // q15 layout (the generator emits plane-major for C>1). Bit-exact.
+    const got: []const i16 = out_lanes;
     try h.bitExact(i16, got, expected);
 }

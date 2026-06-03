@@ -143,9 +143,8 @@ fn hasOutput(comptime Block: type) bool {
 /// have checked `hasOutput(Block)` first (a sink has no output element).
 fn outElemOf(comptime Block: type) type {
     if (port.classify(Block) == .Map) return port.MapOutElem(Block);
-    // Rate: pull(self, want, out: []Out) — `out` is param 2.
-    const f = @typeInfo(@TypeOf(Block.pull)).@"fn";
-    return @typeInfo(f.params[2].type.?).pointer.child;
+    // Rate: pull(self, want, out) — `out` is param 2 (a slice or planar view).
+    return port.RateOutElem(Block);
 }
 
 /// Read the block's rate ratio `p:q`. A `Map` is rate-1:1; a `Rate` declares
@@ -485,11 +484,15 @@ test "add records a Rate node and its pull-output element as the pool key" {
 test "an edge carries the element size matching its lane/channel count" {
     // A wider element => a wider edge buffer. Pin that the recorded elem_size
     // tracks the actual element (stereo f32 is 8 bytes, mono i16 is 2).
+    // Multi-channel ports are PLANAR views (the enforced SoA form), not `[]Frame`
+    // AoS slices. The element identity recovered from the view is still
+    // `Frame(f32,.stereo)`, so the recorded edge `elem_size` stays 8 (two f32 lanes).
     const Stereo = struct {
         const Self = @This();
-        pub fn process(self: *Self, in: []const t.Frame(f32, .stereo), out: []t.Frame(f32, .stereo)) void {
+        pub fn process(self: *Self, in: t.PlanarConst(f32, .stereo), out: t.Planar(f32, .stereo)) void {
             _ = self;
-            @memcpy(out, in);
+            _ = in;
+            _ = out;
         }
     };
     var g = Graph.empty;

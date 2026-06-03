@@ -44,7 +44,6 @@ const Encoding = io.Encoding;
 const ChannelPos = io.ChannelPos;
 const Dither = io.Dither;
 const ChannelLayout = types.ChannelLayout;
-const Frame = types.Frame;
 const Sample = types.Sample;
 
 const expect = std.testing.expect;
@@ -494,10 +493,11 @@ test "deinterleave∘interleave (no dither) is the identity on bytes — stereo 
     std.mem.writeInt(i16, src[2..4], -2000, .little);
     std.mem.writeInt(i16, src[4..6], 3000, .little);
     std.mem.writeInt(i16, src[6..8], -4000, .little);
-    var frames: [2]Frame(f32, L) = undefined;
-    io.deinterleave(L, PcmFormat.s16le, perm, &src, &frames);
+    // Internal planar buffer: 2 stereo frames → [L0,L1][R0,R1].
+    var planes: [4]f32 = undefined;
+    io.deinterleave(L, PcmFormat.s16le, perm, &src, pan.Planar(f32, L).fromBase(&planes, 2));
     var out: [8]u8 = undefined;
-    io.interleave(L, PcmFormat.s16le, perm, null, &frames, &out);
+    io.interleave(L, PcmFormat.s16le, perm, null, pan.PlanarConst(f32, L).fromBase(&planes, 2), &out);
     // Pan-vs-pan: identical kernels over an integer format must be bit-exact.
     try harness.bitExact(u8, &out, &src);
 }
@@ -519,10 +519,11 @@ test "deinterleave∘interleave byte round-trip holds for a 5.1 swapped device o
         const v: i32 = @intCast(@as(i64, @intCast(i)) * 4096 - 8192);
         oracleWriteLE24(src[i * w .. i * w + w], @as(u24, @bitCast(@as(i24, @truncate(v)))));
     }
-    var frames: [2]Frame(f32, L) = undefined;
-    io.deinterleave(L, PcmFormat.s24le, perm, &src, &frames);
+    // Internal planar buffer: 2 frames × C channels, plane-major.
+    var planes: [2 * C]f32 = undefined;
+    io.deinterleave(L, PcmFormat.s24le, perm, &src, pan.Planar(f32, L).fromBase(&planes, 2));
     var out: [2 * C * w]u8 = undefined;
-    io.interleave(L, PcmFormat.s24le, perm, null, &frames, &out);
+    io.interleave(L, PcmFormat.s24le, perm, null, pan.PlanarConst(f32, L).fromBase(&planes, 2), &out);
     try harness.bitExact(u8, &out, &src);
 }
 
@@ -535,27 +536,28 @@ test "deinterleave actually reorders channels to canonical (swapped stereo)" {
     var src: [4]u8 = undefined;
     std.mem.writeInt(i16, src[0..2], 100, .little); // device slot 0 = FR
     std.mem.writeInt(i16, src[2..4], -100, .little); // device slot 1 = FL
-    var frames: [1]Frame(f32, L) = undefined;
-    io.deinterleave(L, PcmFormat.s16le, perm, &src, &frames);
+    // Internal planar buffer: 1 stereo frame → plane(0)=L, plane(1)=R.
+    var planes: [2]f32 = undefined;
+    const dst = pan.Planar(f32, L).fromBase(&planes, 1);
+    io.deinterleave(L, PcmFormat.s16le, perm, &src, dst);
     // canonical FL (slot 0) should carry the device's FL sample (-100/32768).
-    try expectApproxEqAbs(@as(f32, @floatCast(signedNorm(-100, 16))), frames[0].ch[0], 1e-7);
-    try expectApproxEqAbs(@as(f32, @floatCast(signedNorm(100, 16))), frames[0].ch[1], 1e-7);
+    try expectApproxEqAbs(@as(f32, @floatCast(signedNorm(-100, 16))), dst.plane(0)[0], 1e-7);
+    try expectApproxEqAbs(@as(f32, @floatCast(signedNorm(100, 16))), dst.plane(1)[0], 1e-7);
 }
 
 test "mono float deinterleave∘interleave is bit-exact (float storage, no rounding)" {
     // Float formats round-trip bit-exactly even through the interleave seam.
     const L = ChannelLayout.mono;
     const perm = try io.channelPermutation(1, io.canonicalOrder(L), &.{.mono});
-    var frames: [3]Frame(f32, L) = .{
-        .{ .ch = .{0.123} }, .{ .ch = .{-0.456} }, .{ .ch = .{0.789} },
-    };
-    const saved = frames;
+    // Mono is one plane: the planar view spans the whole []f32 buffer.
+    var planes: [3]f32 = .{ 0.123, -0.456, 0.789 };
+    const saved = planes;
     var bytes: [3 * 4]u8 = undefined;
-    io.interleave(L, PcmFormat.f32le, perm, null, &frames, &bytes);
-    var out: [3]Frame(f32, L) = undefined;
-    io.deinterleave(L, PcmFormat.f32le, perm, &bytes, &out);
-    for (saved, out) |s, o| {
-        try expectEqual(@as(u32, @bitCast(s.ch[0])), @as(u32, @bitCast(o.ch[0])));
+    io.interleave(L, PcmFormat.f32le, perm, null, pan.PlanarConst(f32, L).fromBase(&planes, 3), &bytes);
+    var out_planes: [3]f32 = undefined;
+    io.deinterleave(L, PcmFormat.f32le, perm, &bytes, pan.Planar(f32, L).fromBase(&out_planes, 3));
+    for (saved, out_planes) |s, o| {
+        try expectEqual(@as(u32, @bitCast(s)), @as(u32, @bitCast(o)));
     }
 }
 
@@ -564,14 +566,13 @@ test "interleave with a dither pointer perturbs an integer encoding by <= 1 LSB"
     // dithered output is still within one LSB of the no-dither output.
     const L = ChannelLayout.mono;
     const perm = try io.channelPermutation(1, io.canonicalOrder(L), &.{.mono});
-    var frames: [4]Frame(f32, L) = .{
-        .{ .ch = .{0.2} }, .{ .ch = .{-0.2} }, .{ .ch = .{0.4} }, .{ .ch = .{-0.4} },
-    };
+    var planes: [4]f32 = .{ 0.2, -0.2, 0.4, -0.4 };
+    const csrc = pan.PlanarConst(f32, L).fromBase(&planes, 4);
     var clean: [4 * 2]u8 = undefined;
-    io.interleave(L, PcmFormat.s16le, perm, null, &frames, &clean);
+    io.interleave(L, PcmFormat.s16le, perm, null, csrc, &clean);
     var dith = Dither.init(7);
     var dirty: [4 * 2]u8 = undefined;
-    io.interleave(L, PcmFormat.s16le, perm, &dith, &frames, &dirty);
+    io.interleave(L, PcmFormat.s16le, perm, &dith, csrc, &dirty);
     for (0..4) |i| {
         const a = std.mem.readInt(i16, clean[i * 2 ..][0..2], .little);
         const b = std.mem.readInt(i16, dirty[i * 2 ..][0..2], .little);

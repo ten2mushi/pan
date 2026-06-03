@@ -27,6 +27,7 @@ const commit = @import("commit.zig");
 const graph = @import("graph.zig");
 const port = @import("port.zig");
 const mux = @import("mux.zig");
+const types = @import("types.zig");
 
 // ===========================================================================
 // Floating-point environment — flush-to-zero / denormals-are-zero
@@ -170,6 +171,24 @@ fn sliceMut(comptime Elem: type, region: []u8, n: usize) []Elem {
     return @as([]Elem, @alignCast(std.mem.bytesAsSlice(Elem, region)))[0..n];
 }
 
+/// Build a planar buffer view of type `View` (a `Planar`/`PlanarConst`) over a
+/// pool region. The region holds `C * n` lanes plane-major (`C = view channel
+/// count`); plane `c` begins at lane offset `c * n` (byte offset `c·n·sizeof`).
+/// The whole region carries `n * @sizeOf(Frame) == C * n * @sizeOf(Lane)` bytes,
+/// the same size the commit pass allotted (layout-agnostic), so the view simply
+/// re-reads those bytes as `C` contiguous planes rather than as interleaved
+/// frames.
+fn planarConstView(comptime View: type, region: []const u8, n: usize) View {
+    const Lane = View.lane;
+    const lanes: []const Lane = @alignCast(std.mem.bytesAsSlice(Lane, region));
+    return View.fromBase(lanes.ptr, n);
+}
+fn planarMutView(comptime View: type, region: []u8, n: usize) View {
+    const Lane = View.lane;
+    const lanes: []Lane = @alignCast(std.mem.bytesAsSlice(Lane, region));
+    return View.fromBase(lanes.ptr, n);
+}
+
 /// Does any lane of this float output buffer hold a NaN or ±Inf? The block-output
 /// poison check for error isolation (compiled out when guards are off).
 fn bufferIsPoisoned(comptime Elem: type, region: []const u8, n: usize) bool {
@@ -289,18 +308,36 @@ pub fn ExecutorMode(comptime g: graph.Graph, comptime node_blocks: []const type,
             comptime var out_i: usize = 0;
             inline for (params[1..], 1..) |p, ai| {
                 const ParamT = p.type.?;
-                const info = @typeInfo(ParamT).pointer;
-                const Elem = info.child;
-                if (info.is_const) {
-                    const id = op.input_buffer_ids[in_i];
-                    in_i += 1;
-                    const region = pool[plan.buffer_offset[id] .. plan.buffer_offset[id] + plan.buffer_byte_len[id]];
-                    args[ai] = sliceConst(Elem, region, n);
+                // Each port param is either a planar buffer view (multi-channel
+                // plane-major form) or a plain element slice (mono / non-Frame).
+                // The view recovers `C` plane-major planes over the same region
+                // bytes; the slice reinterprets the region as contiguous elements.
+                if (comptime types.isPlanarView(ParamT)) {
+                    if (comptime ParamT.is_const_view) {
+                        const id = op.input_buffer_ids[in_i];
+                        in_i += 1;
+                        const region = pool[plan.buffer_offset[id] .. plan.buffer_offset[id] + plan.buffer_byte_len[id]];
+                        args[ai] = planarConstView(ParamT, region, n);
+                    } else {
+                        const id = op.output_buffer_ids[out_i];
+                        out_i += 1;
+                        const region = pool[plan.buffer_offset[id] .. plan.buffer_offset[id] + plan.buffer_byte_len[id]];
+                        args[ai] = planarMutView(ParamT, region, n);
+                    }
                 } else {
-                    const id = op.output_buffer_ids[out_i];
-                    out_i += 1;
-                    const region = pool[plan.buffer_offset[id] .. plan.buffer_offset[id] + plan.buffer_byte_len[id]];
-                    args[ai] = sliceMut(Elem, region, n);
+                    const info = @typeInfo(ParamT).pointer;
+                    const Elem = info.child;
+                    if (info.is_const) {
+                        const id = op.input_buffer_ids[in_i];
+                        in_i += 1;
+                        const region = pool[plan.buffer_offset[id] .. plan.buffer_offset[id] + plan.buffer_byte_len[id]];
+                        args[ai] = sliceConst(Elem, region, n);
+                    } else {
+                        const id = op.output_buffer_ids[out_i];
+                        out_i += 1;
+                        const region = pool[plan.buffer_offset[id] .. plan.buffer_offset[id] + plan.buffer_byte_len[id]];
+                        args[ai] = sliceMut(Elem, region, n);
+                    }
                 }
             }
             @call(.auto, Block.process, args);
@@ -309,13 +346,21 @@ pub fn ExecutorMode(comptime g: graph.Graph, comptime node_blocks: []const type,
                 comptime var oi: usize = 0;
                 inline for (params[1..]) |p| {
                     const ParamT = p.type.?;
-                    const info = @typeInfo(ParamT).pointer;
-                    if (!info.is_const) {
+                    const is_out = comptime if (types.isPlanarView(ParamT))
+                        !ParamT.is_const_view
+                    else
+                        !@typeInfo(ParamT).pointer.is_const;
+                    if (is_out) {
                         const id = op.output_buffer_ids[oi];
                         oi += 1;
                         const region = pool[plan.buffer_offset[id] .. plan.buffer_offset[id] + plan.buffer_byte_len[id]];
-                        if (bufferIsPoisoned(info.child, region, n)) {
-                            @memset(region[0 .. n * @sizeOf(info.child)], 0); // silence
+                        // The finite-check scans every lane of the region; the
+                        // plane-major vs interleaved arrangement is irrelevant to
+                        // whether any lane is NaN/Inf, so the same scan works for
+                        // a planar-view output and a plain element-slice output.
+                        const Elem = comptime if (types.isPlanarView(ParamT)) ParamT.Elem else @typeInfo(ParamT).pointer.child;
+                        if (bufferIsPoisoned(Elem, region, n)) {
+                            @memset(region[0 .. n * @sizeOf(Elem)], 0); // silence
                             fault.* = true;
                         }
                     }
@@ -497,8 +542,6 @@ pub const Engine = struct {
 // ===========================================================================
 // Tests
 // ===========================================================================
-
-const types = @import("types.zig");
 
 test "renderInto requires a token and replays an (unbound-kernel) op-list" {
     // A Source (zero input) so the path is source-rooted, into a Sink.

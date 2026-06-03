@@ -55,6 +55,9 @@ const port = pan.port;
 const commitComptime = pan.commitComptime;
 const Sample = pan.Sample;
 const Frame = pan.Frame;
+// Multi-channel ports use the enforced planar (SoA) views, not `[]Frame` AoS.
+const Planar = pan.Planar;
+const PlanarConst = pan.PlanarConst;
 
 // ---------------------------------------------------------------------------
 // Synthetic block idioms (one per role). Every graph is SOURCE-ROOTED: it must
@@ -101,21 +104,22 @@ const Sum2 = struct {
 /// footprint tracks element width, not just edge count.
 const SrcStereo = struct {
     const Self = @This();
-    pub fn process(self: *Self, out: []Frame(f32, .stereo)) void {
+    pub fn process(self: *Self, out: Planar(f32, .stereo)) void {
         _ = self;
         _ = out;
     }
 };
 const Map1Stereo = struct {
     const Self = @This();
-    pub fn process(self: *Self, in: []const Frame(f32, .stereo), out: []Frame(f32, .stereo)) void {
+    pub fn process(self: *Self, in: PlanarConst(f32, .stereo), out: Planar(f32, .stereo)) void {
         _ = self;
-        @memcpy(out, in);
+        _ = in;
+        _ = out;
     }
 };
 const SinkStereo = struct {
     const Self = @This();
-    pub fn process(self: *Self, in: []const Frame(f32, .stereo)) void {
+    pub fn process(self: *Self, in: PlanarConst(f32, .stereo)) void {
         _ = self;
         _ = in;
     }

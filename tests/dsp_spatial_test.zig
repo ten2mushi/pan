@@ -56,13 +56,20 @@ fn oracleGains(p: f64) OracleGains {
     return .{ .l = @cos(theta), .r = @sin(theta) };
 }
 
+/// One stereo output frame, recovered from the planar buffer (plane 0 = L,
+/// plane 1 = R) so the analytic checks read per-channel.
+const StereoOut = struct { l: f32, r: f32 };
+
 /// Run the real block once over a one-sample mono input at pan position `p`.
-fn renderOne(p: f32, x: f32) Frame(f32, .stereo) {
+/// The block writes a planar stereo buffer ([L-plane][R-plane]); pull the single
+/// frame's two channels back out of the planes.
+fn renderOne(p: f32, x: f32) StereoOut {
     var blk = Pan{ .pan = p };
     var in: [1]Sample(f32) = .{.{ .ch = .{x} }};
-    var out: [1]Frame(f32, .stereo) = undefined;
-    blk.process(&in, &out);
-    return out[0];
+    var out_buf: [2]f32 = undefined;
+    const out = pan.Planar(f32, .stereo).fromBase(&out_buf, 1);
+    blk.process(&in, out);
+    return .{ .l = out.plane(0)[0], .r = out.plane(1)[0] };
 }
 
 // A tolerance that admits the f32-vs-f64 gap of a single cos/sin product. The
@@ -112,24 +119,28 @@ test "the block exposes a `pan` control parameter typed Scalar(f32)" {
 }
 
 // ===========================================================================
-// 2. The storage-layout fact the gold comparison leans on.
+// 2. The storage-layout fact the gold comparison leans on (PLANAR).
 //
-// `Frame(f32,.stereo)` is `struct { ch: [2]f32 }` — no padding, so a
-// `[]Frame(f32,.stereo)` viewed as `[]f32` is exactly the interleaved
-// [L0,R0,L1,R1,...] layout the NumPy oracle writes. This is an independent
-// structural fact (sizeof/field offsets), and it is the bridge that lets the
-// blob comparison be a flat allclose. If padding ever crept in, the gold test
-// would silently compare the wrong bytes — so pin it explicitly.
+// pan's internal stereo buffer is PLANE-MAJOR: an L-plane of N samples followed
+// by an R-plane of N samples (NOT interleaved L0,R0,L1,R1,…). The plane-major
+// gold blob is `[L-plane][R-plane]` to match, so the test can read it straight
+// into pan's planar buffer with no transpose. This is an independent structural
+// fact (the planar view's plane offsets) and the bridge that makes the blob
+// comparison a flat per-plane allclose. Pin it explicitly: were the buffer to
+// regress to interleaved AoS, plane(1) would no longer start N lanes in.
 // ===========================================================================
 
-test "Frame(f32,.stereo) is exactly two contiguous f32 lanes (interleaved L,R), no padding" {
+test "stereo buffer is plane-major: plane 1 starts N lanes after plane 0 (catalog §9.3)" {
+    const N = 2;
+    // Plane-major backing [L0,L1][R0,R1].
+    var backing: [2 * N]f32 = .{ 1, 2, 3, 4 };
+    const v = pan.Planar(f32, .stereo).fromBase(&backing, N);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, v.plane(0)); // L-plane
+    try std.testing.expectEqualSlices(f32, &.{ 3, 4 }, v.plane(1)); // R-plane
+    // plane(1) begins exactly N lanes past plane(0) (the plane-major invariant).
+    try std.testing.expectEqual(@intFromPtr(v.plane(0).ptr + N), @intFromPtr(v.plane(1).ptr));
+    // The element identity for connect remains the two-lane Frame, no padding.
     try std.testing.expectEqual(@as(usize, 2 * @sizeOf(f32)), @sizeOf(Frame(f32, .stereo)));
-    const F = Frame(f32, .stereo);
-    try std.testing.expectEqual(@as(usize, 0), @offsetOf(F, "ch"));
-    // A 2-frame array reinterpreted as f32 must be [L0,R0,L1,R1].
-    var frames: [2]F = .{ .{ .ch = .{ 1, 2 } }, .{ .ch = .{ 3, 4 } } };
-    const flat: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, std.mem.sliceAsBytes(frames[0..])));
-    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, flat);
 }
 
 // ===========================================================================
@@ -143,7 +154,7 @@ test "constant power: L²+R² == 1 across the full pan sweep (unit input)" {
     var p: f32 = -1.0;
     while (p <= 1.0001) : (p += 0.05) {
         const o = renderOne(p, 1.0);
-        const power = @as(f64, o.ch[0]) * o.ch[0] + @as(f64, o.ch[1]) * o.ch[1];
+        const power = @as(f64, o.l) * o.l + @as(f64, o.r) * o.r;
         // Oracle: the constant-power law asserts unit power for EVERY position.
         std.testing.expectApproxEqAbs(@as(f64, 1.0), power, 1e-6) catch |e| {
             std.debug.print("constant-power violated @ pan={d}: L²+R²={d}\n", .{ p, power });
@@ -159,7 +170,7 @@ test "power scales with the square of the input amplitude (L²+R² == x²)" {
     const amps = [_]f32{ 0.0, 0.25, 0.5, 1.0, 2.0, -0.75 };
     for (amps) |x| {
         const o = renderOne(0.3, x);
-        const power = @as(f64, o.ch[0]) * o.ch[0] + @as(f64, o.ch[1]) * o.ch[1];
+        const power = @as(f64, o.l) * o.l + @as(f64, o.r) * o.r;
         try std.testing.expectApproxEqAbs(@as(f64, x) * x, power, 1e-6);
     }
 }
@@ -178,12 +189,12 @@ test "per-channel gains match the analytic cos/sin oracle at representative posi
         const g = oracleGains(p);
         const want_l: f32 = @floatCast(@as(f64, x) * g.l);
         const want_r: f32 = @floatCast(@as(f64, x) * g.r);
-        std.testing.expectApproxEqAbs(want_l, o.ch[0], analytic_abs) catch |e| {
-            std.debug.print("L gain mismatch @ pan={d}: got {d}, oracle {d}\n", .{ p, o.ch[0], want_l });
+        std.testing.expectApproxEqAbs(want_l, o.l, analytic_abs) catch |e| {
+            std.debug.print("L gain mismatch @ pan={d}: got {d}, oracle {d}\n", .{ p, o.l, want_l });
             return e;
         };
-        std.testing.expectApproxEqAbs(want_r, o.ch[1], analytic_abs) catch |e| {
-            std.debug.print("R gain mismatch @ pan={d}: got {d}, oracle {d}\n", .{ p, o.ch[1], want_r });
+        std.testing.expectApproxEqAbs(want_r, o.r, analytic_abs) catch |e| {
+            std.debug.print("R gain mismatch @ pan={d}: got {d}, oracle {d}\n", .{ p, o.r, want_r });
             return e;
         };
     }
@@ -193,26 +204,26 @@ test "center (pan=0) sends equal √½·x to both channels" {
     const root_half: f32 = @floatCast(@sqrt(0.5)); // independent: cos(π/4)=sin(π/4)
     const x: f32 = 0.5;
     const o = renderOne(0.0, x);
-    try std.testing.expectApproxEqAbs(root_half * x, o.ch[0], analytic_abs);
-    try std.testing.expectApproxEqAbs(root_half * x, o.ch[1], analytic_abs);
+    try std.testing.expectApproxEqAbs(root_half * x, o.l, analytic_abs);
+    try std.testing.expectApproxEqAbs(root_half * x, o.r, analytic_abs);
     // And the two channels are equal at center — the symmetry the law demands.
-    try std.testing.expectApproxEqAbs(o.ch[0], o.ch[1], analytic_abs);
+    try std.testing.expectApproxEqAbs(o.l, o.r, analytic_abs);
 }
 
 test "hard-left (pan=-1) puts all signal in L, none in R" {
     const x: f32 = 0.9;
     const o = renderOne(-1.0, x);
     // θ=0 ⇒ cos=1, sin=0: L=x, R=0.
-    try std.testing.expectApproxEqAbs(x, o.ch[0], analytic_abs);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), o.ch[1], analytic_abs);
+    try std.testing.expectApproxEqAbs(x, o.l, analytic_abs);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), o.r, analytic_abs);
 }
 
 test "hard-right (pan=1) puts all signal in R, none in L" {
     const x: f32 = 0.9;
     const o = renderOne(1.0, x);
     // θ=π/2 ⇒ cos=0, sin=1: L=0, R=x.
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), o.ch[0], analytic_abs);
-    try std.testing.expectApproxEqAbs(x, o.ch[1], analytic_abs);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), o.l, analytic_abs);
+    try std.testing.expectApproxEqAbs(x, o.r, analytic_abs);
 }
 
 test "the L-gain decreases and the R-gain increases monotonically as pan goes left→right" {
@@ -223,16 +234,16 @@ test "the L-gain decreases and the R-gain increases monotonically as pan goes le
     var p: f32 = -1.0;
     while (p <= 1.0001) : (p += 0.1) {
         const o = renderOne(p, 1.0);
-        std.testing.expect(o.ch[0] <= prev_l + analytic_abs) catch |e| {
-            std.debug.print("L not non-increasing @ pan={d}: {d} > prev {d}\n", .{ p, o.ch[0], prev_l });
+        std.testing.expect(o.l <= prev_l + analytic_abs) catch |e| {
+            std.debug.print("L not non-increasing @ pan={d}: {d} > prev {d}\n", .{ p, o.l, prev_l });
             return e;
         };
-        std.testing.expect(o.ch[1] >= prev_r - analytic_abs) catch |e| {
-            std.debug.print("R not non-decreasing @ pan={d}: {d} < prev {d}\n", .{ p, o.ch[1], prev_r });
+        std.testing.expect(o.r >= prev_r - analytic_abs) catch |e| {
+            std.debug.print("R not non-decreasing @ pan={d}: {d} < prev {d}\n", .{ p, o.r, prev_r });
             return e;
         };
-        prev_l = o.ch[0];
-        prev_r = o.ch[1];
+        prev_l = o.l;
+        prev_r = o.r;
     }
 }
 
@@ -247,12 +258,12 @@ test "pan is clamped to [-1,1]: out-of-range positions saturate to the hard pans
     // unclamped pan run.)
     const x: f32 = 0.7;
     const over_right = renderOne(5.0, x);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), over_right.ch[0], analytic_abs);
-    try std.testing.expectApproxEqAbs(x, over_right.ch[1], analytic_abs);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), over_right.l, analytic_abs);
+    try std.testing.expectApproxEqAbs(x, over_right.r, analytic_abs);
 
     const over_left = renderOne(-5.0, x);
-    try std.testing.expectApproxEqAbs(x, over_left.ch[0], analytic_abs);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), over_left.ch[1], analytic_abs);
+    try std.testing.expectApproxEqAbs(x, over_left.l, analytic_abs);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), over_left.r, analytic_abs);
 }
 
 test "a zero input maps to zero in both channels at every pan position" {
@@ -261,8 +272,8 @@ test "a zero input maps to zero in both channels at every pan position" {
     var p: f32 = -1.0;
     while (p <= 1.0001) : (p += 0.25) {
         const o = renderOne(p, 0.0);
-        try std.testing.expectEqual(@as(f32, 0.0), o.ch[0]);
-        try std.testing.expectEqual(@as(f32, 0.0), o.ch[1]);
+        try std.testing.expectEqual(@as(f32, 0.0), o.l);
+        try std.testing.expectEqual(@as(f32, 0.0), o.r);
     }
 }
 
@@ -270,11 +281,11 @@ test "negative input is preserved through the gains (sign carries to both channe
     // Gains are non-negative over [-1,1] (θ∈[0,π/2]), so a negative sample stays
     // negative in any channel that receives energy.
     const o = renderOne(0.0, -1.0);
-    try std.testing.expect(o.ch[0] < 0.0);
-    try std.testing.expect(o.ch[1] < 0.0);
+    try std.testing.expect(o.l < 0.0);
+    try std.testing.expect(o.r < 0.0);
     const root_half: f32 = @floatCast(@sqrt(0.5));
-    try std.testing.expectApproxEqAbs(-root_half, o.ch[0], analytic_abs);
-    try std.testing.expectApproxEqAbs(-root_half, o.ch[1], analytic_abs);
+    try std.testing.expectApproxEqAbs(-root_half, o.l, analytic_abs);
+    try std.testing.expectApproxEqAbs(-root_half, o.r, analytic_abs);
 }
 
 test "process is elementwise: a whole buffer equals per-sample independent renders (stateless)" {
@@ -284,15 +295,17 @@ test "process is elementwise: a whole buffer equals per-sample independent rende
     const n = 64;
     var in: [n]Sample(f32) = undefined;
     h.fillNoise(&in, 99);
-    var out: [n]Frame(f32, .stereo) = undefined;
+    // Plane-major stereo buffer: [L-plane(n)][R-plane(n)].
+    var out_buf: [2 * n]f32 = undefined;
+    const out = pan.Planar(f32, .stereo).fromBase(&out_buf, n);
 
     var blk = Pan{ .pan = 0.37 };
-    blk.process(&in, &out);
+    blk.process(&in, out);
 
-    for (in, out) |s, o| {
+    for (in, out.plane(0), out.plane(1)) |s, l, r| {
         const ref = renderOne(0.37, s.ch[0]);
-        try std.testing.expectEqual(ref.ch[0], o.ch[0]);
-        try std.testing.expectEqual(ref.ch[1], o.ch[1]);
+        try std.testing.expectEqual(ref.l, l);
+        try std.testing.expectEqual(ref.r, r);
     }
 }
 
@@ -303,23 +316,31 @@ test "chunked render equals whole-buffer render (no carry-over between process c
     var in: [n]Sample(f32) = undefined;
     h.fillNoise(&in, 1234);
 
-    var whole_out: [n]Frame(f32, .stereo) = undefined;
+    var whole_buf: [2 * n]f32 = undefined;
     var blk_whole = Pan{ .pan = -0.4 };
-    blk_whole.process(&in, &whole_out);
+    blk_whole.process(&in, pan.Planar(f32, .stereo).fromBase(&whole_buf, n));
 
-    var chunk_out: [n]Frame(f32, .stereo) = undefined;
+    var chunk_buf: [2 * n]f32 = undefined;
+    const chunk_view = pan.Planar(f32, .stereo).fromBase(&chunk_buf, n);
     var blk_chunk = Pan{ .pan = -0.4 };
     var i: usize = 0;
     const chunk = 17;
     while (i < n) {
         const m = @min(chunk, n - i);
-        blk_chunk.process(in[i .. i + m], chunk_out[i .. i + m]);
+        // A sub-block view writes the [i, i+m) slice of each plane. Build the
+        // view from the L-plane sub-pointer; its R-plane follows at +m (the
+        // sub-buffer is itself plane-major over m frames).
+        var sub_buf: [2 * 17]f32 = undefined;
+        const sub = pan.Planar(f32, .stereo).fromBase(&sub_buf, m);
+        blk_chunk.process(in[i .. i + m], sub);
+        @memcpy(chunk_view.plane(0)[i .. i + m], sub.plane(0));
+        @memcpy(chunk_view.plane(1)[i .. i + m], sub.plane(1));
         i += m;
     }
 
-    const whole_flat: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, std.mem.sliceAsBytes(whole_out[0..])));
-    const chunk_flat: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, std.mem.sliceAsBytes(chunk_out[0..])));
-    try h.bitExact(f32, chunk_flat, whole_flat); // pan-vs-pan: exact, never allclose
+    // Pan-vs-pan: exact, never allclose. Compare both planes bit-for-bit.
+    try h.bitExact(f32, chunk_view.plane(0), pan.Planar(f32, .stereo).fromBase(&whole_buf, n).plane(0));
+    try h.bitExact(f32, chunk_view.plane(1), pan.Planar(f32, .stereo).fromBase(&whole_buf, n).plane(1));
 }
 
 // ===========================================================================
@@ -331,9 +352,10 @@ test "chunked render equals whole-buffer render (no carry-over between process c
 //   - the manifest (committed, embedded) supplies the pan position and tolerance;
 //   - input.bin is the mono f32 the oracle was fed (read it, don't regenerate,
 //     so pan sees the exact same quantized samples);
-//   - expected.bin is the stereo interleaved [L,R] f32 oracle output;
-//   - pan renders the real block over the mono input; its `[]Frame(f32,.stereo)`
-//     output, viewed as `[]f32`, is layout-identical to the interleaved oracle;
+//   - expected.bin is the stereo PLANE-MAJOR [L-plane][R-plane] f32 oracle output
+//     (pan's internal planar form — the generator emits plane-major for C>1);
+//   - pan renders the real block over the mono input into a planar stereo buffer;
+//     that buffer's flat f32 view is layout-identical to the plane-major oracle;
 //   - compared with numpy.allclose semantics under the manifest tolerance (the
 //     ≈ tier — the ONLY place allclose applies; tolerance forgives the oracle's
 //     f64 cos/sin, never pan disagreeing with itself).
@@ -402,7 +424,7 @@ test "GoldVector: ConstantPowerPan ≈ the NumPy/SciPy oracle blob, allclose und
     defer gpa.free(expected_bytes);
 
     // Shape sanity against the manifest: input is mono f32 (n_frames lanes);
-    // expected is stereo interleaved (2·n_frames lanes). A shape surprise here is
+    // expected is stereo plane-major (2·n_frames lanes). A shape surprise here is
     // a generator/manifest mismatch, surfaced loud rather than silently sliced.
     const n = m.n_frames;
     try std.testing.expectEqual(n * @sizeOf(f32), input_bytes.len);
@@ -413,15 +435,17 @@ test "GoldVector: ConstantPowerPan ≈ the NumPy/SciPy oracle blob, allclose und
     const in_samples: []const Sample(f32) = @alignCast(std.mem.bytesAsSlice(Sample(f32), input_bytes));
     try std.testing.expectEqual(n, in_scalars.len);
 
-    const out = try gpa.alloc(Frame(f32, .stereo), n);
-    defer gpa.free(out);
+    // pan renders into a PLANE-MAJOR stereo buffer ([L-plane(n)][R-plane(n)]).
+    const out_lanes = try gpa.alloc(f32, 2 * n);
+    defer gpa.free(out_lanes);
+    const out = pan.Planar(f32, .stereo).fromBase(out_lanes.ptr, n);
 
     var blk = Pan{ .pan = pan_pos };
     blk.process(in_samples, out);
 
-    // pan's stereo output viewed as flat f32 == interleaved [L0,R0,L1,R1,...],
-    // bit-for-bit the same layout as the oracle's expected.bin.
-    const got_flat: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, std.mem.sliceAsBytes(out)));
+    // The planar buffer's flat f32 view == [L-plane][R-plane], bit-for-bit the
+    // same plane-major layout as the oracle's expected.bin.
+    const got_flat: []const f32 = out_lanes;
     const expected_flat: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, expected_bytes));
 
     // The ≈ tier: numpy.allclose against the external float oracle.

@@ -73,14 +73,19 @@ const MonoSink = struct {
     }
 };
 
-/// Stereo sink: drains a `Frame(f32,.stereo)` input (the downstream of a pan)
-/// to a destination. Distinct element type from `MonoSink` so the pan chain's
-/// layout change (mono → stereo) is honored end-to-end.
+/// Stereo sink: drains a stereo PLANAR input (the downstream of a pan) to a
+/// plane-major destination buffer. Its input port is a `PlanarConst(f32,.stereo)`
+/// view — the element identity is still `Frame(f32,.stereo)`, but the buffer is
+/// two channel planes, so the chain's layout change (mono → stereo) is honored
+/// end-to-end in the enforced planar form. `dest` is the plane-major backing
+/// (`[L-plane][R-plane]`); the sink copies each plane through.
 const StereoSink = struct {
     const Self = @This();
-    dest: [*]Frame(f32, .stereo) = undefined,
-    pub fn process(self: *Self, in: []const Frame(f32, .stereo)) void {
-        @memcpy(self.dest[0..in.len], in);
+    dest: [*]f32 = undefined,
+    pub fn process(self: *Self, in: pan.PlanarConst(f32, .stereo)) void {
+        const n = in.frames;
+        @memcpy(self.dest[0..n], in.plane(0));
+        @memcpy(self.dest[n .. 2 * n], in.plane(1));
     }
 };
 
@@ -225,7 +230,8 @@ test "executor: layout-changing pan chain (mono→stereo) ≡ hand-run, bit-exac
     const pos: f32 = 0.37; // an off-center position so L ≠ R
 
     // --- executor path ---
-    var exec_out: [N]Frame(f32, .stereo) = undefined;
+    // Plane-major stereo destination: [L-plane(N)][R-plane(N)].
+    var exec_out: [2 * N]f32 = undefined;
     const Exec = Executor(g, &.{ MonoSource, Pan, StereoSink });
     var exec: Exec = .{ .instances = .{
         .{ .data = &input },
@@ -236,29 +242,29 @@ test "executor: layout-changing pan chain (mono→stereo) ≡ hand-run, bit-exac
     defer token.leave();
     exec.render(token);
 
-    // --- hand-run reference ---
+    // --- hand-run reference --- (same kernels, hand-plumbed through the planar
+    // view; the only variable vs the executor is the pool gather/scatter)
     var mid: [N]Sample(f32) = undefined;
-    var stereo: [N]Frame(f32, .stereo) = undefined;
-    var ref_out: [N]Frame(f32, .stereo) = undefined;
+    var stereo: [2 * N]f32 = undefined;
+    var ref_out: [2 * N]f32 = undefined;
     var ref_src = MonoSource{ .data = &input };
     var ref_pan = Pan{ .pan = pos };
     var ref_sink = StereoSink{ .dest = &ref_out };
     ref_src.process(&mid);
-    ref_pan.process(&mid, &stereo);
-    ref_sink.process(&stereo);
+    ref_pan.process(&mid, pan.Planar(f32, .stereo).fromBase(&stereo, N));
+    ref_sink.process(pan.PlanarConst(f32, .stereo).fromBase(&stereo, N));
 
-    // Compare both interleaved-planar lanes bit-exact via the byte view.
-    const exec_bytes = std.mem.sliceAsBytes(exec_out[0..]);
-    const ref_bytes = std.mem.sliceAsBytes(ref_out[0..]);
-    try std.testing.expectEqualSlices(u8, ref_bytes, exec_bytes);
+    // Pan-vs-pan: bit-exact over the plane-major bytes.
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(ref_out[0..]), std.mem.sliceAsBytes(exec_out[0..]));
     try std.testing.expect(!exec.telemetry().fault);
 
     // And independently confirm the layout change actually happened: an
     // off-center pan must give L ≠ R for a non-zero sample (else the test would
-    // pass vacuously even if the stereo lane were dropped).
+    // pass vacuously even if the stereo lane were dropped). L-plane is the first
+    // N lanes, R-plane the next N.
     var saw_distinct = false;
-    for (exec_out) |o| {
-        if (o.ch[0] != o.ch[1]) saw_distinct = true;
+    for (0..N) |i| {
+        if (exec_out[i] != exec_out[N + i]) saw_distinct = true;
     }
     try std.testing.expect(saw_distinct);
 }

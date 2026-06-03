@@ -108,6 +108,81 @@ pub fn Sample(comptime T: type) type {
     return Frame(T, .mono);
 }
 
+/// `Planar(Lane, L)` / `PlanarConst(Lane, L)` — the planar buffer VIEW a block
+/// sees for layout `L` (channel count `C := L.count()`). It is the enforced
+/// multi-channel storage form: a buffer of `N` frames is `C` contiguous
+/// `N`-sample channel planes laid out plane-major (`[ch0_0…ch0_{N-1}][ch1_0…]…`),
+/// NOT an array of interleaved frames. A block reads/writes each channel as its
+/// own contiguous `[]Lane` plane via `plane(c)`, so a per-channel kernel
+/// vectorizes over a whole plane.
+///
+/// The element IDENTITY for `connect`/`PortId` type-checking is `Frame(Lane, L)`
+/// (exposed as `Elem`), which carries the channel count, positional tags, and
+/// canonical order in `L`; the view does NOT change that identity, only the
+/// physical arrangement and the access shape. Mono (`C = 1`) degenerates to a
+/// single plane — `plane(0)` is the whole buffer as `[]Lane` — and is trivially
+/// conformant, which is why mono blocks may equivalently keep a `[]Sample(T)`
+/// slice port (one plane is contiguous either way).
+///
+/// `is_planar_view` is the marker the port machinery keys on to recover
+/// `(Lane, L)` from a view parameter; `is_const_view` carries the direction
+/// (a const view is an input port, a mutable view an output port).
+fn PlanarView(comptime Lane: type, comptime L: ChannelLayout, comptime is_const: bool) type {
+    const Ptr = if (is_const) [*]const Lane else [*]Lane;
+    const PlaneSlice = if (is_const) []const Lane else []Lane;
+    return struct {
+        const Self = @This();
+        /// The base of the plane-major region (plane 0, sample 0). The `c`-th
+        /// plane starts at `base[c * frames]`.
+        base: Ptr,
+        /// The frame count `N` — the length of each channel plane.
+        frames: usize,
+
+        /// The element lane (the per-sample scalar type).
+        pub const lane = Lane;
+        /// The layout descriptor — count + positional tags + canonical order.
+        pub const layout = L;
+        /// The channel count `C := L.count()`, i.e. the number of planes.
+        pub const channel_count: usize = L.count();
+        /// The layout-identity element type for `connect`/`PortId` type-checking.
+        pub const Elem = Frame(Lane, L);
+        /// Marker: this type is a planar buffer view (read by the port machinery).
+        pub const is_planar_view = true;
+        /// Marker: a const view is an input port; a mutable view an output port.
+        pub const is_const_view = is_const;
+
+        /// The `c`-th channel plane as a contiguous `[]Lane` (or `[]const Lane`).
+        /// `c` must be in `0..C`. The slice spans the whole `N`-sample plane.
+        pub fn plane(self: Self, c: usize) PlaneSlice {
+            return self.base[c * self.frames ..][0..self.frames];
+        }
+
+        /// Build a view over a plane-major region of `n` frames. The region holds
+        /// exactly `C * n` lanes (`C * n * @sizeOf(Lane)` bytes), plane-major.
+        pub fn fromBase(base: Ptr, n: usize) Self {
+            return .{ .base = base, .frames = n };
+        }
+    };
+}
+
+/// A mutable planar view (an OUTPUT port): `C` writable `[]Lane` planes.
+pub fn Planar(comptime Lane: type, comptime L: ChannelLayout) type {
+    return PlanarView(Lane, L, false);
+}
+
+/// A const planar view (an INPUT port): `C` read-only `[]const Lane` planes.
+pub fn PlanarConst(comptime Lane: type, comptime L: ChannelLayout) type {
+    return PlanarView(Lane, L, true);
+}
+
+/// Is `T` a `Planar`/`PlanarConst` buffer view? Used by the port machinery to
+/// recover `(Lane, L)` and the direction from a view parameter.
+pub fn isPlanarView(comptime T: type) bool {
+    if (@typeInfo(T) != .@"struct") return false;
+    if (!@hasDecl(T, "is_planar_view")) return false;
+    return T.is_planar_view;
+}
+
 /// `Complex(T)` — one spectral bin. Wraps `std.math.Complex(T)` (which has no
 /// `typeName()` of its own) in a named struct carrying one. Pool class key
 /// `(Complex(T), N/2+1)`.
@@ -206,6 +281,28 @@ test "every non-primitive element carries a typeName()" {
     try std.testing.expectEqualStrings("FeatureFrame(13)", FeatureFrame(13).typeName());
     try std.testing.expectEqualStrings("Scalar(f32)", Scalar(f32).typeName());
     try std.testing.expectEqualStrings("Bounded(f32,8)", Bounded(f32, 8).typeName());
+}
+
+test "Planar view exposes C plane-major []Lane planes and the Frame identity" {
+    // Plane-major: [L0,L1,L2][R0,R1,R2], NOT interleaved [L0,R0,L1,R1,L2,R2].
+    var buf: [6]f32 = .{ 1, 2, 3, 10, 20, 30 };
+    const v = Planar(f32, .stereo).fromBase(&buf, 3);
+    try std.testing.expect(isPlanarView(Planar(f32, .stereo)));
+    try std.testing.expect(isPlanarView(PlanarConst(f32, .stereo)));
+    try std.testing.expect(!isPlanarView(Frame(f32, .stereo)));
+    try std.testing.expectEqual(@as(usize, 2), Planar(f32, .stereo).channel_count);
+    // The view's element identity is the Frame — that is what connect checks.
+    try std.testing.expect(Planar(f32, .stereo).Elem == Frame(f32, .stereo));
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3 }, v.plane(0));
+    try std.testing.expectEqualSlices(f32, &.{ 10, 20, 30 }, v.plane(1));
+    // Mutable plane writes through to the backing buffer.
+    v.plane(1)[0] = 99;
+    try std.testing.expectEqual(@as(f32, 99), buf[3]);
+    // Mono degenerates to one plane spanning the whole buffer.
+    var mono: [4]f32 = .{ 5, 6, 7, 8 };
+    const mv = Planar(f32, .mono).fromBase(&mono, 4);
+    try std.testing.expectEqual(@as(usize, 1), Planar(f32, .mono).channel_count);
+    try std.testing.expectEqualSlices(f32, &.{ 5, 6, 7, 8 }, mv.plane(0));
 }
 
 test "elements are distinct types across lane/layout/family so connect can reject" {

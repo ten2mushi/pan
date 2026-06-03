@@ -19,7 +19,6 @@ const h = @import("harness.zig");
 
 const num = pan.numericFor(.f32, .{});
 const Sample = pan.Sample(f32);
-const Stereo = pan.types.Frame(f32, .stereo);
 
 const Gain = pan.filters.Gain(num);
 const Biquad = pan.filters.Biquad(num);
@@ -31,10 +30,14 @@ const BufSource = struct {
         @memcpy(out, self.data[0..out.len]);
     }
 };
+// Stereo sink over the enforced planar form: input is a stereo PLANAR view (two
+// channel planes), copied through to a plane-major destination `[L-plane][R-plane]`.
 const StereoSink = struct {
-    dest: [*]Stereo = undefined,
-    pub fn process(self: *@This(), in: []const Stereo) void {
-        @memcpy(self.dest[0..in.len], in);
+    dest: [*]f32 = undefined,
+    pub fn process(self: *@This(), in: pan.PlanarConst(f32, .stereo)) void {
+        const n = in.frames;
+        @memcpy(self.dest[0..n], in.plane(0));
+        @memcpy(self.dest[n .. 2 * n], in.plane(1));
     }
 };
 const MonoSink = struct {
@@ -59,8 +62,8 @@ fn chainGraph(comptime N: usize) pan.graph.Graph {
     return gg;
 }
 
-fn viewBits(frames: []const Stereo) []const f32 {
-    return @alignCast(std.mem.bytesAsSlice(f32, std.mem.sliceAsBytes(frames)));
+fn viewBits(planes: []const f32) []const f32 {
+    return planes;
 }
 
 test "B≡C: colored pool ≡ per-edge baseline through the executor, bit-exact (gain→biquad→pan)" {
@@ -78,8 +81,9 @@ test "B≡C: colored pool ≡ per-edge baseline through the executor, bit-exact 
     const bq = pan.filters.Coeffs(f32){ .b0 = 0.3, .b1 = 0.1, .a1 = -0.5 };
     const pan_pos: f32 = 0.3;
 
-    var out_c: [N]Stereo = undefined;
-    var out_b: [N]Stereo = undefined;
+    // Plane-major stereo destinations: [L-plane(N)][R-plane(N)].
+    var out_c: [2 * N]f32 = undefined;
+    var out_b: [2 * N]f32 = undefined;
 
     var colored: Colored = .{ .instances = .{
         .{ .data = &input }, .{ .gain = gain_coef }, .{ .coeffs = bq }, .{ .pan = pan_pos }, .{ .dest = &out_c },

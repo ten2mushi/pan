@@ -36,12 +36,13 @@ fn NoiseSource(comptime T: type) type {
 }
 
 /// Stereo discard sink: folds output into a checksum (defeats DCE), no device I/O.
+/// Reads the stereo buffer through the planar view (L-plane, R-plane).
 fn StereoSink(comptime T: type) type {
     return struct {
         checksum: T = 0,
-        pub fn process(self: *@This(), in: []const pan.types.Frame(T, .stereo)) void {
+        pub fn process(self: *@This(), in: pan.types.PlanarConst(T, .stereo)) void {
             var acc: T = self.checksum;
-            for (in) |f| acc += f.ch[0] + f.ch[1];
+            for (in.plane(0), in.plane(1)) |l, r| acc += l + r;
             self.checksum = acc;
         }
     };
@@ -191,14 +192,28 @@ pub fn main() !void {
     var rng = std.Random.DefaultPrng.init(2);
     for (&in) |*s| s.ch[0] = rng.random().float(f32) * 2.0 - 1.0;
     var out: [N]pan.types.Sample(f32) = undefined;
-    var stereo: [N]pan.types.Frame(f32, .stereo) = undefined;
+    // Plane-major stereo backing: an L-plane of N then an R-plane of N.
+    var stereo_planes: [2 * N]f32 = undefined;
+    const stereo_view = pan.types.Planar(f32, .stereo).fromBase(&stereo_planes, N);
     std.debug.print("per-block (f32, N={d}):\n", .{N});
     var gain = pan.filters.Gain(num){ .gain = 0.5 };
     benchBlock(io, "gain", pan.filters.Gain(num), &gain, @as([]const pan.types.Sample(f32), &in), @as([]pan.types.Sample(f32), &out));
     var biquad = pan.filters.Biquad(num){ .coeffs = .{ .b0 = 0.2, .a1 = -0.8 } };
     benchBlock(io, "biquad", pan.filters.Biquad(num), &biquad, @as([]const pan.types.Sample(f32), &in), @as([]pan.types.Sample(f32), &out));
+    // Pan writes a planar stereo view, so time it directly (benchBlock's report
+    // helpers assume an element slice with .len/.ptr; the view has neither).
     var panner = pan.spatial.ConstantPowerPan(num){ .pan = 0.25 };
-    benchBlock(io, "pan", pan.spatial.ConstantPowerPan(num), &panner, @as([]const pan.types.Sample(f32), &in), @as([]pan.types.Frame(f32, .stereo), &stereo));
+    {
+        const in_slice = @as([]const pan.types.Sample(f32), &in);
+        for (0..warm) |_| panner.process(in_slice, stereo_view);
+        var timer = h.Timer.start(io);
+        for (0..iters) |_| panner.process(in_slice, stereo_view);
+        const ns = timer.read();
+        h.consume(stereo_view.plane(0).ptr);
+        const ns_per = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(iters));
+        const fps = @as(f64, @floatFromInt(N)) / (ns_per / 1e9);
+        std.debug.print("  {s}: {d:.1} ns/iter  {d:.2}M frames/s\n", .{ "pan", ns_per, fps / 1e6 });
+    }
 
     // The chain, swept over precision × block size, with the telemetry cross-check.
     std.debug.print("chain (per-render vs deadline):\n", .{});

@@ -9,6 +9,7 @@
 //! which also caps a direction at 8 ports — a readable compile error past that.
 
 const std = @import("std");
+const types = @import("types.zig");
 
 /// Port direction. Derived purely from slice constness: `[]const A` is an
 /// input, `[]A` is an output.
@@ -89,21 +90,51 @@ pub fn isParamPort(comptime T: type) bool {
     }
 }
 
-/// Read one slice param's element type and direction. Asserts the param is a
-/// slice `[]A` / `[]const A`; the leading `self: *Self` is skipped by callers.
-/// A bare array element is rejected: the buffer pool keys on the element and the
-/// diagnostics name it, and a bare `[K]T` has no `typeName()` — it must be
-/// wrapped in a named struct (e.g. `FeatureFrame(K)`).
+/// Read one port param's element type and direction. Two shapes are accepted:
+///
+///   - A **planar buffer view** `Planar(Lane, L)` / `PlanarConst(Lane, L)` — the
+///     enforced multi-channel form (`C` plane-major `[]Lane` planes). The
+///     view's element IDENTITY is recovered from its `Elem` decl (`Frame(Lane,L)`)
+///     and the direction from `is_const_view` (a const view is an input, a
+///     mutable view an output). This is what `connect`/`PortId` type-check
+///     against, so the pool class key and footprint are layout-agnostic.
+///   - A plain **slice** `[]A` / `[]const A` — the single-plane form. Mono
+///     (`A = Sample(T)`, one plane) and the non-`Frame` elements (`Scalar`,
+///     `FeatureFrame`, `Complex`, …) ride here unchanged; one plane is
+///     contiguous whether the port is spelled as a slice or a one-channel view.
+///
+/// The leading `self: *Self` is skipped by callers. A bare array slice element
+/// is rejected: the buffer pool keys on the element and the diagnostics name it,
+/// and a bare `[K]T` has no `typeName()` — it must be wrapped in a named struct
+/// (e.g. `FeatureFrame(K)`).
 fn portOfParam(comptime ParamT: type) struct { Elem: type, dir: Direction } {
+    if (types.isPlanarView(ParamT)) {
+        return .{
+            .Elem = ParamT.Elem,
+            .dir = if (ParamT.is_const_view) .in else .out,
+        };
+    }
     const info = @typeInfo(ParamT);
     if (info != .pointer or info.pointer.size != .slice) {
-        @compileError("pan: a port param must be a slice []A or []const A, got " ++
-            @typeName(ParamT));
+        @compileError("pan: a port param must be a planar view Planar(Lane,L)/" ++
+            "PlanarConst(Lane,L) or a slice []A/[]const A, got " ++ @typeName(ParamT));
     }
     const Elem = info.pointer.child;
     if (@typeInfo(Elem) == .array)
         @compileError("pan: a port element may not be a bare array " ++ @typeName(Elem) ++
             " — wrap it in a named struct (e.g. FeatureFrame(K)) so it carries a typeName()");
+    // STRICT PLANAR ENFORCEMENT (fail loud): a multi-channel audio stream buffer
+    // must be PLANAR — `C` plane-major channel planes accessed via a planar view —
+    // never an array-of-structs `[]Frame(Lane, L)` (which is interleaved L,R,L,R…
+    // at the buffer level for `C > 1`). Reject a slice whose element is a Frame of
+    // count > 1 here, so an AoS multi-channel port is a COMPILE ERROR, not silently
+    // treated as interleaved. (Mono `Frame(.,.mono)` = `Sample` is one plane and
+    // rides the slice path unchanged; `Scalar`/`FeatureFrame`/`Complex`/… are not
+    // multi-channel Frames and are unaffected.)
+    if (@hasDecl(Elem, "channel_count") and Elem.channel_count > 1)
+        @compileError("pan: a multi-channel port must use a planar view " ++
+            "Planar(Lane,L)/PlanarConst(Lane,L), not a slice of " ++ @typeName(Elem) ++
+            " (array-of-structs is interleaved for C>1 — the internal buffer form is planar)");
     return .{
         .Elem = Elem,
         .dir = if (info.pointer.is_const) .in else .out,
@@ -256,10 +287,10 @@ pub fn MapInPortAt(comptime Block: type, comptime i: usize) type {
 }
 
 /// The element on a `Rate`/`VariRate` block's output port — `pull(self, want,
-/// out: []Out)`, param index 2.
+/// out)`, param index 2. The `out` port may be a planar view or a plain slice.
 pub fn RateOutElem(comptime Block: type) type {
     const f = @typeInfo(@TypeOf(Block.pull)).@"fn";
-    return @typeInfo(f.params[2].type.?).pointer.child;
+    return portOfParam(f.params[2].type.?).Elem;
 }
 
 // --- named-input (Concat / fan-in by name) minting ------------------------
@@ -324,7 +355,6 @@ pub fn ParamPort(comptime Block: type, comptime name: []const u8) type {
 }
 
 test "classify: a process-only block is a Map" {
-    const types = @import("types.zig");
     const Gain = struct {
         const Self = @This();
         pub fn process(self: *Self, in: []const types.Sample(f32), out: []types.Sample(f32)) void {
@@ -339,7 +369,6 @@ test "classify: a process-only block is a Map" {
 }
 
 test "classify: a complete Rate is Rate; a VariRate is VariRate" {
-    const types = @import("types.zig");
     const Decim = struct {
         const Self = @This();
         pub const out_per_in = .{ 1, 2 };
@@ -367,7 +396,6 @@ test "classify: a complete Rate is Rate; a VariRate is VariRate" {
 }
 
 test "isSource: a zero-sample-input generator Map is a Source" {
-    const types = @import("types.zig");
     const Osc = struct {
         const Self = @This();
         phase: f32 = 0,
@@ -383,7 +411,6 @@ test "isSource: a zero-sample-input generator Map is a Source" {
 }
 
 test "parameter port minting: node.param.<name> is a typed param PortId" {
-    const types = @import("types.zig");
     const Biquad = struct {
         const Self = @This();
         pub const params = .{ .cutoff = types.Scalar(f32), .q = types.Scalar(f32) };
@@ -402,7 +429,6 @@ test "parameter port minting: node.param.<name> is a typed param PortId" {
 }
 
 test "PortId carries node identity: same signature, different node => distinct type" {
-    const types = @import("types.zig");
     const A = struct {
         const Self = @This();
         pub fn process(self: *Self, in: []const types.Sample(f32), out: []types.Sample(f32)) void {
@@ -430,7 +456,6 @@ test "checkPortCeiling accepts up to 8 ports per direction" {
 }
 
 test "indexed inputs: node.in(i) reads the i-th input port element" {
-    const types = @import("types.zig");
     const Sum2 = struct {
         const Self = @This();
         pub fn process(self: *Self, in0: []const types.Sample(f32), in1: []const types.Sample(f32), out: []types.Sample(f32)) void {
@@ -448,7 +473,6 @@ test "indexed inputs: node.in(i) reads the i-th input port element" {
 }
 
 test "named-input minting: NamedInPort + ConcatOut from a spec" {
-    const types = @import("types.zig");
     const spec = .{
         .mfcc = types.FeatureFrame(13),
         .centroid = types.Scalar(f32),

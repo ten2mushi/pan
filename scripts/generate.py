@@ -11,11 +11,16 @@ input signal from the manifest seed, computes the SciPy/NumPy *reference*
 (the independent external oracle — catalog.md §0.1, Rule 9), and writes both
 as native-endian raw sample bytes next to the manifest.
 
-On-disk layout: raw native-endian samples, no header, frame-major
-(interleaved: frame 0 all channels, frame 1 all channels, ...). The manifest
-carries shape/precision so the reader needs no in-band metadata. pan stores
-planar internally; the interleave↔planar conversion is an I/O-boundary concern,
-not part of the vector format.
+On-disk layout: raw native-endian samples, no header. pan's internal canonical
+buffer form is PLANAR (plane-major: all of channel 0, then all of channel 1, …),
+and the gold blobs match THAT form so a test can read them straight into pan's
+planar buffer with no transpose. A mono (C = 1) blob is therefore identical
+whether viewed as frame-major or plane-major (one channel). For C > 1 (e.g.
+stereo pan output), `expected.bin` is `[ch0_0…ch0_{n-1}][ch1_0…ch1_{n-1}]…`
+(plane-major), NOT `[ch0_0,ch1_0,ch0_1,ch1_1,…]` (interleaved). The interleaved
+device LPCM form lives only at the I/O boundary (the codec transposes there),
+not in the internal vector format. The manifest carries shape/precision so the
+reader needs no in-band metadata.
 
 The float oracle is compared by the test harness with numpy.allclose
 (|pan - ref| <= atol + rtol*|ref|); integer/fixed-point is compared bit-exact
@@ -206,10 +211,22 @@ def _quantize(y: np.ndarray, precision: str) -> np.ndarray:
     return np.clip(np.rint(y), info.min, info.max).astype(dt)
 
 
+def _planar_bytes(a: np.ndarray) -> bytes:
+    """Serialize a (n_frames, C) sample array as PLANE-MAJOR native-endian bytes:
+    all of channel 0, then all of channel 1, … (pan's internal canonical form).
+    For C == 1 this equals the frame-major bytes (one channel). For C > 1 it is
+    the transpose of the interleaved layout — `a.T` is (C, n), and `.tobytes()`
+    flattens it C-order to `[ch0…][ch1…]…`. `ascontiguousarray` makes the
+    transposed view contiguous so the byte order is plane-major as intended."""
+    return np.ascontiguousarray(a.T).tobytes()
+
+
 def _compute_blobs(manifest: dict, manifest_path: pathlib.Path) -> tuple[bytes, bytes]:
     """Deterministically compute (input_bytes, expected_bytes) from a manifest.
     Pure function of (manifest, seed) — the determinism contract lives here, so
-    `--check` can call it twice and assert byte-equality."""
+    `--check` can call it twice and assert byte-equality. Both blobs are
+    PLANE-MAJOR (pan's internal planar form): input is mono (C = 1, so plane-major
+    == frame-major), expected is plane-major across its output channels."""
     fmt = manifest["format"]
     precision = fmt["precision"]
     if precision not in _DTYPE:
@@ -226,14 +243,13 @@ def _compute_blobs(manifest: dict, manifest_path: pathlib.Path) -> tuple[bytes, 
         dt = _DTYPE[precision]
         x_codes = _quantize(x, precision)
         y_codes = _FIXED_REFERENCES[block](x_codes, manifest.get("params", {}), _FRAC[precision], dt)
-        return x_codes.tobytes(), y_codes.tobytes()
+        return _planar_bytes(x_codes), _planar_bytes(y_codes)
 
     # Float lanes: allclose. Real-valued reference, then cast to the lane.
     if block not in _REFERENCES:
         sys.exit(f"no reference compute for block {block!r} — add one to _REFERENCES")
     y = _REFERENCES[block](x, manifest.get("params", {}))
-    # Frame-major (interleaved) native-endian bytes; .tobytes() flattens C-order.
-    return _quantize(x, precision).tobytes(), _quantize(y, precision).tobytes()
+    return _planar_bytes(_quantize(x, precision)), _planar_bytes(_quantize(y, precision))
 
 
 def generate(manifest_path: pathlib.Path) -> None:

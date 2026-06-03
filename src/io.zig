@@ -344,61 +344,65 @@ pub fn encodeShaped(
 // Interleaved LPCM ↔ internal frame conversion
 // ===========================================================================
 //
-// KNOWN NON-CONFORMANCE (tracked, scheduled — not a silent deviation): the
-// internal canonical buffer layout is mandated PLANAR (C contiguous N-sample
-// channel planes, plane-major) — the SIMD-friendly form, a core throughput
-// requirement. But `Frame(Lane, L)` is `struct { ch: [C]Lane }`, so a `[]Frame`
-// buffer is **array-of-structs / interleaved** at the buffer level for C > 1,
-// which VIOLATES the planar mandate. This codec currently deinterleaves into that
-// AoS `Frame` representation; for a stereo f32 device stream AoS happens to equal
-// the device's interleaved layout (so today there is no transpose), but that is
-// the non-conformant path. The planar-conformance phase converts the element/port
-// view + the C>1 surfaces to plane-major, after which `deinterleave` transposes
-// device-interleaved → planes here (the boundary is the only place the transpose
-// belongs). Mono (C = 1) is already planar-conformant.
+// The internal canonical buffer layout is PLANAR (C contiguous N-sample channel
+// planes, plane-major) — the SIMD-friendly form, a core throughput requirement
+// (STRICTLY ENFORCED). The device/file speaks frame-major INTERLEAVED LPCM
+// (frame 0 all channels, frame 1 all channels, …). The transpose between the two
+// belongs ONLY here, at the I/O boundary: `deinterleave` transposes
+// device-interleaved bytes → C planar planes (a real transpose for C > 1);
+// `interleave`/`interleaveShaped` transpose planar planes → device-interleaved
+// bytes. The internal side is addressed through a planar VIEW (the `dst`/`src`
+// `Planar`/`PlanarConst` over the plane-major buffer), so this path is now
+// planar-conformant. Mono (C = 1) is one plane — the transpose degenerates to a
+// straight copy and the planar view is the whole buffer.
 
-/// Decode interleaved device LPCM bytes into internal f32 frames, reconciling the
-/// device channel order to the layout's canonical order. `src` holds
-/// `frames · C · fmt.byteWidth()` bytes (frame-major); `dst[f].ch[k]` receives the
-/// canonical channel `k` of frame `f`.
+/// Decode interleaved device LPCM bytes into the internal PLANAR f32 buffer,
+/// reconciling the device channel order to the layout's canonical order. `src`
+/// holds `frames · C · fmt.byteWidth()` bytes (frame-major interleaved); the
+/// canonical channel `k` of frame `f` is written to `dst.plane(k)[f]` — a
+/// transpose from interleaved to plane-major.
 pub fn deinterleave(
     comptime L: types.ChannelLayout,
     fmt: PcmFormat,
     perm: [L.count()]usize,
     src: []const u8,
-    dst: []types.Frame(f32, L),
+    dst: types.Planar(f32, L),
 ) void {
     const C = comptime L.count();
     const w = fmt.byteWidth();
-    for (dst, 0..) |*frame, f| {
-        inline for (0..C) |k| {
-            const di = perm[k];
+    inline for (0..C) |k| {
+        const di = perm[k];
+        const planek = dst.plane(k);
+        for (planek, 0..) |*s, f| {
             const off = (f * C + di) * w;
-            frame.ch[k] = decodeSample(fmt, src[off .. off + w]);
+            s.* = decodeSample(fmt, src[off .. off + w]);
         }
     }
 }
 
-/// Encode internal f32 frames into interleaved device LPCM bytes in the device's
-/// channel order (the inverse permutation of `deinterleave`), applying `dither`
-/// on an integer encoding. `dst` must hold `src.len · C · fmt.byteWidth()` bytes.
+/// Encode the internal PLANAR f32 buffer into interleaved device LPCM bytes in
+/// the device's channel order (the inverse permutation of `deinterleave`),
+/// applying `dither` on an integer encoding — a transpose from plane-major to
+/// frame-major interleaved. `dst` must hold `src.frames · C · fmt.byteWidth()`
+/// bytes.
 pub fn interleave(
     comptime L: types.ChannelLayout,
     fmt: PcmFormat,
     perm: [L.count()]usize,
     dither: ?*Dither,
-    src: []const types.Frame(f32, L),
+    src: types.PlanarConst(f32, L),
     dst: []u8,
 ) void {
     const C = comptime L.count();
     const w = fmt.byteWidth();
     const use_dither = dither != null and fmt.encoding != .float_pcm;
-    for (src, 0..) |frame, f| {
+    var f: usize = 0;
+    while (f < src.frames) : (f += 1) {
         inline for (0..C) |k| {
             const di = perm[k]; // canonical k goes back to device slot di
             const off = (f * C + di) * w;
             const d: f32 = if (use_dither) dither.?.next() else 0;
-            encodeSample(fmt, frame.ch[k], d, dst[off .. off + w]);
+            encodeSample(fmt, src.plane(k)[f], d, dst[off .. off + w]);
         }
     }
 }
@@ -407,25 +411,26 @@ pub fn interleave(
 /// optional dither) on a down-bit integer conversion — the quality path for
 /// f32 → i16/i24 output. The shaper carries per-channel error across calls, so
 /// pass the same `*NoiseShaper(C)` every block. Float encodings are exact and
-/// ignore both the shaper and the dither.
+/// ignore both the shaper and the dither. Reads the internal planar buffer.
 pub fn interleaveShaped(
     comptime L: types.ChannelLayout,
     fmt: PcmFormat,
     perm: [L.count()]usize,
     dither: ?*Dither,
     shaper: *NoiseShaper(L.count()),
-    src: []const types.Frame(f32, L),
+    src: types.PlanarConst(f32, L),
     dst: []u8,
 ) void {
     const C = comptime L.count();
     const w = fmt.byteWidth();
     const use_dither = dither != null and fmt.encoding != .float_pcm;
-    for (src, 0..) |frame, f| {
+    var f: usize = 0;
+    while (f < src.frames) : (f += 1) {
         inline for (0..C) |k| {
             const di = perm[k];
             const off = (f * C + di) * w;
             const d: f32 = if (use_dither) dither.?.next() else 0;
-            encodeShaped(C, fmt, shaper, k, frame.ch[k], d, dst[off .. off + w]);
+            encodeShaped(C, fmt, shaper, k, src.plane(k)[f], d, dst[off .. off + w]);
         }
     }
 }
@@ -914,10 +919,13 @@ test "deinterleave ↔ interleave is a bijection on the bytes (stereo, no dither
     std.mem.writeInt(i16, src[2..4], -2000, .little);
     std.mem.writeInt(i16, src[4..6], 3000, .little);
     std.mem.writeInt(i16, src[6..8], -4000, .little);
-    var frames: [2]types.Frame(f32, L) = undefined;
-    deinterleave(L, PcmFormat.s16le, perm, &src, &frames);
+    // Internal planar buffer: 2 frames stereo → [L0,L1][R0,R1].
+    var planes: [4]f32 = undefined;
+    const dst = types.Planar(f32, L).fromBase(&planes, 2);
+    deinterleave(L, PcmFormat.s16le, perm, &src, dst);
     var out: [8]u8 = undefined;
-    interleave(L, PcmFormat.s16le, perm, null, &frames, &out);
+    const csrc = types.PlanarConst(f32, L).fromBase(&planes, 2);
+    interleave(L, PcmFormat.s16le, perm, null, csrc, &out);
     try testing.expectEqualSlices(u8, &src, &out);
 }
 
