@@ -1,0 +1,4 @@
+{
+  "_comment": "Committed bench baselines (tiny scalars only — no blobs, per the disk-minimal policy). Footprint is a deterministic comptime constant; a regression fails -Dbench-gate hard. Throughput is machine-dependent and only checked outside a noise band, so it is not pinned here.",
+  "chain_f32_n512_footprint_bytes": 8192
+}

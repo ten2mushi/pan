@@ -140,9 +140,14 @@ fn registeredLayoutCount(ch: u16) bool {
 /// One render op — a single block invocation. The hot path replays
 /// `op.fn_ptr(op.self_ptr, gather(input_buffer_ids), scatter(output_buffer_ids), n)`.
 pub const RenderOp = struct {
-    /// Monomorphized Map/Rate kernel entry (erased). Null in this phase: the
-    /// op-list topology + buffer ids are fixed here; binding the concrete kernel
-    /// pointers is the executor's job (a later phase).
+    /// The graph node this op renders. The op-list is in forward-topo order, so
+    /// op index ≠ node id; the executor keys off this to recover the node's
+    /// monomorphized kernel and instance from the parallel block-type tuple.
+    node_id: usize,
+    /// Monomorphized Map/Rate kernel entry (erased). Null in the comptime IR: the
+    /// op-list topology + buffer ids are fixed by the commit pass; the runnable
+    /// kernel pointer is bound by the executor when it monomorphizes over the
+    /// block-type tuple (the same op then runs `fn_ptr(self_ptr, in, out, n)`).
     fn_ptr: ?*const anyopaque,
     self_ptr: ?*anyopaque,
     /// Buffer ids feeding this node's input ports — forward edges then feedback
@@ -160,6 +165,14 @@ pub const RenderOp = struct {
 /// The committed plan: a flat op-list (one op per node, forward-topo order) plus
 /// the static footprint. `footprint_bytes` is a comptime constant for a comptime
 /// graph, so it can size a `[footprint_bytes]u8` pool in `.bss`.
+///
+/// Beyond the op-list and the single footprint figure, the plan carries the
+/// **pool layout** the executor needs to turn an op's `*_buffer_ids` into real
+/// byte slices: each pool buffer id maps to a `[offset, offset+len)` window in
+/// the engine's flat pool. The window is contiguous per element-class (a class's
+/// `M` colored buffers sit back-to-back), and `len` is `N · element_size` for the
+/// class. Persistent (delay/feedback) state lives past `pool_bytes`; for a graph
+/// with no feedback `pool_bytes == footprint_bytes`.
 pub fn Plan(comptime n_ops: usize) type {
     return struct {
         ops: [n_ops]RenderOp,
@@ -167,6 +180,15 @@ pub fn Plan(comptime n_ops: usize) type {
         footprint_bytes: usize,
         /// Which buffer-assignment strategy produced this plan.
         buffer_mode: BufferMode,
+        /// Number of distinct pool buffer ids (across all element classes).
+        pool_buffer_count: usize = 0,
+        /// Total bytes the colored/per-edge pools occupy (the executor's pool
+        /// region). Excludes persistent delay/feedback state.
+        pool_bytes: usize = 0,
+        /// Byte offset of each pool buffer id into the engine's flat pool.
+        buffer_offset: [graph.max_edges]usize = [_]usize{0} ** graph.max_edges,
+        /// Byte length of each pool buffer id (`N · element_size` of its class).
+        buffer_byte_len: [graph.max_edges]usize = [_]usize{0} ** graph.max_edges,
     };
 }
 
@@ -610,6 +632,7 @@ pub fn commitComptimeMode(comptime g: graph.Graph, comptime mode: BufferMode) Co
                 }
             }
             ops[i] = .{
+                .node_id = v,
                 .fn_ptr = null,
                 .self_ptr = null,
                 .input_buffer_ids = in_ids,
@@ -620,13 +643,25 @@ pub fn commitComptimeMode(comptime g: graph.Graph, comptime mode: BufferMode) Co
             };
         }
 
-        // ---- 9. footprint -------------------------------------------------
+        // ---- 9. footprint + pool layout -----------------------------------
         // pools + persistent (delay rings / feedback read-sides) + per-block
         // state. The plugin-delay-compensation term is zero until that pass lands.
-        var footprint: usize = 0;
+        // While summing the pools, record each buffer id's byte window so the
+        // executor can resolve an op's buffer ids into real slices: a class's M
+        // colored buffers sit contiguously, each N·element_size bytes wide.
+        var buffer_offset: [max_edges]usize = [_]usize{0} ** max_edges;
+        var buffer_byte_len: [max_edges]usize = [_]usize{0} ** max_edges;
+        var pool_bytes: usize = 0;
         for (0..class_count) |c| {
-            footprint += class_M[c] * N * class_elem_size[c];
+            const stride = N * class_elem_size[c];
+            for (0..class_M[c]) |color| {
+                const id = class_base[c] + color;
+                buffer_offset[id] = pool_bytes;
+                buffer_byte_len[id] = stride;
+                pool_bytes += stride;
+            }
         }
+        var footprint: usize = pool_bytes;
         for (0..NC) |v| {
             if (g.nodes[v].is_delay)
                 footprint += g.nodes[v].delay_len * g.nodes[v].out_elem_size;
@@ -638,6 +673,10 @@ pub fn commitComptimeMode(comptime g: graph.Graph, comptime mode: BufferMode) Co
             .op_count = NC,
             .footprint_bytes = footprint,
             .buffer_mode = mode,
+            .pool_buffer_count = total_pool,
+            .pool_bytes = pool_bytes,
+            .buffer_offset = buffer_offset,
+            .buffer_byte_len = buffer_byte_len,
         };
     }
 }

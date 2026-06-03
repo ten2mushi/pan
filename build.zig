@@ -17,6 +17,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // The I/O HAL's device backend is platform C interop: on macOS the CoreAudio
+    // sink calls AudioToolbox; on Linux the ALSA sink calls libasound. Link the
+    // platform's audio transport so any executable built from this module
+    // resolves those `extern` symbols. (On Linux this links libasound, present on
+    // a real Linux host; the x86_64-linux-gnu *cross-compile* gate builds the
+    // static lib only — which does not link — so it needs no sysroot libasound.)
+    linkPlatformAudio(target, pan_mod);
+
     const lib = b.addLibrary(.{
         .name = "pan",
         .root_module = pan_mod,
@@ -31,6 +39,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "pan", .module = pan_mod }},
     });
+    linkPlatformAudio(target, exe_mod);
     const exe = b.addExecutable(.{ .name = "pan", .root_module = exe_mod });
     b.installArtifact(exe);
 
@@ -66,6 +75,12 @@ pub fn build(b: *std.Build) void {
         "tests/state_granularity_test.zig",
         "tests/commit_plan_test.zig",
         "tests/commit_validation_test.zig",
+        "tests/executor_test.zig",
+        "tests/dsp_filters_test.zig",
+        "tests/dsp_spatial_test.zig",
+        "tests/io_codec_test.zig",
+        "tests/bc_executor_test.zig",
+        "tests/gold_fixedpoint_test.zig",
     };
     for (harnesses) |path| {
         const h_mod = b.createModule(.{
@@ -74,6 +89,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{.{ .name = "pan", .module = pan_mod }},
         });
+        linkPlatformAudio(target, h_mod);
         const h_test = b.addTest(.{ .root_module = h_mod });
         test_step.dependOn(&b.addRunArtifact(h_test).step);
     }
@@ -103,11 +119,71 @@ pub fn build(b: *std.Build) void {
     docs_step.dependOn(&docs.step);
 
     // ---- Formatting gate -----------------------------------------------
-    const fmt = b.addFmt(.{ .paths = &.{ "src", "build.zig", "tests" }, .check = true });
+    const fmt = b.addFmt(.{ .paths = &.{ "src", "build.zig", "tests", "bench" }, .check = true });
     const fmt_step = b.step("fmt-check", "Verify formatting (CI gate)");
     fmt_step.dependOn(&fmt.step);
 
-    // ---- Bench placeholder (wired in a later phase) --------------------
-    const bench_step = b.step("bench", "Run benchmarks (placeholder)");
-    bench_step.dependOn(b.getInstallStep());
+    // ---- Linux cross-compile gate (the ≥2-backend proof) ---------------
+    // The brief mandates the I/O HAL run on macOS AND Linux (and embedded), with
+    // Linux/embedded *testing* deferred but the platforms architecturally
+    // accounted for. Building the pan static library for x86_64-linux-gnu proves
+    // the ALSA backend compiles behind the same I/O-HAL seam as CoreAudio — a
+    // single backend would leave the abstraction unexercised. A static lib does
+    // not link, so this needs no sysroot libasound; the compile is the stand-in
+    // for on-device Linux testing.
+    const linux_target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
+    const linux_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = linux_target,
+        .optimize = optimize,
+    });
+    const linux_lib = b.addLibrary(.{ .name = "pan-linux", .root_module = linux_mod, .linkage = .static });
+    const cross_step = b.step("cross-linux", "Cross-compile the pan lib for x86_64-linux-gnu (ALSA seam gate)");
+    cross_step.dependOn(&linux_lib.step);
+
+    // ---- Benchmarks (measurement, not correctness) --------------------
+    // Each bench/*.zig is a ReleaseFast executable importing pan. Benches MEASURE
+    // (throughput, latency headroom, footprint, byte displacement); they never
+    // assert an oracle match. Runs on demand, not as the per-commit gate.
+    const bench_gate = b.option(bool, "bench-gate", "Fail hard on a footprint regression vs the committed baselines") orelse false;
+    const bench_opts = b.addOptions();
+    bench_opts.addOption(bool, "bench_gate", bench_gate);
+    const bench_opts_mod = bench_opts.createModule();
+
+    const bench_step = b.step("bench", "Build and run the benchmarks (ReleaseFast)");
+    const benches = [_][]const u8{
+        "bench/dsp_chain.zig",
+    };
+    for (benches) |path| {
+        const bench_mod = b.createModule(.{
+            .root_source_file = b.path(path),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "pan", .module = pan_mod },
+                .{ .name = "build_options", .module = bench_opts_mod },
+            },
+        });
+        linkPlatformAudio(target, bench_mod);
+        const bench_exe = b.addExecutable(.{ .name = b.fmt("bench-{s}", .{std.fs.path.stem(path)}), .root_module = bench_mod });
+        bench_step.dependOn(&b.addRunArtifact(bench_exe).step);
+    }
+}
+
+/// Link the build target's audio transport so the I/O HAL's `extern` device-
+/// backend symbols resolve in any executable built from `mod`. macOS → the
+/// AudioToolbox / CoreAudio frameworks (the CoreAudio sink); Linux → libasound
+/// (the ALSA sink). Other targets need nothing (the no-op backend has no
+/// externs). Called for every module that becomes a runnable artifact.
+fn linkPlatformAudio(target: std.Build.ResolvedTarget, mod: *std.Build.Module) void {
+    const os = target.result.os.tag;
+    if (os.isDarwin()) {
+        mod.link_libc = true;
+        mod.linkFramework("AudioToolbox", .{});
+        mod.linkFramework("CoreAudio", .{});
+        mod.linkFramework("CoreFoundation", .{});
+    } else if (os == .linux) {
+        mod.link_libc = true;
+        mod.linkSystemLibrary("asound", .{});
+    }
 }

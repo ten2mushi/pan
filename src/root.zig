@@ -89,11 +89,31 @@ pub const Telemetry = engine.Telemetry;
 pub const RealtimeToken = engine.RealtimeToken;
 pub const enterRealtimeThread = engine.enterRealtimeThread;
 pub const renderInto = engine.renderInto;
+/// The Tier-A bound executor — monomorphize over a committed comptime graph and
+/// its node-id → block-type tuple to get a runnable, wait-free pull renderer.
+pub const Executor = engine.Executor;
 
-// --- namespaced layered-library roots (filled by later phases) ------------
+// --- the Compute HAL (portable @Vector kernels) ---------------------------
 
-pub const io = struct {};
-pub const filters = struct {};
+pub const simd = @import("simd.zig");
+
+// --- namespaced layered-library roots -------------------------------------
+
+/// The I/O boundary: LPCM codecs (14 PCM formats + i24 packed + float PCM,
+/// endianness, channel-order reconciliation, dither), the in-memory `LpcmSource`,
+/// and the device backends (CoreAudio on macOS, ALSA on Linux) behind one seam.
+pub const io = @import("io.zig");
+/// First DSP filters — `Gain` (aliasing-safe) and `Biquad` (per-sample Mealy).
+pub const filters = @import("filters.zig");
+/// Spatial blocks — `ConstantPowerPan` (mono → stereo, layout-changing).
+pub const spatial = @import("spatial.zig");
+/// The realtime-thread entry: `pan.realtime.enterRealtimeThread()` sets FTZ/DAZ.
+pub const realtime = struct {
+    pub const enterRealtimeThread = engine.enterRealtimeThread;
+    pub const RealtimeToken = engine.RealtimeToken;
+};
+
+// Layered-library roots filled by later phases.
 pub const gen = struct {};
 pub const env = struct {};
 pub const fx = struct {};
@@ -101,9 +121,7 @@ pub const spectral = struct {};
 pub const feat = struct {};
 pub const mix = struct {};
 pub const time = struct {};
-pub const spatial = struct {};
 pub const synth = struct {};
-pub const realtime = struct {};
 
 /// Graph combinators. `Concat` is the named fan-in: a comptime
 /// struct-of-(name → element-type) spec mints one typed input port per name

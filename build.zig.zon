@@ -10,6 +10,7 @@
         "CONTRIBUTING.md",
         "src",
         "tests",
+        "bench",
         "scripts",
         "examples",
         "include",
