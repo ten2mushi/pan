@@ -203,18 +203,26 @@ test "renderInto requires a token and replays an (empty-kernel) op-list" {
     const types = @import("types.zig");
     const graph = @import("graph.zig");
     const port = @import("port.zig");
-    const Gain = struct {
+    // A Source (zero input) so the path is source-rooted, into a Sink.
+    const Src = struct {
         const Self = @This();
-        pub fn process(self: *Self, in: []const types.Sample(f32), out: []types.Sample(f32)) void {
+        pub fn process(self: *Self, out: []types.Sample(f32)) void {
             _ = self;
-            @memcpy(out, in);
+            _ = out;
+        }
+    };
+    const Sink = struct {
+        const Self = @This();
+        pub fn process(self: *Self, in: []const types.Sample(f32)) void {
+            _ = self;
+            _ = in;
         }
     };
     const g = comptime blk: {
         var gg = graph.Graph.empty;
-        const a = gg.add(Gain);
-        const b = gg.add(Gain);
-        gg.connect(port.MapOutPort(Gain), a, 0, port.MapInPort(Gain), b, 0);
+        const a = gg.add(Src);
+        const b = gg.add(Sink);
+        gg.connect(port.MapOutPort(Src), a, 0, port.MapInPort(Sink), b, 0);
         break :blk gg;
     };
     const plan = comptime try commit.commitComptime(g);
@@ -224,7 +232,8 @@ test "renderInto requires a token and replays an (empty-kernel) op-list" {
     var pm = mux.PullSampleMux{ .in_buf = &in_bytes, .out_buf = &out_bytes };
 
     const token = enterRealtimeThread();
-    renderInto(g.edge_count, token, &plan, pm.sampleMux());
+    // One op per node: pass the node count as the op-list length.
+    renderInto(g.node_count, token, &plan, pm.sampleMux());
     try std.testing.expect(token._entered);
 }
 

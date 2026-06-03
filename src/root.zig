@@ -64,7 +64,13 @@ pub const graph = @import("graph.zig");
 pub const commit = @import("commit.zig");
 pub const RenderOp = commit.RenderOp;
 pub const Plan = commit.Plan;
+pub const CommitError = commit.CommitError;
+pub const BufferMode = commit.BufferMode;
+pub const Coercion = commit.Coercion;
+pub const EdgeFormat = commit.EdgeFormat;
+pub const coercionFor = commit.coercionFor;
 pub const commitComptime = commit.commitComptime;
+pub const commitComptimeMode = commit.commitComptimeMode;
 
 /// The developer-facing graph builder — `pan.Graph.init / add / connect /
 /// commit`. Wraps the IR and the commit pass.
@@ -136,9 +142,11 @@ test {
 
 const SmokeSource = struct {
     const Self = @This();
-    pub fn process(self: *Self, in: []const Sample(f32), out: []Sample(f32)) void {
+    // A Source: zero sample inputs, so it may legally root a path (its output
+    // length comes from the pull demand, not an input slice).
+    pub fn process(self: *Self, out: []Sample(f32)) void {
         _ = self;
-        @memcpy(out, in);
+        _ = out;
     }
 };
 
@@ -153,9 +161,10 @@ const SmokeGain = struct {
 
 const SmokeSink = struct {
     const Self = @This();
-    pub fn process(self: *Self, in: []const Sample(f32), out: []Sample(f32)) void {
+    // A sink: input only, no output port.
+    pub fn process(self: *Self, in: []const Sample(f32)) void {
         _ = self;
-        @memcpy(out, in);
+        _ = in;
     }
 };
 
@@ -179,8 +188,10 @@ test "comptime-commit smoke gate: footprint_bytes is a comptime constant > 0" {
     comptime std.debug.assert(proof.len > 0);
 
     try std.testing.expect(plan.footprint_bytes > 0);
-    try std.testing.expectEqual(@as(usize, 2), plan.op_count); // two edges
-    try std.testing.expectEqual(@as(usize, 2 * @sizeOf(Sample(f32))), plan.footprint_bytes);
+    // One op per node: source → gain → sink = 3 ops.
+    try std.testing.expectEqual(@as(usize, 3), plan.op_count);
+    // Two ping-pong pool buffers (M=2) over the default N=512: 2 · 512 · 4.
+    try std.testing.expectEqual(@as(usize, 2 * 512 * @sizeOf(Sample(f32))), plan.footprint_bytes);
 }
 
 test "smoke gate: classifier + PortId minting on the stub blocks" {

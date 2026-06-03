@@ -11,6 +11,15 @@ const std = @import("std");
 const port = @import("port.zig");
 
 /// A node: a block instance identified by a comptime index and its class.
+///
+/// Beyond identity, a node carries the small set of block-derived facts the
+/// commit pass reads: the rate ratio and group delay (for scheduling and the
+/// later plugin-delay pass), the persistent-state sizes (for the footprint), and
+/// the two structural flags the validation stages key off — whether the block is
+/// a SOURCE (a zero-sample-input generator whose output length comes from the
+/// pull demand, so it may legally sit at the head of a path) and whether it is a
+/// DELAY element (so a feedback cycle through it is causal). Every field is read
+/// off the block type once, at `add`, so the commit pass never re-reflects.
 pub const Node = struct {
     /// Comptime-stable identity (also the topological-sort key seed).
     id: usize,
@@ -18,24 +27,99 @@ pub const Node = struct {
     /// `@typeName` of the block type, for diagnostics / op-list emission.
     type_name: []const u8,
     /// `@sizeOf` of one element on this node's output port — drives the pool
-    /// class key `(element_type, element_count)` and the footprint formula.
+    /// class key `(element_type, element_count)` and the footprint formula. Zero
+    /// for a sink (no output port).
     out_elem_size: usize,
     /// `@typeName` of the output element type — the pool class discriminator.
+    /// `"(sink)"` for a block with no output port.
     out_elem_name: []const u8,
+    /// True iff the block has zero sample-input ports: a generator (oscillator,
+    /// noise, file/stream source) whose output length is set by the pull demand,
+    /// not by an input slice. A path head must be a source (or a persistent
+    /// generator) — otherwise it has no producer for its inputs (the
+    /// source-rooted rule).
+    is_source: bool,
+    /// True iff the block is a delay element (a unit delay / delay line, or a
+    /// fused tight-feedback kernel with a declared internal one-block delay). A
+    /// feedback cycle is causal only if it contains at least one such element,
+    /// because this block's output must then depend solely on a *previous*
+    /// block's looped value.
+    is_delay: bool,
+    /// The persistent ring length (in elements) of a delay element; 0 otherwise.
+    /// This is pool-excluded state (its live range spans every callback), and it
+    /// contributes the feedback/persistent term of the footprint.
+    delay_len: usize,
+    /// Worst-case group delay introduced by the block, in samples of its own
+    /// rate domain. 0 for a pure rate-1:1 map. Read by the plugin-delay pass.
+    algorithmic_latency: usize,
+    /// The output:input rate ratio `p:q` (1:1 for a map). Read by the rate
+    /// scheduler when propagating demand upstream.
+    out_per_in_p: usize,
+    out_per_in_q: usize,
+    /// The author's M4 assertion that the block reads each input fully before
+    /// writing the aliased output, so its single output edge may share the input
+    /// buffer (in-place). Consumed by the in-place coalescing gate (a later
+    /// phase); recorded here so the gate has it.
+    aliasing_safe: bool,
+    /// Per-block persistent state bytes (coefficients, window tables, …) — the
+    /// per-block term of the footprint. 0 unless the block declares it.
+    state_size: usize,
+    /// Which clock grid this node's I/O lives on. A single audio domain (0) for
+    /// every graph until rate-elastic blocks introduce a second grid; carried so
+    /// the per-rate-domain delay pass has it.
+    rate_domain: usize,
+    /// This node's I/O sample rate (Hz). Uniform across a graph until rate
+    /// conversion is introduced; the negotiate pass compares a producer's and
+    /// consumer's rate to decide whether a resampler coercion is required.
+    sample_rate: u32,
+    /// Bitset over parameter-slot indices marked as driven by an external
+    /// `set`/`schedule` (bit i ⇒ slot i is set-driven). The one-source check
+    /// rejects a slot that is ALSO fed by a wired parameter edge. `set`/`schedule`
+    /// populate this in a later phase; the commit-time check lives here now.
+    set_param_slots: u8,
 };
 
-/// An edge: a wiring from `(from_node, from_port)` to `(to_node, to_port)`.
+/// A forward edge: a wiring from `(from_node, from_port)` to `(to_node, to_port)`.
+/// Feedback (back) edges live in a separate `FeedbackEdge` list (the z⁻¹ split),
+/// so the topological sort sees only the DAG and the SCC check unions both.
 pub const Edge = struct {
     from_node: usize,
     from_port: port.PortIndex,
     to_node: usize,
     to_port: port.PortIndex,
-    /// Explicitly-declared feedback edge. Removed before the
-    /// topological sort; its SCC must contain a delay (else error.DelayFreeLoop).
-    feedback: bool,
+    /// Vestigial on a forward edge (always false); kept so hand-built edge
+    /// literals that set it still compile. Declared feedback rides in the
+    /// `FeedbackEdge` list, not here.
+    feedback: bool = false,
     /// `@sizeOf` of the element carried on this edge (pool sizing).
     elem_size: usize,
     /// `@typeName` of the element type carried (pool class discriminator).
+    elem_name: []const u8,
+    /// True iff this is a wired PARAMETER (control) edge — a side input carrying
+    /// one coefficient per render call, exempt from the rate-1:1 law and subject
+    /// to the one-source rule (a slot driven by both a wire and `set` is a commit
+    /// error). False for an ordinary sample/stream edge.
+    is_param: bool = false,
+    /// Channel count of the carried element (1 for a non-`Frame` element). Lets
+    /// the negotiate pass reason about channel up/down-mix coercion without
+    /// re-parsing the element name.
+    channels: u16 = 1,
+};
+
+/// A declared feedback (back) edge — the z⁻¹ write/read split. Its **write side**
+/// is produced THIS block; its **read side** is satisfied from the persistent
+/// value produced LAST block, so the edge imposes no scheduling order (it is
+/// removed from the topological sort) but DOES close a cycle for the
+/// SCC-has-delay check. Same direction as a forward edge (producer → consumer)
+/// for reachability.
+pub const FeedbackEdge = struct {
+    /// Producer side (this block's output that feeds back).
+    write_node: usize,
+    write_port: port.PortIndex,
+    /// Consumer side (where the previous block's value is read in).
+    read_node: usize,
+    read_port: port.PortIndex,
+    elem_size: usize,
     elem_name: []const u8,
 };
 
@@ -44,9 +128,19 @@ pub const Edge = struct {
 pub const max_nodes = 64;
 pub const max_edges = 128;
 
+/// Does the block have a sample output port? A `Map` sink (input only) has none;
+/// a `Rate`/`VariRate` always produces through `pull`.
+fn hasOutput(comptime Block: type) bool {
+    return switch (port.classify(Block)) {
+        .Map => port.mapOutputCount(Block) > 0,
+        .Rate, .VariRate => true,
+    };
+}
+
 /// The output element type of a block, by class. In a comptime `if` on a
 /// comptime-known class, only the taken branch is analyzed — so a Map never
-/// touches `Block.pull` and a Rate never touches `Block.process`.
+/// touches `Block.pull` and a Rate never touches `Block.process`. Caller must
+/// have checked `hasOutput(Block)` first (a sink has no output element).
 fn outElemOf(comptime Block: type) type {
     if (port.classify(Block) == .Map) return port.MapOutElem(Block);
     // Rate: pull(self, want, out: []Out) — `out` is param 2.
@@ -54,35 +148,98 @@ fn outElemOf(comptime Block: type) type {
     return @typeInfo(f.params[2].type.?).pointer.child;
 }
 
+/// Read the block's rate ratio `p:q`. A `Map` is rate-1:1; a `Rate` declares
+/// `out_per_in = .{ p, q }`. (A `VariRate`'s scheduling uses its `rate_bounds`
+/// min endpoint — wired in with the rate-elastic blocks; here it falls back to
+/// 1:1, which no committed graph yet exercises.)
+fn ratioOf(comptime Block: type) struct { p: usize, q: usize } {
+    if (@hasDecl(Block, "out_per_in")) {
+        const r = Block.out_per_in;
+        return .{ .p = r[0], .q = r[1] };
+    }
+    // A VariRate plans on its WORST-CASE (min) ratio endpoint — the most input
+    // ever needed for a given demand (rate_bounds.min). Falls back to 1:1.
+    if (@hasDecl(Block, "rate_bounds")) {
+        const m = Block.rate_bounds.min;
+        return .{ .p = m[0], .q = m[1] };
+    }
+    return .{ .p = 1, .q = 1 };
+}
+
+/// Channel count carried on an element type — `Frame`/`Sample` expose
+/// `channel_count`; every other element is single-channel for negotiation.
+fn channelsOf(comptime Elem: type) u16 {
+    if (@hasDecl(Elem, "channel_count")) return @intCast(Elem.channel_count);
+    return 1;
+}
+
 pub const Graph = struct {
     nodes: [max_nodes]Node = undefined,
     node_count: usize = 0,
+    /// Forward (DAG) edges. Declared feedback edges live in `feedback`.
     edges: [max_edges]Edge = undefined,
     edge_count: usize = 0,
+    /// Declared feedback (back) edges — the z⁻¹ split, kept separate so topo sees
+    /// the DAG and SCC-has-delay unions both.
+    feedback: [max_edges]FeedbackEdge = undefined,
+    feedback_count: usize = 0,
+    /// The device block size N this graph is committed for, in frames. Pool
+    /// buffers hold N elements, so the footprint scales with it; the buffer-id
+    /// *map* does not (an N change resizes the backing bytes, not the topology).
+    /// On embedded N is comptime-fixed, so the footprint is a comptime constant.
+    block_size: usize = 512,
+    /// The pipeline sample rate (Hz) every node inherits at `add`. The negotiate
+    /// pass compares producer/consumer rates to decide resampler coercion.
+    sample_rate: u32 = 48_000,
 
     const Self = @This();
 
     pub const empty: Self = .{};
 
-    /// Add a block instance. Returns the node id. The output element size/name
-    /// are read from the block's `process` signature (Map) for pool keying;
-    /// Rate blocks report their `pull` output element.
+    /// Add a block instance. Returns the node id. Reads, once, every
+    /// block-derived fact the commit pass needs: the output element (pool key),
+    /// the source/delay structural flags, the rate ratio, the group delay, and
+    /// the persistent-state sizes. A sink (no output port) records a zero/`(sink)`
+    /// output element.
     pub fn add(self: *Self, comptime Block: type) usize {
         const class = comptime port.classify(Block);
         // Derive the output element type in a comptime context so the unused
-        // switch prong (which references `Block.pull` for a Map, or
-        // `Block.process` for a Rate) is never analyzed for the wrong class.
-        const OutElem = comptime outElemOf(Block);
+        // branch (which references `Block.pull` for a Map, or `Block.process`
+        // for a Rate, or the output port of a sink) is never analyzed wrongly.
+        const out_size = comptime if (hasOutput(Block)) @sizeOf(outElemOf(Block)) else 0;
+        const out_name = comptime if (hasOutput(Block)) @typeName(outElemOf(Block)) else "(sink)";
+        const ratio = comptime ratioOf(Block);
         const id = self.node_count;
         self.nodes[id] = .{
             .id = id,
             .class = class,
             .type_name = @typeName(Block),
-            .out_elem_size = @sizeOf(OutElem),
-            .out_elem_name = @typeName(OutElem),
+            .out_elem_size = out_size,
+            .out_elem_name = out_name,
+            .is_source = comptime port.isSource(Block),
+            // A delay element is marked by a `delay_len` decl (its persistent
+            // ring length): a unit delay declares 1, a delay line declares L.
+            .is_delay = comptime @hasDecl(Block, "delay_len"),
+            .delay_len = comptime if (@hasDecl(Block, "delay_len")) Block.delay_len else 0,
+            .algorithmic_latency = comptime if (@hasDecl(Block, "algorithmic_latency")) Block.algorithmic_latency else 0,
+            .out_per_in_p = ratio.p,
+            .out_per_in_q = ratio.q,
+            .aliasing_safe = comptime @hasDecl(Block, "aliasing_safe") and Block.aliasing_safe,
+            .state_size = comptime if (@hasDecl(Block, "state_size")) Block.state_size else 0,
+            .rate_domain = 0,
+            .sample_rate = self.sample_rate,
+            .set_param_slots = 0,
         };
         self.node_count += 1;
         return id;
+    }
+
+    /// Mark parameter slot `slot` of node `node_id` as driven by an external
+    /// `set`/`schedule`. The one-source check then rejects the commit if that
+    /// same slot is also fed by a wired parameter edge (P2). (`set`/`schedule`
+    /// call this in a later phase; exposed now so the check is real and testable.)
+    pub fn markSetParam(self: *Self, node_id: usize, slot: port.PortIndex) void {
+        self.nodes[node_id].set_param_slots |= (@as(u8, 1) << slot);
     }
 
     /// Connect an output `PortId` to an input `PortId`. Type-checks element
@@ -100,12 +257,12 @@ pub const Graph = struct {
         in_idx: port.PortIndex,
     ) void {
         typeCheckConnect(OutPort, InPort);
-        self.addEdge(out_node, out_idx, in_node, in_idx, OutPort.Elem, false);
+        self.addEdge(out_node, out_idx, in_node, in_idx, OutPort.Elem, comptime port.isParamPort(InPort));
     }
 
-    /// Connect a declared feedback (back) edge. Same type check;
-    /// flagged so the commit pass removes it before the topological sort and
-    /// requires its SCC to contain a delay.
+    /// Connect a declared feedback (back) edge. Same type check; recorded in the
+    /// separate `feedback` list (the z⁻¹ split) so it is absent from the
+    /// topological sort and present in the SCC-has-delay check.
     pub fn connectFeedback(
         self: *Self,
         comptime OutPort: type,
@@ -116,7 +273,16 @@ pub const Graph = struct {
         in_idx: port.PortIndex,
     ) void {
         typeCheckConnect(OutPort, InPort);
-        self.addEdge(out_node, out_idx, in_node, in_idx, OutPort.Elem, true);
+        const f = self.feedback_count;
+        self.feedback[f] = .{
+            .write_node = out_node,
+            .write_port = out_idx,
+            .read_node = in_node,
+            .read_port = in_idx,
+            .elem_size = @sizeOf(OutPort.Elem),
+            .elem_name = @typeName(OutPort.Elem),
+        };
+        self.feedback_count += 1;
     }
 
     fn typeCheckConnect(comptime OutPort: type, comptime InPort: type) void {
@@ -142,7 +308,7 @@ pub const Graph = struct {
         in_node: usize,
         in_idx: port.PortIndex,
         comptime Elem: type,
-        feedback: bool,
+        comptime is_param: bool,
     ) void {
         const e = self.edge_count;
         self.edges[e] = .{
@@ -150,13 +316,20 @@ pub const Graph = struct {
             .from_port = out_idx,
             .to_node = in_node,
             .to_port = in_idx,
-            .feedback = feedback,
+            .feedback = false,
             .elem_size = @sizeOf(Elem),
             .elem_name = @typeName(Elem),
+            .is_param = is_param,
+            .channels = channelsOf(Elem),
         };
         self.edge_count += 1;
     }
 };
+
+/// The committed graph the commit pass consumes is exactly this IR — a finite
+/// diagram of nodes, forward edges, and the declared feedback (z⁻¹) edges. The
+/// spec names it `CommittedGraph`; here it is the same value.
+pub const CommittedGraph = Graph;
 
 test "connect type-checks matching PortIds; graph records the edge" {
     const types = @import("types.zig");
@@ -189,7 +362,11 @@ test "feedback edge is explicitly flagged (catalog §5.2)" {
     var g = Graph.empty;
     const a = g.add(Gain);
     g.connectFeedback(port.MapOutPort(Gain), a, 0, port.MapInPort(Gain), a, 0);
-    try std.testing.expect(g.edges[0].feedback);
+    // Feedback edges live in the separate z⁻¹ list, not in `edges`.
+    try std.testing.expectEqual(@as(usize, 0), g.edge_count);
+    try std.testing.expectEqual(@as(usize, 1), g.feedback_count);
+    try std.testing.expectEqual(@as(usize, 0), g.feedback[0].write_node);
+    try std.testing.expectEqual(@as(usize, 0), g.feedback[0].read_node);
 }
 
 // === Yoneda coverage additions =========================================
@@ -275,10 +452,14 @@ test "connectFeedback type-checks identically but flags the edge as feedback" {
     const b = g.add(GainF32);
     g.connect(port.MapOutPort(GainF32), a, 0, port.MapInPort(GainF32), b, 0);
     g.connectFeedback(port.MapOutPort(GainF32), b, 0, port.MapInPort(GainF32), a, 0);
+    // The forward edge stays in `edges`; the back-edge goes to the z⁻¹ list with
+    // the same element metadata and the producer→consumer (write→read) split.
+    try std.testing.expectEqual(@as(usize, 1), g.edge_count);
+    try std.testing.expectEqual(@as(usize, 1), g.feedback_count);
     try std.testing.expect(!g.edges[0].feedback);
-    try std.testing.expect(g.edges[1].feedback);
-    // Both edges still carry the correct element metadata.
-    try std.testing.expectEqual(g.edges[0].elem_size, g.edges[1].elem_size);
+    try std.testing.expectEqual(@as(usize, 1), g.feedback[0].write_node);
+    try std.testing.expectEqual(@as(usize, 0), g.feedback[0].read_node);
+    try std.testing.expectEqual(g.edges[0].elem_size, g.feedback[0].elem_size);
 }
 
 test "add records a Rate node and its pull-output element as the pool key" {
