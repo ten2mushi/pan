@@ -1,23 +1,25 @@
-//! The graph-commit pass — SKELETON, comptime-evaluable (catalog §8.2, §8.5).
+//! The graph-commit pass — SKELETON, comptime-evaluable.
 //!
-//! Pipeline (catalog §8.2): topological sort (DAG minus feedback edges) →
-//! liveness → per-element-class coloring → SCC-has-delay check → PDC →
-//! buffer-id assignment → emit op-list + footprint.
+//! The full pipeline is: topological sort (the DAG with feedback edges removed)
+//! → liveness → per-element-class buffer coloring → delay-free-cycle check →
+//! plugin-delay compensation → buffer-id assignment → emit the render op-list +
+//! the static footprint.
 //!
-//! This skeleton implements: edge type-name validation, >8-port rejection,
+//! This skeleton implements only: edge validation, the >8-port rejection,
 //! delay-free-cycle detection (`error.DelayFreeLoop`), per-edge buffer
-//! assignment (pool MODE B = one buffer per edge), and a `footprint_bytes`
-//! that is a comptime constant for a comptime graph (catalog §7.8 H2).
+//! assignment (MODE B = one buffer per edge — the obviously-correct baseline),
+//! and a `footprint_bytes` that is a comptime constant for a comptime graph (the
+//! bounded-static-memory guarantee the embedded profile relies on).
 //!
-//! TODO(pan_commit_pass_algorithms.md): optimal interval-coloring (left-edge
-//! algorithm, catalog §7.2) replacing MODE B; PDC longest-path DP (§7.7).
+//! TODO: optimal interval coloring (the left-edge algorithm) replacing MODE B,
+//! and the plugin-delay-compensation longest-path pass.
 
 const std = @import("std");
 const graph = @import("graph.zig");
 const port = @import("port.zig");
 
-/// One render op (catalog §8.2 / C2). `fn_ptr`/`self_ptr` are erased; the hot
-/// path replays `op.fn_ptr(op.self_ptr, gather(inputs), scatter(outputs), n)`.
+/// One render op. `fn_ptr`/`self_ptr` are erased; the hot path replays
+/// `op.fn_ptr(op.self_ptr, gather(inputs), scatter(outputs), n)`.
 pub const RenderOp = struct {
     /// Monomorphized Map/Rate kernel entry (erased). Optional in the skeleton
     /// because stub graphs may carry no bound kernel yet.
@@ -32,33 +34,34 @@ pub const RenderOp = struct {
     n_or_pull_spec: usize,
 };
 
-/// The committed plan: a flat op-list + the static footprint (catalog §8.2).
+/// The committed plan: a flat op-list + the static footprint.
 pub fn Plan(comptime n_ops: usize) type {
     return struct {
         ops: [n_ops]RenderOp,
         op_count: usize,
-        /// The H2 memory bound — a comptime constant for a comptime graph
-        /// (catalog §7.8, §8.5). MODE B: Σ_edge element_size · element_count.
+        /// The static render-memory bound — a comptime constant for a comptime
+        /// graph. MODE B: the sum over edges of element_size · element_count.
         footprint_bytes: usize,
     };
 }
 
 pub const CommitError = error{
-    /// A cycle with no delay element in its SCC (catalog §5.2, ⊢ A4).
+    /// A feedback cycle whose strongly-connected component contains no delay
+    /// element (proven ⊢ — a delay-free loop is not causal).
     DelayFreeLoop,
-    /// >8 ports on a direction (catalog §3.2, ⊢ A2) — also caught at port mint.
+    /// More than 8 ports on a direction (proven ⊢; also caught at port mint).
     PortCeilingExceeded,
     /// Edge endpoints reference out-of-range nodes (malformed graph).
     MalformedGraph,
 };
 
-/// Commit a graph at COMPTIME (catalog §8.5: `commitComptime`). Returns a
-/// `Plan` whose `footprint_bytes` is a comptime constant. The whole body is
-/// comptime-evaluable: that the build compiles is the discharge of the
-/// comptime-commit obligation for this graph (the smoke gate, §8.5).
+/// Commit a graph at COMPTIME. Returns a `Plan` whose `footprint_bytes` is a
+/// comptime constant. The whole body is comptime-evaluable: that the build
+/// compiles is itself the discharge of the comptime-commit obligation for this
+/// graph (the embedded "same code, specialized" promise in miniature).
 pub fn commitComptime(comptime g: graph.Graph) CommitError!Plan(g.edge_count) {
     comptime {
-        // --- validate edges & port ceiling (catalog §3.2 A2) ---------------
+        // --- validate edges & port ceiling --------------------------------
         var in_degree: [graph.max_nodes]usize = [_]usize{0} ** graph.max_nodes;
         var out_degree: [graph.max_nodes]usize = [_]usize{0} ** graph.max_nodes;
         for (g.edges[0..g.edge_count]) |e| {
@@ -75,30 +78,31 @@ pub fn commitComptime(comptime g: graph.Graph) CommitError!Plan(g.edge_count) {
         }
 
         // --- delay-free-cycle detection on the DAG minus feedback edges -----
-        // SCC-has-delay law (catalog §5.2): a back-edge is legal iff its SCC
-        // contains a delay; the topological sort runs on the DAG with feedback
-        // edges removed. In this skeleton a `feedback` flag *is* the declared
-        // delay (a UnitDelay/DelayLine sits on that edge). So: after removing
-        // feedback edges, the remainder must be acyclic. Any cycle that remains
-        // is a delay-free loop → error.DelayFreeLoop.
+        // A back-edge is legal only if its cycle contains a delay element, and
+        // the topological sort runs on the graph with feedback edges removed. In
+        // this skeleton a `feedback` flag *is* the declared delay (a UnitDelay /
+        // DelayLine sits on that edge). So after removing feedback edges the
+        // remainder must be acyclic; any cycle that survives is a delay-free
+        // loop, which is not causal → error.DelayFreeLoop.
         try rejectDelayFreeCycle(g);
 
         // --- buffer-id assignment (pool MODE B: one buffer per edge) --------
-        // TODO(pan_commit_pass_algorithms.md §7.2): replace with per-class
-        // interval coloring (left-edge, optimal k = M_class). MODE B is the
-        // obviously-correct baseline used by the B≡C differential test (§7.5).
+        // TODO: replace with per-element-class interval coloring (the left-edge
+        // algorithm, optimal in colors used). MODE B (one buffer per edge) is
+        // the obviously-correct baseline the colored-pool path is differenced
+        // against.
         var ops: [g.edge_count]RenderOp = undefined;
         var footprint: usize = 0;
         for (g.edges[0..g.edge_count], 0..) |e, i| {
-            // MODE B: edge i owns buffer i. element_count is 1 in the skeleton
-            // (the per-edge window); footprint = Σ element_size · element_count.
-            footprint += e.elem_size; // · element_count (=1) — catalog §7.8
+            // MODE B: edge i owns buffer i. The per-edge element_count is 1 in
+            // the skeleton; footprint = sum of element_size · element_count.
+            footprint += e.elem_size;
             var in_ids: [port.max_ports_per_direction]usize = undefined;
             var out_ids: [port.max_ports_per_direction]usize = undefined;
             in_ids[0] = i;
             out_ids[0] = i;
             ops[i] = .{
-                .fn_ptr = null, // stub kernel (empty) — catalog: kernels may be empty
+                .fn_ptr = null, // stub kernel (empty kernels are allowed)
                 .self_ptr = null,
                 .input_buffer_ids = in_ids,
                 .input_count = 1,
@@ -116,9 +120,9 @@ pub fn commitComptime(comptime g: graph.Graph) CommitError!Plan(g.edge_count) {
     }
 }
 
-/// Reject any cycle that survives removal of declared feedback edges
-/// (catalog §5.2, ⊢ A4 — `error.DelayFreeLoop`). DFS-based cycle detection on
-/// the non-feedback sub-graph (comptime-evaluable).
+/// Reject any cycle that survives removal of the declared feedback edges
+/// (proven ⊢ — `error.DelayFreeLoop`; a loop with no delay is not causal).
+/// DFS-based cycle detection on the non-feedback sub-graph (comptime-evaluable).
 fn rejectDelayFreeCycle(comptime g: graph.Graph) CommitError!void {
     comptime {
         const White = 0;
@@ -235,9 +239,9 @@ test "a cycle WITH a declared feedback edge is accepted (catalog §5.2)" {
 
 // === Yoneda coverage additions =========================================
 // The commit pass is observed by callers through the Plan it returns (op_count
-// + the H2 comptime footprint_bytes + the per-edge buffer ids) and through the
-// CommitError it raises. We characterize it by: footprint = Σ edge element
-// sizes (the MODE-B formula, catalog §7.8), DETERMINISM/comptime-constancy of
+// + the comptime-constant footprint_bytes + the per-edge buffer ids) and through
+// the CommitError it raises. We characterize it by: footprint = sum of edge
+// element sizes (the MODE-B formula), the determinism / comptime-constancy of
 // that footprint, op_count == edge_count, the MalformedGraph + cycle errors at
 // their boundaries (self-loop, length-3 cycle, the legal diamond DAG), the
 // feedback-breaks-the-cycle law, and the empty-graph degenerate case.
@@ -277,7 +281,7 @@ test "footprint scales with the element width carried on the edges" {
     // count alone — pinning the Σ element_size formula, not a per-edge constant.
     const Stereo = struct {
         const Self = @This();
-        pub fn process(self: *Self, in: []const tt.Frame(f32, 2), out: []tt.Frame(f32, 2)) void {
+        pub fn process(self: *Self, in: []const tt.Frame(f32, .stereo), out: []tt.Frame(f32, .stereo)) void {
             _ = self;
             @memcpy(out, in);
         }
@@ -307,9 +311,9 @@ test "footprint_bytes is a COMPTIME CONSTANT, usable as an array length (H2, §7
 }
 
 test "commit is deterministic: re-committing the same graph yields the same plan" {
-    // The commit is a pure comptime transform (Rule 5): footprint + op_count are
+    // The commit is a pure comptime transform: footprint + op_count are
     // identical across evaluations. A non-deterministic commit would silently
-    // move the §7.8 memory bound.
+    // move the static-memory bound.
     const g = comptime chain(5);
     const p1 = comptime try commitComptime(g);
     const p2 = comptime try commitComptime(g);

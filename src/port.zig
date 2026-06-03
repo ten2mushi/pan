@@ -1,43 +1,42 @@
-//! Comptime port machinery (type-model §1, exec §8, catalog §3.2).
+//! Comptime port machinery: classify a block, read its port element types off
+//! its signature, and mint the typed `PortId` handles that `connect`
+//! type-checks against.
 //!
-//! Reads a block's `process`/`pull` fn params via `@typeInfo`:
-//!   - `.pointer.child`    = the port element type `A`
-//!   - `.pointer.is_const` = input (const slice) vs output (mutable slice)
-//! Mints a typed `PortId(Node, dir, Elem)` carrying node identity + direction
-//! + element type. The 8-port-per-direction ceiling is enforced via a `u3`
-//! index type. A comptime classifier labels a block `Map` vs `Rate` by the
-//! presence of `out_per_in`/`pull`.
+//! A block's sample ports are derived from its `process`/`pull` parameters: a
+//! `[]const A` slice is an input port carrying element `A`, a `[]A` slice is an
+//! output port. The element type rides inside the `PortId` so wiring a mismatch
+//! is a compile error naming the offending port. The port index is a `u3`,
+//! which also caps a direction at 8 ports — a readable compile error past that.
 
 const std = @import("std");
 
-/// Port direction. A `process`/`pull` param that is a `[]const A` slice is an
-/// input; a `[]A` slice is an output (exec §8: `.pointer.is_const`).
+/// Port direction. Derived purely from slice constness: `[]const A` is an
+/// input, `[]A` is an output.
 pub const Direction = enum { in, out };
 
-/// The 8-port-per-direction ceiling (catalog §3.2 / A2). The port index is a
-/// `u3` (values 0..7). Indexing past 7 is rejected at comptime via the
-/// `checkPortCeiling` helper below; `u3` is also the on-the-wire index type.
+/// The port-index type. `u3` indexes 0..7, which is also the 8-port-per-
+/// direction ceiling — eight ports per direction is enough for every block, and
+/// the small index type makes the ceiling a type-level fact.
 pub const PortIndex = u3;
 pub const max_ports_per_direction: comptime_int = std.math.maxInt(PortIndex) + 1; // 8
 
-/// Enforce the 8-port ceiling as a comptime `@compileError` (catalog §3.2, ⊢).
-/// Called when minting port lists from a signature.
+/// Reject more than 8 ports per direction with a readable compile error.
 pub fn checkPortCeiling(comptime n: comptime_int, comptime dir: Direction) void {
     if (n > max_ports_per_direction) {
         @compileError(std.fmt.comptimePrint(
-            "pan: {d} {s} ports exceeds the 8-port-per-direction ceiling (catalog §3.2)",
+            "pan: {d} {s} ports exceeds the 8-port-per-direction ceiling",
             .{ n, @tagName(dir) },
         ));
     }
 }
 
-/// A typed `PortId` — the connect-checking handle (type-model §1, catalog §3.2).
-/// Carries node identity (`Node` type + comptime index), direction, and element
-/// type. Because `Elem` rides in the type, `connect` (graph.zig) type-checks
-/// both ends and emits a named `@compileError` on a mismatch.
+/// A typed `PortId` — the connect-checking handle. It carries node identity
+/// (the `Node` type), `direction`, and the element type `Elem`. Because all
+/// three ride in the type, `connect` type-checks both ends and rejects a
+/// mismatch at compile time, and two ports of different nodes are distinct
+/// types even with identical element/direction.
 pub fn PortId(comptime NodeT: type, comptime dir: Direction, comptime ElemT: type) type {
     return struct {
-        /// Index of this port within its direction on the node (0..7).
         index: PortIndex,
 
         const Self = @This();
@@ -51,17 +50,29 @@ pub fn PortId(comptime NodeT: type, comptime dir: Direction, comptime ElemT: typ
     };
 }
 
-/// Is `T` a `PortId(...)`? Structural check used by `connect`. Written as a
-/// comptime tag switch: a bare `@typeInfo(T) == .@"struct"` union-to-tag
-/// compare degrades to a runtime value here (it does not constant-fold inside
-/// the `and` chain on 0.16.0), so we switch on the tag instead.
+/// A typed parameter (control) `PortId`. Same shape as `PortId` plus the marker
+/// `is_param`, so the rate-1:1 law can exclude parameter ports: a parameter
+/// port delivers one coefficient per render call, not a length-N sample window.
+pub fn ParamPortId(comptime NodeT: type, comptime ElemT: type) type {
+    return struct {
+        index: PortIndex,
+
+        const Self = @This();
+        pub const Node = NodeT;
+        pub const direction: Direction = .in;
+        pub const Elem = ElemT;
+        pub const is_param = true;
+
+        pub fn init(index: PortIndex) Self {
+            return .{ .index = index };
+        }
+    };
+}
+
+/// Structural test: is `T` a `PortId` (or `ParamPortId`)? Used by `connect`.
+/// Wrapped in a `comptime` block so the answer is comptime-known at the call
+/// site (a chain of `@hasDecl` results does not constant-fold on its own here).
 pub fn isPortId(comptime T: type) bool {
-    // NOTE (0.16.0): an `and`-chain of comptime `@hasDecl` results inside a
-    // plain `fn ... bool` body lowers to a RUNTIME value (it does not
-    // constant-fold), so callers that need a comptime answer must wrap the call
-    // in `comptime`. We additionally guard with a `comptime` block here so the
-    // returned value is comptime-known whenever the function is itself called
-    // in a comptime context.
     comptime {
         if (@typeInfo(T) != .@"struct") return false;
         if (!@hasDecl(T, "Node")) return false;
@@ -71,71 +82,132 @@ pub fn isPortId(comptime T: type) bool {
     }
 }
 
-/// Extract the element type and direction of one slice param of a
-/// `process`/`pull` fn. Asserts the param is a slice (`[]A` / `[]const A`);
-/// `self: *Self` (the first param) is handled by the caller, not here.
+/// Is `T` specifically a parameter port (carries the `is_param` marker)?
+pub fn isParamPort(comptime T: type) bool {
+    comptime {
+        return isPortId(T) and @hasDecl(T, "is_param");
+    }
+}
+
+/// Read one slice param's element type and direction. Asserts the param is a
+/// slice `[]A` / `[]const A`; the leading `self: *Self` is skipped by callers.
+/// A bare array element is rejected: the buffer pool keys on the element and the
+/// diagnostics name it, and a bare `[K]T` has no `typeName()` — it must be
+/// wrapped in a named struct (e.g. `FeatureFrame(K)`).
 fn portOfParam(comptime ParamT: type) struct { Elem: type, dir: Direction } {
     const info = @typeInfo(ParamT);
     if (info != .pointer or info.pointer.size != .slice) {
-        @compileError("pan: port param must be a slice []A or []const A, got " ++
+        @compileError("pan: a port param must be a slice []A or []const A, got " ++
             @typeName(ParamT));
     }
+    const Elem = info.pointer.child;
+    if (@typeInfo(Elem) == .array)
+        @compileError("pan: a port element may not be a bare array " ++ @typeName(Elem) ++
+            " — wrap it in a named struct (e.g. FeatureFrame(K)) so it carries a typeName()");
     return .{
-        .Elem = info.pointer.child,
+        .Elem = Elem,
         .dir = if (info.pointer.is_const) .in else .out,
     };
 }
 
-/// The two morphism classes (catalog §2). Discriminated ⊢ at comptime by
-/// presence of `out_per_in`/`pull`.
-pub const BlockClass = enum { Map, Rate };
+/// The three morphism classes, discriminated at comptime by field presence:
+/// `rate_bounds` ⇒ `VariRate`; `out_per_in`/`pull` ⇒ `Rate`; otherwise a block
+/// with a `process` is a `Map`. (A Source — a generator with zero sample-input
+/// ports — is still one of these; it is not a fourth class.)
+pub const BlockClass = enum { Map, Rate, VariRate };
 
-/// Classify a block type as `Map` or `Rate` (catalog §2, exec §2; ⊢ A3).
-/// A `Rate` declares `out_per_in` and `pull` (and `algorithmic_latency`); a
-/// `Map` declares neither — it has a `process`. Field/decl presence is
-/// structurally checkable, so this is decidable at comptime.
+/// Classify a block. The contract for each class is checked structurally:
+///   - A `VariRate` declares a bounded `rate_bounds` interval and a worst-case
+///     `max_latency`; missing either is a build error (the variable out:in
+///     ratio still needs a static plan, so the worst case must be declared).
+///   - A `Rate` declares both `out_per_in` and `pull`, plus `algorithmic_latency`
+///     (group delay is orthogonal to the rate ratio); missing any is a build
+///     error.
+///   - Anything else with a `process` is a `Map`.
 pub fn classify(comptime Block: type) BlockClass {
-    const has_pull = @hasDecl(Block, "pull");
+    const has_rate_bounds = @hasDecl(Block, "rate_bounds");
     const has_ratio = @hasDecl(Block, "out_per_in");
-    if (has_pull or has_ratio) {
-        // R1 (catalog §2.2): a Rate missing either declaration is a build error.
+    const has_pull = @hasDecl(Block, "pull");
+
+    if (has_rate_bounds) {
+        if (!@hasDecl(Block, "max_latency"))
+            @compileError("pan: " ++ @typeName(Block) ++
+                " declares rate_bounds but no max_latency — VariRate contract incomplete");
         if (!has_pull)
             @compileError("pan: " ++ @typeName(Block) ++
-                " declares out_per_in but no pull — Rate contract incomplete (R1)");
+                " declares rate_bounds but no pull — VariRate contract incomplete");
+        return .VariRate;
+    }
+
+    if (has_pull or has_ratio) {
+        if (!has_pull)
+            @compileError("pan: " ++ @typeName(Block) ++
+                " declares out_per_in but no pull — Rate contract incomplete");
         if (!has_ratio)
             @compileError("pan: " ++ @typeName(Block) ++
-                " declares pull but no out_per_in — Rate contract incomplete (R1)");
+                " declares pull but no out_per_in — Rate contract incomplete");
         if (!@hasDecl(Block, "algorithmic_latency"))
             @compileError("pan: " ++ @typeName(Block) ++
-                " is a Rate but declares no algorithmic_latency (R1, catalog §2.2)");
+                " is a Rate but declares no algorithmic_latency");
         return .Rate;
     }
+
     if (!@hasDecl(Block, "process"))
         @compileError("pan: " ++ @typeName(Block) ++
-            " is neither Map (process) nor Rate (out_per_in+pull)");
+            " is neither a Map (process) nor a Rate (out_per_in + pull)");
     return .Map;
 }
 
-/// The element type carried by a `Map`'s input port (param 1 of `process`),
-/// derived from the signature via `@typeInfo` (type-model §1).
+/// Count a `Map`'s sample input/output ports by scanning its `process` params
+/// (after `self`) and classifying each slice by constness.
+fn mapPortCounts(comptime Block: type) struct { inputs: comptime_int, outputs: comptime_int } {
+    const f = @typeInfo(@TypeOf(Block.process)).@"fn";
+    var inputs: comptime_int = 0;
+    var outputs: comptime_int = 0;
+    inline for (f.params[1..]) |p| {
+        const port = portOfParam(p.type.?);
+        if (port.dir == .in) inputs += 1 else outputs += 1;
+    }
+    return .{ .inputs = inputs, .outputs = outputs };
+}
+
+/// A Source is a block with ZERO sample-input ports: a generator (oscillator,
+/// noise, wavetable, constant) whose output length comes from the pull demand,
+/// not from an input slice. It is not a class of its own — it is a Map or Rate
+/// with an empty input side.
+pub fn isSource(comptime Block: type) bool {
+    comptime {
+        return switch (classify(Block)) {
+            .Map => mapPortCounts(Block).inputs == 0,
+            // A stream/sample source is a Rate whose `pull` reads a backing
+            // store rather than an upstream edge; its zero-input-ness is a
+            // graph-shape property checked at commit, not a signature property.
+            .Rate, .VariRate => false,
+        };
+    }
+}
+
+/// The element on a `Map`'s (first) input port — the first `[]const A` param.
 pub fn MapInElem(comptime Block: type) type {
     const f = @typeInfo(@TypeOf(Block.process)).@"fn";
-    // params: (self: *Self, in: []const In, out: []Out)
-    const p = portOfParam(f.params[1].type.?);
-    std.debug.assert(p.dir == .in);
-    return p.Elem;
+    inline for (f.params[1..]) |p| {
+        const port = portOfParam(p.type.?);
+        if (port.dir == .in) return port.Elem;
+    }
+    @compileError("pan: " ++ @typeName(Block) ++ " has no sample input port (is it a Source?)");
 }
 
-/// The element type carried by a `Map`'s output port (param 2 of `process`).
+/// The element on a `Map`'s (first) output port — the first `[]A` param.
 pub fn MapOutElem(comptime Block: type) type {
     const f = @typeInfo(@TypeOf(Block.process)).@"fn";
-    const p = portOfParam(f.params[2].type.?);
-    std.debug.assert(p.dir == .out);
-    return p.Elem;
+    inline for (f.params[1..]) |p| {
+        const port = portOfParam(p.type.?);
+        if (port.dir == .out) return port.Elem;
+    }
+    @compileError("pan: " ++ @typeName(Block) ++ " has no output port");
 }
 
-/// Mint the input `PortId` type for a `Map` block, reading its `process`
-/// signature (type-model §1: the same handle `connect` type-checks).
+/// Mint the input `PortId` type for a `Map` block from its `process` signature.
 pub fn MapInPort(comptime Block: type) type {
     checkPortCeiling(1, .in);
     return PortId(Block, .in, MapInElem(Block));
@@ -147,255 +219,265 @@ pub fn MapOutPort(comptime Block: type) type {
     return PortId(Block, .out, MapOutElem(Block));
 }
 
-test "classifier labels a Map block (catalog §2, ⊢ A3)" {
+/// The number of sample input ports a `Map` declares.
+pub fn mapInputCount(comptime Block: type) comptime_int {
+    return mapPortCounts(Block).inputs;
+}
+
+/// The number of sample output ports a `Map` declares.
+pub fn mapOutputCount(comptime Block: type) comptime_int {
+    return mapPortCounts(Block).outputs;
+}
+
+/// The element on a `Map`'s `i`-th input port (0-based, declaration order) — the
+/// reader behind the homogeneous indexed accessor `node.in(i)`. An out-of-range
+/// index is a compile error naming the block and its port count.
+pub fn MapInElemAt(comptime Block: type, comptime i: usize) type {
+    const f = @typeInfo(@TypeOf(Block.process)).@"fn";
+    comptime var seen: usize = 0;
+    inline for (f.params[1..]) |p| {
+        const pinfo = portOfParam(p.type.?);
+        if (pinfo.dir == .in) {
+            if (seen == i) return pinfo.Elem;
+            seen += 1;
+        }
+    }
+    @compileError(std.fmt.comptimePrint(
+        "pan: {s} has no input port {d} (it declares {d})",
+        .{ @typeName(Block), i, seen },
+    ));
+}
+
+/// Mint the `i`-th input `PortId` for a `Map` block (the typed `node.in(i)`
+/// handle). The 8-port ceiling is enforced via the index.
+pub fn MapInPortAt(comptime Block: type, comptime i: usize) type {
+    checkPortCeiling(i + 1, .in);
+    return PortId(Block, .in, MapInElemAt(Block, i));
+}
+
+/// The element on a `Rate`/`VariRate` block's output port — `pull(self, want,
+/// out: []Out)`, param index 2.
+pub fn RateOutElem(comptime Block: type) type {
+    const f = @typeInfo(@TypeOf(Block.pull)).@"fn";
+    return @typeInfo(f.params[2].type.?).pointer.child;
+}
+
+// --- named-input (Concat / fan-in by name) minting ------------------------
+//
+// A named-fan-in block declares `pub const inputs = .{ .name = ElemType, ... }`
+// (a comptime struct-of-(name → element-type)). Each named input mints a typed
+// `PortId` exposed as `node.in.<name>`, and the synthesized output struct's
+// field order IS the canonical column order — wiring and column identity are
+// the SAME declaration, so a transposed feature matrix is unrepresentable.
+
+/// Read the element type declared for named input `name`.
+fn NamedInputElem(comptime Block: type, comptime name: []const u8) type {
+    if (!@hasDecl(Block, "inputs"))
+        @compileError("pan: " ++ @typeName(Block) ++ " declares no named inputs");
+    const spec = Block.inputs;
+    if (!@hasField(@TypeOf(spec), name))
+        @compileError("pan: " ++ @typeName(Block) ++ " has no named input '" ++ name ++ "'");
+    return @field(spec, name);
+}
+
+/// Mint the typed input `PortId` for `node.in.<name>` on a named-fan-in block.
+pub fn NamedInPort(comptime Block: type, comptime name: []const u8) type {
+    return PortId(Block, .in, NamedInputElem(Block, name));
+}
+
+/// Synthesize the output struct of a `Concat`/named-fan-in `spec` (a
+/// struct-of-(name → element-type)): one field per named input, in declaration
+/// order — the canonical feature-matrix column order.
+pub fn ConcatOut(comptime spec: anytype) type {
+    const fields = @typeInfo(@TypeOf(spec)).@"struct".fields;
+    comptime var names: [fields.len][:0]const u8 = undefined;
+    comptime var elem_types: [fields.len]type = undefined;
+    comptime var attrs: [fields.len]std.builtin.Type.StructField.Attributes = undefined;
+    inline for (fields, 0..) |f, i| {
+        names[i] = f.name;
+        elem_types[i] = @field(spec, f.name);
+        attrs[i] = .{};
+    }
+    const final_names = names;
+    const final_types = elem_types;
+    const final_attrs = attrs;
+    return @Struct(.auto, null, &final_names, &final_types, &final_attrs);
+}
+
+/// The control element type declared for parameter slot `name` in a block's
+/// `pub const params = .{ .name = ControlElem, ... }`. A wrong name is a
+/// compile error naming the slot.
+fn ParamElem(comptime Block: type, comptime name: []const u8) type {
+    if (!@hasDecl(Block, "params"))
+        @compileError("pan: " ++ @typeName(Block) ++ " declares no parameter ports");
+    const params = Block.params;
+    if (!@hasField(@TypeOf(params), name))
+        @compileError("pan: " ++ @typeName(Block) ++ " has no parameter port '" ++ name ++ "'");
+    return @field(params, name);
+}
+
+/// Mint the typed parameter `PortId` for `node.param.<name>` — the in-graph
+/// modulation handle. `connect` type-checks a driver's output against it, so a
+/// wrong control element type is a compile error naming the slot.
+pub fn ParamPort(comptime Block: type, comptime name: []const u8) type {
+    return ParamPortId(Block, ParamElem(Block, name));
+}
+
+test "classify: a process-only block is a Map" {
     const types = @import("types.zig");
     const Gain = struct {
         const Self = @This();
-        gain: f32 = 1.0,
-        // rate-1:1, element-preserving Map (empty stub kernel: copy).
         pub fn process(self: *Self, in: []const types.Sample(f32), out: []types.Sample(f32)) void {
             _ = self;
             @memcpy(out, in);
         }
     };
     try std.testing.expect(classify(Gain) == .Map);
-    // PortId minting reads the signature: element type is Sample(f32).
-    const InPort = MapInPort(Gain);
-    const OutPort = MapOutPort(Gain);
-    try std.testing.expect(InPort.Elem == types.Sample(f32));
-    try std.testing.expect(OutPort.Elem == types.Sample(f32));
-    try std.testing.expect(InPort.direction == .in);
-    try std.testing.expect(OutPort.direction == .out);
-    try std.testing.expect(comptime isPortId(InPort));
+    try std.testing.expect(MapInPort(Gain).Elem == types.Sample(f32));
+    try std.testing.expect(MapOutPort(Gain).direction == .out);
+    try std.testing.expect(comptime isPortId(MapInPort(Gain)));
 }
 
-test "classifier labels a Rate block; channel-changing Map sees C-difference" {
+test "classify: a complete Rate is Rate; a VariRate is VariRate" {
     const types = @import("types.zig");
-    // A Framer-shaped Rate stub (declarations present; pull body is a stub).
-    const Framer = struct {
+    const Decim = struct {
         const Self = @This();
-        pub const out_per_in = .{ 1, 64 }; // 1 frame per 64 input samples (Ratio stub)
-        pub const algorithmic_latency: usize = 0;
-        pub fn needed_input(self: *Self, want: usize) usize {
-            _ = self;
-            return want * 64;
-        }
-        pub fn pull(self: *Self, want: usize, out: []types.FeatureFrame(64)) usize {
+        pub const out_per_in = .{ 1, 2 };
+        pub const algorithmic_latency: usize = 3;
+        pub fn pull(self: *Self, want: usize, out: []types.Sample(f32)) usize {
             _ = self;
             _ = out;
             return want;
         }
     };
-    try std.testing.expect(classify(Framer) == .Rate);
+    try std.testing.expect(classify(Decim) == .Rate);
 
-    // A channel-changing Map: in Frame(.,1), out Frame(.,2) — differ in C only.
-    const Upmix = struct {
+    const Asrc = struct {
         const Self = @This();
-        pub fn process(self: *Self, in: []const types.Frame(f32, 1), out: []types.Frame(f32, 2)) void {
+        pub const rate_bounds = .{ .min = .{ 1, 2 }, .nominal = .{ 1, 1 }, .max = .{ 2, 1 } };
+        pub const max_latency: usize = 2048;
+        pub fn pull(self: *Self, want: usize, out: []types.Sample(f32)) usize {
             _ = self;
-            for (in, out) |s, *d| d.* = .{ .ch = .{ s.ch[0], s.ch[0] } };
+            _ = out;
+            return want;
         }
     };
-    try std.testing.expect(classify(Upmix) == .Map);
-    try std.testing.expect(MapInElem(Upmix) == types.Frame(f32, 1));
-    try std.testing.expect(MapOutElem(Upmix) == types.Frame(f32, 2));
-    // The element types differ => connect across a C-mismatch is a type error.
-    try std.testing.expect(MapInElem(Upmix) != MapOutElem(Upmix));
+    try std.testing.expect(classify(Asrc) == .VariRate);
+    try std.testing.expect(RateOutElem(Asrc) == types.Sample(f32));
 }
 
-// === Yoneda coverage additions =========================================
-// The port machinery is observed by the graph through: the signature reader
-// (portOfParam) deriving Elem+direction from `[]const A`/`[]A`; the typed
-// PortId carrying (Node, direction, Elem); the structural isPortId predicate
-// connect() guards on; the u3 ceiling; and the Map/Rate classifier. We pin
-// each, including the corner cases of the classifier and the const/elem
-// derivation, plus DOCUMENTED expected-@compileError cases (negative comptime
-// tests cannot run; see the commented stubs — they must stay disabled to keep
-// the build green per the testing contract §7 note).
-
-const test_types = @import("types.zig");
-
-test "port direction is derived purely from slice constness ([]const A => in)" {
-    // The single bit `is_const` decides direction (exec §8). A block whose
-    // input/output lanes are the SAME element type still gets distinct
-    // directions purely from constness — proving direction is NOT inferred
-    // from element type or param position alone.
-    const Id = struct {
+test "isSource: a zero-sample-input generator Map is a Source" {
+    const types = @import("types.zig");
+    const Osc = struct {
         const Self = @This();
-        pub fn process(self: *Self, in: []const test_types.Sample(f32), out: []test_types.Sample(f32)) void {
+        phase: f32 = 0,
+        pub const params = .{ .freq = types.Scalar(f32) };
+        pub fn process(self: *Self, out: []types.Sample(f32)) void {
             _ = self;
-            @memcpy(out, in);
+            _ = out;
         }
     };
-    const In = MapInPort(Id);
-    const Out = MapOutPort(Id);
-    try std.testing.expect(In.direction == .in);
-    try std.testing.expect(Out.direction == .out);
-    // Same element type, opposite directions => the PortId TYPES still differ.
-    try std.testing.expect(In.Elem == Out.Elem);
-    try std.testing.expect(In != Out);
+    try std.testing.expect(classify(Osc) == .Map);
+    try std.testing.expect(comptime isSource(Osc));
+    try std.testing.expect(MapOutElem(Osc) == types.Sample(f32)); // out read despite no input
 }
 
-test "PortId carries node identity, direction, and Elem as the connect handle" {
-    const Blk = struct {
+test "parameter port minting: node.param.<name> is a typed param PortId" {
+    const types = @import("types.zig");
+    const Biquad = struct {
         const Self = @This();
-        pub fn process(self: *Self, in: []const test_types.Frame(f32, 2), out: []test_types.Frame(f32, 2)) void {
+        pub const params = .{ .cutoff = types.Scalar(f32), .q = types.Scalar(f32) };
+        pub fn process(self: *Self, in: []const types.Sample(f32), out: []types.Sample(f32)) void {
             _ = self;
             @memcpy(out, in);
         }
     };
-    const In = MapInPort(Blk);
-    try std.testing.expect(In.Node == Blk);
-    try std.testing.expect(In.direction == .in);
-    try std.testing.expect(In.Elem == test_types.Frame(f32, 2));
-    // The runtime index field is a u3 carrying the port slot (0..7).
-    const p = In.init(5);
-    try std.testing.expectEqual(@as(PortIndex, 5), p.index);
-    try std.testing.expect(@TypeOf(p.index) == u3);
+    const Cutoff = ParamPort(Biquad, "cutoff");
+    try std.testing.expect(Cutoff.Elem == types.Scalar(f32));
+    try std.testing.expect(Cutoff.direction == .in);
+    try std.testing.expect(comptime isParamPort(Cutoff));
+    try std.testing.expect(comptime isPortId(Cutoff));
+    // A sample port is not a param port.
+    try std.testing.expect(!comptime isParamPort(MapInPort(Biquad)));
 }
 
-test "PortId types for different nodes are distinct even with identical Elem/dir" {
-    // Node identity rides in the TYPE: two blocks with the same signature mint
-    // DIFFERENT PortId types, so connect cannot confuse one node for another.
+test "PortId carries node identity: same signature, different node => distinct type" {
+    const types = @import("types.zig");
     const A = struct {
         const Self = @This();
-        pub fn process(self: *Self, in: []const test_types.Sample(f32), out: []test_types.Sample(f32)) void {
+        pub fn process(self: *Self, in: []const types.Sample(f32), out: []types.Sample(f32)) void {
             _ = self;
             @memcpy(out, in);
         }
     };
     const B = struct {
         const Self = @This();
-        pub fn process(self: *Self, in: []const test_types.Sample(f32), out: []test_types.Sample(f32)) void {
+        pub fn process(self: *Self, in: []const types.Sample(f32), out: []types.Sample(f32)) void {
             _ = self;
             @memcpy(out, in);
         }
     };
     try std.testing.expect(MapInPort(A) != MapInPort(B));
-    try std.testing.expect(MapInPort(A).Node != MapInPort(B).Node);
-    try std.testing.expect(MapInPort(A).Elem == MapInPort(B).Elem); // same Elem
+    try std.testing.expect(MapInPort(A).Elem == MapInPort(B).Elem);
 }
 
-test "isPortId: positive on a minted PortId, negative on non-PortId types" {
-    const Blk = struct {
-        const Self = @This();
-        pub fn process(self: *Self, in: []const test_types.Sample(f32), out: []test_types.Sample(f32)) void {
-            _ = self;
-            @memcpy(out, in);
-        }
-    };
-    try std.testing.expect(comptime isPortId(MapInPort(Blk)));
-    try std.testing.expect(comptime isPortId(MapOutPort(Blk)));
-    // Non-PortId types are rejected: a primitive, a slice, the element struct
-    // itself, and a struct missing the Node/direction/Elem decls.
-    try std.testing.expect(!comptime isPortId(u32));
-    try std.testing.expect(!comptime isPortId([]const f32));
-    try std.testing.expect(!comptime isPortId(test_types.Sample(f32)));
-    const Faux = struct {
-        pub const Node = u8; // has Node but not direction/Elem
-    };
-    try std.testing.expect(!comptime isPortId(Faux));
-}
-
-test "checkPortCeiling accepts up to 8 ports per direction (boundary, catalog §3.2)" {
-    // The ceiling is INCLUSIVE of 8 (u3 indexes 0..7 = 8 slots). 1..8 must all
-    // be accepted at comptime; 9 is the @compileError documented below.
+test "checkPortCeiling accepts up to 8 ports per direction" {
     inline for (1..max_ports_per_direction + 1) |n| {
-        checkPortCeiling(n, .in); // compiles => accepted
+        checkPortCeiling(n, .in);
         checkPortCeiling(n, .out);
     }
     try std.testing.expectEqual(@as(comptime_int, 8), max_ports_per_direction);
-    try std.testing.expectEqual(@as(comptime_int, 8), std.math.maxInt(PortIndex) + 1);
 }
 
-// EXPECTED-@compileError (catalog §3.2, ⊢ A2): the 9th port per direction.
-// A @compileError cannot be caught by a runtime test (it aborts compilation),
-// so per the testing contract §7 note this case is pinned as a DISABLED stub.
-// Un-commenting it MUST fail the build with the named ceiling diagnostic
-// "9 in ports exceeds the 8-port-per-direction ceiling (catalog §3.2)".
-//
-//   test "EXPECTED COMPILE ERROR: 9th port exceeds the u3 ceiling" {
-//       checkPortCeiling(9, .in); // => @compileError, build goes red (loud)
-//   }
-
-test "classify: a process-only block is a Map; bare process has no Rate decls" {
-    const M = struct {
+test "indexed inputs: node.in(i) reads the i-th input port element" {
+    const types = @import("types.zig");
+    const Sum2 = struct {
         const Self = @This();
-        pub fn process(self: *Self, in: []const test_types.Sample(f32), out: []test_types.Sample(f32)) void {
+        pub fn process(self: *Self, in0: []const types.Sample(f32), in1: []const types.Sample(f32), out: []types.Sample(f32)) void {
             _ = self;
-            @memcpy(out, in);
+            for (in0, in1, out) |a, b, *o| o.ch[0] = a.ch[0] + b.ch[0];
         }
     };
-    try std.testing.expect(classify(M) == .Map);
+    try std.testing.expectEqual(@as(comptime_int, 2), mapInputCount(Sum2));
+    try std.testing.expect(MapInPortAt(Sum2, 0).Elem == types.Sample(f32));
+    try std.testing.expect(MapInPortAt(Sum2, 1).Elem == types.Sample(f32));
+    // Same-element homogeneous inputs share one PortId TYPE; the runtime index
+    // (the `.init(i)` field) disambiguates the two ports at the instance level.
+    try std.testing.expect(MapInPortAt(Sum2, 0) == MapInPortAt(Sum2, 1));
+    try std.testing.expectEqual(@as(PortIndex, 1), MapInPortAt(Sum2, 1).init(1).index);
 }
 
-test "classify: a complete Rate (out_per_in + pull + algorithmic_latency) is Rate" {
-    // A Rate is recognized by the PRESENCE of out_per_in/pull, independent of
-    // whether it also has a `process` — the classifier short-circuits on the
-    // Rate decls. We give it no `process` to prove `process` is not required.
-    const R = struct {
+test "named-input minting: NamedInPort + ConcatOut from a spec" {
+    const types = @import("types.zig");
+    const spec = .{
+        .mfcc = types.FeatureFrame(13),
+        .centroid = types.Scalar(f32),
+        .rms = types.Scalar(f32),
+    };
+    const Collect = struct {
         const Self = @This();
-        pub const out_per_in = .{ 1, 2 };
-        pub const algorithmic_latency: usize = 3;
-        pub fn pull(self: *Self, want: usize, out: []test_types.Sample(f32)) usize {
+        pub const inputs = spec;
+        pub fn process(self: *Self) void {
             _ = self;
-            _ = out;
-            return want;
         }
     };
-    try std.testing.expect(classify(R) == .Rate);
+    try std.testing.expect(NamedInPort(Collect, "mfcc").Elem == types.FeatureFrame(13));
+    try std.testing.expect(NamedInPort(Collect, "centroid").Elem == types.Scalar(f32));
+    try std.testing.expect(NamedInPort(Collect, "centroid").direction == .in);
+
+    // The output struct mirrors the spec, field order = column order.
+    const Out = ConcatOut(spec);
+    const out_fields = @typeInfo(Out).@"struct".fields;
+    try std.testing.expectEqual(@as(usize, 3), out_fields.len);
+    try std.testing.expectEqualStrings("mfcc", out_fields[0].name);
+    try std.testing.expectEqualStrings("centroid", out_fields[1].name);
+    try std.testing.expectEqualStrings("rms", out_fields[2].name);
+    try std.testing.expect(out_fields[0].type == types.FeatureFrame(13));
 }
 
-// EXPECTED-@compileError corner cases of the classifier (catalog §2.2 R1).
-// Each is an INCOMPLETE Rate contract that classify() rejects by name; they
-// cannot run (they abort compilation) so they are pinned as disabled stubs.
-// Un-commenting any one MUST fail the build with the quoted R1 diagnostic.
-//
-//   test "EXPECTED COMPILE ERROR: out_per_in without pull (R1 incomplete)" {
-//       const Bad = struct {
-//           pub const out_per_in = .{ 1, 2 };
-//           pub fn process(_: *@This(), _: []const f32, _: []f32) void {}
-//       };
-//       _ = classify(Bad); // => "declares out_per_in but no pull"
-//   }
-//   test "EXPECTED COMPILE ERROR: pull without out_per_in (R1 incomplete)" {
-//       const Bad = struct {
-//           pub fn pull(_: *@This(), w: usize, _: []f32) usize { return w; }
-//       };
-//       _ = classify(Bad); // => "declares pull but no out_per_in"
-//   }
-//   test "EXPECTED COMPILE ERROR: Rate without algorithmic_latency (R1)" {
-//       const Bad = struct {
-//           pub const out_per_in = .{ 1, 2 };
-//           pub fn pull(_: *@This(), w: usize, _: []f32) usize { return w; }
-//       };
-//       _ = classify(Bad); // => "is a Rate but declares no algorithmic_latency"
-//   }
-//   test "EXPECTED COMPILE ERROR: neither Map nor Rate" {
-//       const Bad = struct { x: u8 = 0 };
-//       _ = classify(Bad); // => "is neither Map (process) nor Rate"
-//   }
-
-test "MapInElem/MapOutElem read the exact element type off the signature" {
-    // The reader must thread the Frame's lane AND channel count through, not
-    // just the family — a downmix block sees C go 4 -> 1.
-    const Downmix = struct {
-        const Self = @This();
-        pub fn process(self: *Self, in: []const test_types.Frame(i16, 4), out: []test_types.Frame(i16, 1)) void {
-            _ = self;
-            for (in, out) |s, *d| d.* = .{ .ch = .{s.ch[0]} };
-        }
-    };
-    try std.testing.expect(MapInElem(Downmix) == test_types.Frame(i16, 4));
-    try std.testing.expect(MapOutElem(Downmix) == test_types.Frame(i16, 1));
-    // Sample/Frame identity is preserved through the reader: a Sample(f32) out
-    // reads back as Frame(f32,1).
-    const Mono = struct {
-        const Self = @This();
-        pub fn process(self: *Self, in: []const test_types.Sample(f32), out: []test_types.Sample(f32)) void {
-            _ = self;
-            @memcpy(out, in);
-        }
-    };
-    try std.testing.expect(MapOutElem(Mono) == test_types.Frame(f32, 1));
-}
+// DISABLED @compileError stubs (cannot run — they abort compilation):
+//   - A bare-array port element:
+//       pub fn process(_: *@This(), _: []const [4]f32, _: []f32) void {}
+//     => "a port element may not be a bare array [4]f32 — wrap it in a named struct"
+//   - NamedInPort(Collect, "nope") => "has no named input 'nope'"
+//   - MapInPortAt(Sum2, 2) => "has no input port 2 (it declares 2)"

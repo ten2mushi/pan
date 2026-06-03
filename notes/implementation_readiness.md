@@ -41,8 +41,7 @@ thing layout-ready and fold the rest in at their own feature steps:
 - [ ] **At their steps:** `VariRate` (§2.6, with step 5 / sampler), `EventLane(Event)` + `NoteEvent`
   (§8.6, with step 6d), `PolyVoice` (§8.12, step 6d). The step-1 trio (Gain/Biquad/Pan) only needs
   `.mono`/`.stereo`, so it is **not** blocked by the others.
-- [ ] Decide: evolve `src/` in place, or branch a `v2-core` reconciliation. (Recommend: in place,
-  small PRs.)
+- [ ] evolve `src/` in place, small PRs.
 
 ### 1.2 Pin the public API surface
 The DX doc repeatedly flags the builder/engine identifiers as *"plausible surface, not pinned."*
@@ -54,13 +53,6 @@ from *illustrative* to *matches code*. Concretely, pin:
 - [ ] Control verbs: `set` (atomic+ramp, **no** `at_sample`), `schedule` (SPSC, sample-accurate), `edit`→`commit` (RCU).
 - [ ] Mux family names: `TestSampleMux / PullTestSampleMux / PullSampleMux / RingSampleMux`.
 - [ ] `enterRealtimeThread()` token type; `telemetry` struct (`xrun_count`, `deadline_headroom`, `guards_compiled_out`, …).
-
-### 1.3 De-risking entry point — offline-first, not CoreAudio-first
-Roadmap step 1 leads with CoreAudio, but the highest-value/highest-uncertainty core is the
-**commit pass + render replay**, gated by the SciPy oracle and the B≡C differential test. De-risk
-*all* of that on the **file→file offline path** — deterministic, bit-exact, zero device/RT
-complexity — then add CoreAudio as a separable, thinner risk.
-- [ ] Confirm: build & validate the commit pass offline first (reorders roadmap 1/4/7), CoreAudio after.
 
 ---
 

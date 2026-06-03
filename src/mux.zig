@@ -1,15 +1,17 @@
-//! The `SampleMux` seam (catalog §4.1, exec §3) — the only coupling between a
-//! block and its transport. A fixed 10-method vtable; a block's
-//! `process`/`pull` is handed slices by a mux and never knows whether those
-//! slices are a private double-buffer, a coalesced pool buffer, or a ring.
+//! The `SampleMux` seam — the only coupling between a block and its transport.
+//! A fixed 10-method vtable; a block's `process`/`pull` is handed slices by a
+//! mux and never knows whether those slices are a private double-buffer, a
+//! coalesced pool buffer, or a ring. This is the only reason the same block runs
+//! unchanged under push, pull, and offline transports.
 //!
-//! This is the `ptr + vtable` idiom (skill ch.12). Element type is erased to
-//! `[]u8` byte-slices at the seam; the block's typed wrapper recovers `[]A`.
+//! Implemented as the type-erased `ptr + vtable` idiom. The element type is
+//! erased to `[]u8` byte-slices at the seam; the block's typed wrapper recovers
+//! `[]A`.
 
 const std = @import("std");
 
-/// The 10-method `SampleMux` vtable (catalog §4.1). Methods are type-erased
-/// (a `*anyopaque` instance pointer); buffers are byte slices at the seam.
+/// The 10-method `SampleMux` vtable. Methods are type-erased (a `*anyopaque`
+/// instance pointer); buffers are byte slices at the seam.
 pub const SampleMux = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -66,8 +68,8 @@ pub const SampleMux = struct {
     }
 };
 
-/// `TestSampleMux` (catalog §4.1) — feeds exact bytes from caller-owned input
-/// slices and exposes caller-owned output slices. *Defines* behaviour for the
+/// `TestSampleMux` — feeds exact bytes from caller-owned input slices and
+/// exposes caller-owned output slices. It *defines* behaviour for the
 /// gold-vector oracle. Single-port-per-direction skeleton (sufficient for the
 /// tracer bullet).
 pub const TestSampleMux = struct {
@@ -145,11 +147,11 @@ pub const TestSampleMux = struct {
     }
 };
 
-/// `PullSampleMux` skeleton (catalog §4.1, exec §3) — the synchronous-pull
-/// executor seam. `waitInputAvailable` returns immediately (upstream was
-/// rendered first, so exactly N is present); `update*` are no-ops (single-shot
-/// render, liveness already known). Buffers slice into pool buffers handed in
-/// by the engine; here a flat byte arena stands in for the colored pool.
+/// `PullSampleMux` skeleton — the synchronous-pull executor seam.
+/// `waitInputAvailable` returns immediately (upstream was rendered first, so
+/// exactly N is present); `update*` are no-ops (single-shot render, liveness
+/// already known). Buffers slice into pool buffers handed in by the engine; here
+/// a flat byte arena stands in for the colored pool.
 pub const PullSampleMux = struct {
     in_buf: []const u8,
     out_buf: []u8,
@@ -173,7 +175,7 @@ pub const PullSampleMux = struct {
         .setEOS = setEOS,
     };
 
-    // Pull semantics (exec §3): wait* return immediately, update* are no-ops.
+    // Pull semantics: wait* return immediately, update* are no-ops.
     fn waitInputAvailable(ptr: *anyopaque, port: usize, n: usize) void {
         _ = ptr;
         _ = port;
@@ -224,6 +226,171 @@ pub const PullSampleMux = struct {
     }
 };
 
+/// `PullTestSampleMux` — the dual-mux partner of `TestSampleMux` under pull
+/// semantics, so every block is exercised under BOTH push and pull (a surface
+/// leak between the two interpretations is caught here). Same
+/// caller-owned slices as `TestSampleMux`; `wait*` return immediately and
+/// `update*` advance the cursor. The full demand-tracking executor lives in the
+/// test backbone phase; this is the seam type.
+pub const PullTestSampleMux = struct {
+    input: []const u8,
+    output: []u8,
+    in_cursor: usize = 0,
+    out_cursor: usize = 0,
+    eos: bool = false,
+
+    const Self = @This();
+
+    pub fn sampleMux(self: *Self) SampleMux {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = SampleMux.VTable{
+        .waitInputAvailable = waitInputAvailable,
+        .getInputAvailable = getInputAvailable,
+        .getOutputAvailable = getOutputAvailable,
+        .getInputBuffer = getInputBuffer,
+        .getOutputBuffer = getOutputBuffer,
+        .updateInputBuffer = updateInputBuffer,
+        .updateOutputBuffer = updateOutputBuffer,
+        .waitOutputAvailable = waitOutputAvailable,
+        .getNumReadersForOutput = getNumReadersForOutput,
+        .setEOS = setEOS,
+    };
+
+    fn waitInputAvailable(ptr: *anyopaque, port: usize, n: usize) void {
+        _ = ptr;
+        _ = port;
+        _ = n;
+    }
+    fn waitOutputAvailable(ptr: *anyopaque, port: usize, n: usize) void {
+        _ = ptr;
+        _ = port;
+        _ = n;
+    }
+    fn getInputAvailable(ptr: *anyopaque, port: usize) usize {
+        _ = port;
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.input.len - self.in_cursor;
+    }
+    fn getOutputAvailable(ptr: *anyopaque, port: usize) usize {
+        _ = port;
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.output.len - self.out_cursor;
+    }
+    fn getInputBuffer(ptr: *anyopaque, port: usize) []const u8 {
+        _ = port;
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.input[self.in_cursor..];
+    }
+    fn getOutputBuffer(ptr: *anyopaque, port: usize) []u8 {
+        _ = port;
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.output[self.out_cursor..];
+    }
+    fn updateInputBuffer(ptr: *anyopaque, port: usize, n: usize) void {
+        _ = port;
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.in_cursor += n;
+    }
+    fn updateOutputBuffer(ptr: *anyopaque, port: usize, n: usize) void {
+        _ = port;
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.out_cursor += n;
+    }
+    fn getNumReadersForOutput(ptr: *anyopaque, port: usize) usize {
+        _ = ptr;
+        _ = port;
+        return 1;
+    }
+    fn setEOS(ptr: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.eos = true;
+    }
+};
+
+/// `RingSampleMux` — the offline push transport (Tier C / OfflineBatch).
+/// Bounded SPSC rings, no deadline, blocking permitted. The
+/// interface is present here so the family name is stable; the ring body (the
+/// real push executor) is filled in the offline-execution phase. This stub
+/// carries flat in/out byte buffers with advancing cursors.
+pub const RingSampleMux = struct {
+    in_buf: []const u8,
+    out_buf: []u8,
+    in_cursor: usize = 0,
+    out_cursor: usize = 0,
+    eos: bool = false,
+
+    const Self = @This();
+
+    pub fn sampleMux(self: *Self) SampleMux {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = SampleMux.VTable{
+        .waitInputAvailable = waitInputAvailable,
+        .getInputAvailable = getInputAvailable,
+        .getOutputAvailable = getOutputAvailable,
+        .getInputBuffer = getInputBuffer,
+        .getOutputBuffer = getOutputBuffer,
+        .updateInputBuffer = updateInputBuffer,
+        .updateOutputBuffer = updateOutputBuffer,
+        .waitOutputAvailable = waitOutputAvailable,
+        .getNumReadersForOutput = getNumReadersForOutput,
+        .setEOS = setEOS,
+    };
+
+    fn waitInputAvailable(ptr: *anyopaque, port: usize, n: usize) void {
+        _ = ptr;
+        _ = port;
+        _ = n;
+    }
+    fn waitOutputAvailable(ptr: *anyopaque, port: usize, n: usize) void {
+        _ = ptr;
+        _ = port;
+        _ = n;
+    }
+    fn getInputAvailable(ptr: *anyopaque, port: usize) usize {
+        _ = port;
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.in_buf.len - self.in_cursor;
+    }
+    fn getOutputAvailable(ptr: *anyopaque, port: usize) usize {
+        _ = port;
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.out_buf.len - self.out_cursor;
+    }
+    fn getInputBuffer(ptr: *anyopaque, port: usize) []const u8 {
+        _ = port;
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.in_buf[self.in_cursor..];
+    }
+    fn getOutputBuffer(ptr: *anyopaque, port: usize) []u8 {
+        _ = port;
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.out_buf[self.out_cursor..];
+    }
+    fn updateInputBuffer(ptr: *anyopaque, port: usize, n: usize) void {
+        _ = port;
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.in_cursor += n;
+    }
+    fn updateOutputBuffer(ptr: *anyopaque, port: usize, n: usize) void {
+        _ = port;
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.out_cursor += n;
+    }
+    fn getNumReadersForOutput(ptr: *anyopaque, port: usize) usize {
+        _ = ptr;
+        _ = port;
+        return 1;
+    }
+    fn setEOS(ptr: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.eos = true;
+    }
+};
+
 test "TestSampleMux feeds slices through the 10-method vtable" {
     var in = [_]u8{ 1, 2, 3, 4 };
     var out = [_]u8{ 0, 0, 0, 0 };
@@ -243,4 +410,29 @@ test "TestSampleMux feeds slices through the 10-method vtable" {
 
     mux.setEOS();
     try std.testing.expect(tm.eos);
+}
+
+test "PullTestSampleMux advances cursors through the same vtable" {
+    var in = [_]u8{ 9, 8, 7 };
+    var out = [_]u8{ 0, 0, 0 };
+    var pm = PullTestSampleMux{ .input = &in, .output = &out };
+    const mux = pm.sampleMux();
+    try std.testing.expectEqual(@as(usize, 3), mux.getInputAvailable(0));
+    const dst = mux.getOutputBuffer(0);
+    @memcpy(dst, mux.getInputBuffer(0));
+    mux.updateInputBuffer(0, 3);
+    mux.updateOutputBuffer(0, 3);
+    try std.testing.expectEqual(@as(usize, 0), mux.getInputAvailable(0));
+    try std.testing.expectEqualSlices(u8, &in, &out);
+}
+
+test "RingSampleMux (offline push stub) round-trips through the vtable" {
+    var in = [_]u8{ 1, 2 };
+    var out = [_]u8{ 0, 0 };
+    var rm = RingSampleMux{ .in_buf = &in, .out_buf = &out };
+    const mux = rm.sampleMux();
+    @memcpy(mux.getOutputBuffer(0), mux.getInputBuffer(0));
+    mux.setEOS();
+    try std.testing.expect(rm.eos);
+    try std.testing.expectEqualSlices(u8, &in, &out);
 }

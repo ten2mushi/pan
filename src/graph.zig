@@ -1,13 +1,11 @@
-//! Graph with `add()`/`connect()` (catalog §3, exec §8).
-//!
-//! A flowgraph is a finite diagram in **Stream**. Nodes are blocks; edges are
-//! wirings (output port → input port). `connect` type-checks `PortId` element
-//! types and emits a NAMED `@compileError` on a mismatch (catalog §6 / A1/A6).
-//! A feedback edge is explicitly declared (catalog §5.2: the back-edge is
-//! removed before the topological sort and must contain a delay in its SCC).
+//! The low-level graph IR — nodes (block instances) and edges (output port →
+//! input port wirings). `connect` type-checks `PortId` element types and emits a
+//! NAMED `@compileError` on a mismatch. A feedback edge is explicitly declared:
+//! the back-edge is removed before the topological sort and its cycle must
+//! contain a delay element to be causal.
 //!
 //! The graph is comptime-evaluable so the commit pass can run at `comptime` on
-//! embedded (catalog §8.5): it uses a fixed-capacity array, not a heap list.
+//! embedded targets: it uses a fixed-capacity array, not a heap list.
 
 const std = @import("std");
 const port = @import("port.zig");
@@ -32,7 +30,7 @@ pub const Edge = struct {
     from_port: port.PortIndex,
     to_node: usize,
     to_port: port.PortIndex,
-    /// Explicitly-declared feedback edge (catalog §5.2). Removed before the
+    /// Explicitly-declared feedback edge. Removed before the
     /// topological sort; its SCC must contain a delay (else error.DelayFreeLoop).
     feedback: bool,
     /// `@sizeOf` of the element carried on this edge (pool sizing).
@@ -42,7 +40,7 @@ pub const Edge = struct {
 };
 
 /// Fixed capacities keep the graph comptime-evaluable (no allocator) so the
-/// whole commit pass can run at `comptime` on embedded (catalog §8.5).
+/// whole commit pass can run at `comptime` on embedded targets.
 pub const max_nodes = 64;
 pub const max_edges = 128;
 
@@ -88,10 +86,10 @@ pub const Graph = struct {
     }
 
     /// Connect an output `PortId` to an input `PortId`. Type-checks element
-    /// types at comptime and emits a NAMED `@compileError` on a mismatch
-    /// (catalog §6 / A1/A6: element type, direction, and channel count — the
-    /// last rides inside the `Frame(Lane,C)` element type, so a C-mismatch is
-    /// just an element-type mismatch).
+    /// types at comptime and emits a NAMED `@compileError` on a mismatch:
+    /// element type, direction, and channel layout — the layout rides inside
+    /// the `Frame(Lane,L)` element type, so a layout mismatch is just an
+    /// element-type mismatch.
     pub fn connect(
         self: *Self,
         comptime OutPort: type,
@@ -105,7 +103,7 @@ pub const Graph = struct {
         self.addEdge(out_node, out_idx, in_node, in_idx, OutPort.Elem, false);
     }
 
-    /// Connect a declared feedback (back) edge (catalog §5.2). Same type check;
+    /// Connect a declared feedback (back) edge. Same type check;
     /// flagged so the commit pass removes it before the topological sort and
     /// requires its SCC to contain a delay.
     pub fn connectFeedback(
@@ -134,7 +132,7 @@ pub const Graph = struct {
             @compileError("pan: port element-type mismatch on connect: source " ++
                 @typeName(OutPort.Node) ++ ".out is " ++ @typeName(OutPort.Elem) ++
                 " but destination " ++ @typeName(InPort.Node) ++ ".in expects " ++
-                @typeName(InPort.Elem) ++ " (catalog §6, A1/A6)");
+                @typeName(InPort.Elem));
     }
 
     fn addEdge(
@@ -202,7 +200,7 @@ test "feedback edge is explicitly flagged (catalog §5.2)" {
 // AFTER a comptime type-check that rejects mismatches by name. We pin the
 // record contents exactly (they drive footprint + coloring), the id sequence,
 // the Rate-node path through `add`, and DOCUMENT the negative @compileError
-// cases (which cannot run) as disabled stubs per testing-contract §7.
+// cases (which cannot run as live tests) as disabled stubs.
 
 const t = @import("types.zig");
 
@@ -228,7 +226,7 @@ test "add returns sequential ids and records node identity + pool-class key" {
     try std.testing.expectEqual(@as(usize, 1), g.nodes[1].id);
     try std.testing.expect(g.nodes[1].class == .Map);
     try std.testing.expectEqual(@sizeOf(t.Sample(f32)), g.nodes[1].out_elem_size);
-    try std.testing.expectEqualStrings("Frame(f32,1)", t.Sample(f32).typeName());
+    try std.testing.expectEqualStrings("Frame(f32,mono)", t.Sample(f32).typeName());
     // out_elem_name is the @typeName of the output element (pool discriminator).
     try std.testing.expect(std.mem.indexOf(u8, g.nodes[1].out_elem_name, "Frame") != null);
 }
@@ -250,7 +248,7 @@ test "connect records BOTH endpoints (node ids + u3 port indices) faithfully" {
     try std.testing.expectEqual(@as(usize, 1), e.to_node);
     try std.testing.expectEqual(@as(port.PortIndex, 0), e.to_port);
     try std.testing.expect(!e.feedback);
-    // The edge carries the element size+name for pool sizing (catalog §7.8).
+    // The edge carries the element size+name for pool sizing.
     try std.testing.expectEqual(@sizeOf(t.Sample(f32)), e.elem_size);
     try std.testing.expect(std.mem.indexOf(u8, e.elem_name, "Frame") != null);
 }
@@ -271,7 +269,7 @@ test "multiple edges accumulate in order; edge_count tracks them" {
 test "connectFeedback type-checks identically but flags the edge as feedback" {
     // Same element-type check as connect (a feedback edge is still typed); only
     // the `feedback` discriminator differs — that flag is what the commit pass
-    // removes before the topo-sort (catalog §5.2).
+    // removes before the topological sort.
     var g = Graph.empty;
     const a = g.add(GainF32);
     const b = g.add(GainF32);
@@ -308,7 +306,7 @@ test "an edge carries the element size matching its lane/channel count" {
     // tracks the actual element (stereo f32 is 8 bytes, mono i16 is 2).
     const Stereo = struct {
         const Self = @This();
-        pub fn process(self: *Self, in: []const t.Frame(f32, 2), out: []t.Frame(f32, 2)) void {
+        pub fn process(self: *Self, in: []const t.Frame(f32, .stereo), out: []t.Frame(f32, .stereo)) void {
             _ = self;
             @memcpy(out, in);
         }
@@ -320,10 +318,10 @@ test "an edge carries the element size matching its lane/channel count" {
     try std.testing.expectEqual(@as(usize, 8), g.edges[0].elem_size);
 }
 
-// EXPECTED-@compileError cases of connect (catalog §6, A1/A6). These abort
-// compilation and so cannot be runtime tests; per testing-contract §7 they are
-// pinned as DISABLED stubs. Un-commenting any one MUST turn the build red with
-// the quoted NAMED diagnostic.
+// EXPECTED-@compileError cases of connect (a wired element-type mismatch is a
+// compile error). These abort compilation and so cannot be runtime tests; they
+// are pinned as DISABLED stubs. Un-commenting any one MUST turn the build red
+// with the quoted NAMED diagnostic.
 //
 //   test "EXPECTED COMPILE ERROR: element-type mismatch on connect" {
 //       const F32 = GainF32;
@@ -336,7 +334,7 @@ test "an edge carries the element size matching its lane/channel count" {
 //       const b = g.add(I16);
 //       // source out = Frame(f32,1), dest in = Frame(i16,1) => mismatch:
 //       g.connect(port.MapOutPort(F32), a, 0, port.MapInPort(I16), b, 0);
-//       // => "port element-type mismatch on connect: ... (catalog §6, A1/A6)"
+//       // => "port element-type mismatch on connect: ..."
 //   }
 //   test "EXPECTED COMPILE ERROR: channel-count mismatch (C differs)" {
 //       const Mono = GainF32;
