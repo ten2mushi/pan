@@ -1,11 +1,15 @@
 # Handoff — end of Session 4 (P4 "Tier-A executor + CoreAudio vertical slice") → into P5
 
-> **Status:** P0 + P1 + P2 + P3 + **P4 implemented and green**. This is an advisory
-> handoff, not a spec: the `specifications/` corpus and `pan_implementation_plan.md`
-> remain the source of truth.
+> **Status:** P0 + P1 + P2 + P3 + **P4 implemented and green**, **plus three post-P4 follow-ups
+> committed** (fixed-point pan gold closed; planar SoA implemented *and strictly enforced* —
+> **Phase 4.5**; runtime-Engine render path scheduled into P5). This is an advisory handoff, not a
+> spec: the `specifications/` corpus and `pan_implementation_plan.md` remain the source of truth.
 > **Date:** 2026-06-03. **Toolchain:** `zig 0.16.0` (re-run `zig version` at P5 start — Rule 13).
-> No commit made (the user had not asked). Session ran "Full P4, accept the overrun" with the
-> "cross-compiling extern seam" device-backend realism (the user's explicit choices).
+> Session ran "Full P4, accept the overrun" with the "cross-compiling extern seam" device-backend
+> realism (the user's explicit choices).
+> **Committed (main):** `e282ae3` (P4), `952d662` (P4 follow-up: fixed-point pan gold + strict-planar
+> spec/plan enforcement), `ce121cc` (Phase 4.5: planar SoA conversion + the compile-time AoS-rejection
+> gate). HEAD = `ce121cc`. Not pushed.
 
 ---
 
@@ -59,7 +63,45 @@ inlines on embedded" — the monomorphized `inline for` IS the binding.
 
 ---
 
-## 3. What was built (this session's deltas)
+## 2.5 Post-P4 follow-ups, committed (READ before P5 — these change the rules)
+
+Three things landed after the P4 commit, each verified green across the full matrix and committed:
+
+1. **Fixed-point pan gold CLOSED** (`952d662`). `ConstantPowerPan` gained an optional
+   `gains_q: ?[2]T` — pre-quantized integer channel gains used by the integer path INSTEAD of a
+   runtime `cos/sin` (a real embedded win: no runtime trig; and it removes the transcendental from the
+   bit-exact comparison — an f32-vs-f64 `cos` would differ by ~1 ULP and shift every output sample).
+   `tests/gold_fixedpoint_test.zig` now runs `Gain(q15)` AND `ConstantPowerPan(q15)` bit-exact vs the
+   NumPy oracle; manifests carry the exact integer coeffs (`gain_q`, `pan_lq`/`pan_rq`).
+
+2. **PLANAR (SoA) is now the enforced internal buffer form — Phase 4.5** (`ce121cc`). The spec locked
+   "planar internal" but P1's `Frame = struct{ch:[C]Lane}` made a `[]Frame` buffer AoS/interleaved for
+   `C>1` — an internal contradiction. Resolved:
+   - **Buffers are plane-major.** A multi-channel stream buffer of `N` frames on layout `L` is `C`
+     contiguous `N`-sample channel planes. `src/types.zig` adds `Planar(Lane,L)` / `PlanarConst(Lane,L)`
+     views (`base: [*]Lane`, `frames`, `plane(c) = base[c*N..][0..N]`). A block's multi-channel port
+     is a **view**, not `[]Frame`; mono (`Sample(T)`, one plane) stays a plain slice.
+   - **Element identity is unchanged** — the view's `Elem` is still `Frame(Lane,L)`, so the pool class
+     key/size and **`src/commit.zig` are byte-identical** (the layout-agnostic proof: the chain
+     footprint is still 8192 B; `bench -Dbench-gate` enforces it). Only the byte arrangement *within* a
+     buffer and the access view changed.
+   - **STRICTLY ENFORCED (fails loud):** `port.zig` `portOfParam` now `@compileError`s on a `C>1`
+     `[]Frame(Lane,L)` AoS slice port, directing the author to the planar view. `tests/planar_conformance_test.zig`
+     is the P-2 gate. **P5 blocks with multi-channel ports MUST use `Planar`/`PlanarConst` views.**
+   - The codec (`io.zig`) now transposes interleaved↔planar at the I/O boundary (the only place a
+     transpose belongs); the executor (`engine.zig` `runOp`) builds a view over the pool buffer's
+     planes (plane `c` at lane offset `c*N`). Spec: `catalog.md` §9.3 P-1/P-2, §1.3; `type` §2.1.
+
+3. **B≡C through the executor — DONE** (was listed as P7 in the original P4 gaps). `ExecutorMode(g,
+   blocks, mode)` parameterizes the buffer mode; `tests/bc_executor_test.zig` renders the SAME chain
+   under `.colored` vs `.per_edge` and asserts bit-identical sink output (the executor-level B≡C).
+
+4. **Runtime `Engine` render path → scheduled into P5** (`952d662`). The plan's Phase 5 gained an
+   explicit Work item 6 + gate to close it (see §6 below).
+
+---
+
+## 3. What was built (the P4 session's deltas)
 
 ```
 src/commit.zig   (M)  RenderOp += node_id; Plan += pool_buffer_count/pool_bytes/
@@ -115,9 +157,15 @@ zig build test -Doptimize=ReleaseFast   #                                       
 zig build smoke                         # freestanding ReleaseSmall comptime-commit → PASS
 zig build cross-linux                   # x86_64-linux-gnu ALSA-seam compile gate   → PASS
 zig build fmt-check                     #                                          → PASS
-zig build bench                         # gain→biquad→pan throughput (ReleaseFast)  → prints numbers
+zig build bench                         # per-block + chain throughput, stress, sweep (ReleaseFast)
+zig build bench -Dbench-gate            # footprint baseline (8192B) — fails hard on a regression
 python3 scripts/generate.py tests/vectors/biquad_f32.json   # regenerate gold blobs (numpy; scipy optional)
+python3 scripts/generate.py tests/vectors/pan_q15.json      # (and pan_f32 / gain_q15) — plane-major for C>1
 ```
+> The four-mode suite is **442 tests**. The P-2 planar conformance gate is
+> `tests/planar_conformance_test.zig` (7 tests; asserts plane-major byte offsets, layout-agnostic
+> footprint, element identity, real-block plane-major write, codec round-trip). `src/commit.zig` is
+> byte-unchanged vs the pre-Phase-4.5 base — the layout-agnostic proof.
 > **Carried cosmetic noise (P2, still live):** `aliasing_message_test` / `comparator_test` drive
 > reject paths and `std.debug.print` diagnostics ("aliasing hazard…", "oracle allclose fail…"); the
 > 0.16 build runner echoes "failed command" for those, but the suite exits 0. Use
@@ -128,21 +176,28 @@ python3 scripts/generate.py tests/vectors/biquad_f32.json   # regenerate gold bl
 
 ## 5. Honest gaps carried into P5+ (Rule 12)
 
+**Closed since the P4 commit (no longer gaps):** fixed-point pan gold (now a live bit-exact test);
+B≡C through the executor (`bc_executor_test.zig` — was tagged P7); the planar-vs-AoS `Frame` tension
+(resolved by Phase 4.5 — planar is implemented *and* compile-time enforced); telemetry
+`xrun_count`/`deadline_headroom`/`per_block_cpu` (now populated via `Executor.recordTiming`, cross-checked
+in the bench).
+
+**Still genuinely deferred:**
 - **Live device gate is the user's** (no audio HW / no 10-min loop in the sandbox). The CoreAudio
   render-callback path *compiles + links* (AudioToolbox) but is **not opened/run** here.
-- **`CoreAudioSource` (capture)** is shape-pinned and returns `error.CaptureNotYetImplemented` — the
-  P4 slice is output-sink + in-memory source; input-unit config lands when live capture is exercised.
-- **B≡C through the executor** is **P7** (the commit-level B≡C differential exists from P3; the
-  executor currently runs the `.colored` plan only — wiring the `.per_edge` baseline behind a runtime
-  `getBuffer` and the B≡C executor differential is P7, as the P4 handoff already noted).
+- **Runtime `Engine` render path** — the runnable Tier-A engine is the comptime `Executor`; the runtime
+  `Engine.{renderInto,start,stop}` is a documented control-plane façade. **Closing it is now an explicit
+  P5 Work item** (§6) — runtime commit pass + RCU swap, sharing the `RenderOp`/`Plan`/pool model.
+- **`CoreAudioSource` (capture)** is implemented as the extern HAL-input seam (compiles + links) but is
+  **not opened/run**; device-format negotiation finalizes against real hardware.
 - **Persistent state in the executor** (delay rings / feedback z⁻¹) is **P6** — the executor
   `@compileError`s if `footprint_bytes != pool_bytes` today.
 - **`Rate`/`pull` binding** in the executor is unimplemented (P4 slice is all-Map); needed when a
   real `Rate` block (framer/resampler) rides the executor (P8).
-- **q15 biquad/pan gold vectors** not added (q15 gain manifest exists; the slice is f32). The
-  fixed-point kernel paths in `filters`/`spatial` exist (qMulStore) but lack committed gold vectors.
-- **Telemetry**: `fault` + `guards_compiled_out` are live; `xrun_count`/`deadline_headroom`/
-  `per_block_cpu`/`spin_time` are populated by the device loop / bench, not the headless executor.
+- **Fixed-point BIQUAD** is a deliberate `@compileError` (q-format needs wider coeff scaling +
+  accumulator headroom + limit-cycle control → embedded phase; see `dev-notes/fixed-point-biquad.md`).
+  Gain + Pan q15 gold ARE live and bit-exact; biquad q15 has no kernel yet, so no gold.
+- **`spin_time`** telemetry is a Tier-B (multicore) quantity, populated when Tier B lands.
 
 ---
 
@@ -157,6 +212,20 @@ The hooks P4 leaves: the runtime commit + RCU plan swap (the `edit→commit` mec
 P4 op-list/pool-layout; `ConstantPowerPan` already declares a `param.pan` slot ready for the wired-edge
 / `set` source; the negotiate stage (`coercionFor`) already decides `resample`/`ramp_hold` (P3) — P5
 materializes the coercion node bodies and the SPSC ring / atomic-scalar / RCU mechanisms.
+
+**Plan Phase 5 now has an explicit Work item 6 (added this session): close the runtime `Engine` render
+path cleanly.** The runnable Tier-A renderer is the comptime `Executor`/`ExecutorMode`; P5 makes the
+*runtime* `Engine` equally real by adding the **runtime commit pass** (a runtime-built graph →
+heap-allocated `Plan` with **bound, type-erased `fn_ptr`/`self_ptr`** — the SAME `RenderOp`/`Plan`/
+pool-by-buffer-id model, do NOT fork a second IR), wiring `Engine.start`→`AudioBackend` and
+`Engine.renderInto`→that replay, with `edit→commit` swapping the heap `Plan` pointer atomically. Gate:
+the runtime-committed plan replays **bit-identically** to the comptime `Executor` over the same graph,
+and an RCU swap rewires with no glitch / no audio-thread alloc/lock. (Elegance constraint: comptime and
+runtime paths share the pool + gather/scatter; only the dispatch differs — inlined vs bound indirect.)
+
+**New hard rule for any P5 block with a multi-channel port:** it MUST use a `Planar(Lane,L)` /
+`PlanarConst(Lane,L)` view, never a `[]Frame(Lane,L)` slice — a `C>1` AoS slice port is now a
+`@compileError` (Phase 4.5). Mono ports stay plain `[]Sample(T)` slices.
 
 ---
 
