@@ -110,6 +110,11 @@ pub const renderInto = engine.renderInto;
 /// The Tier-A bound executor — monomorphize over a committed comptime graph and
 /// its node-id → block-type tuple to get a runnable, wait-free pull renderer.
 pub const Executor = engine.Executor;
+pub const ExecutorMode = engine.ExecutorMode;
+/// The Tier-A executor with active paranoid NaN-poison (Debug/ReleaseSafe): a
+/// retired pool buffer is filled with NaN so a colorer/aliasing bug reaches the
+/// sink as a loud NaN rather than as silently-stale audio.
+pub const ParanoidExecutor = engine.ParanoidExecutor;
 
 // --- the Compute HAL (portable @Vector kernels) ---------------------------
 
@@ -131,14 +136,32 @@ pub const realtime = struct {
     pub const RealtimeToken = engine.RealtimeToken;
 };
 
+/// Time-domain delay primitives — element-generic `UnitDelay` / `DelayLine`. The
+/// persistent (pool-excluded) delay state a feedback cycle is built on.
+pub const time = @import("time.zig");
+pub const UnitDelay = time.UnitDelay;
+pub const DelayLine = time.DelayLine;
+/// Multi-channel (planar) delays — the `Frame(C>1)` / `Frame(.discrete(N))` form a
+/// stereo/surround delay or an FDN vector feedback edge rides.
+pub const PlanarUnitDelay = time.PlanarUnitDelay;
+pub const PlanarDelayLine = time.PlanarDelayLine;
+/// Fused tight-feedback kernels — `Comb`, `Allpass`, `KarplusStrong`, `Ladder`:
+/// single-`Map` blocks running a sample-accurate per-sample feedback loop over
+/// internal state. `FdnMatrix` is the mixing core of a graph-level FDN reverb (the
+/// matrix-mix `Map` over a `Frame(.discrete(N))` bus closed by feedback edges).
+pub const fx = @import("fx.zig");
+pub const Comb = fx.Comb;
+pub const Allpass = fx.Allpass;
+pub const KarplusStrong = fx.KarplusStrong;
+pub const Ladder = fx.Ladder;
+pub const FdnMatrix = fx.FdnMatrix;
+
 // Layered-library roots filled by later phases.
 pub const gen = struct {};
 pub const env = struct {};
-pub const fx = struct {};
 pub const spectral = struct {};
 pub const feat = struct {};
 pub const mix = struct {};
-pub const time = struct {};
 pub const synth = struct {};
 
 /// Graph combinators. `Concat` is the named fan-in: a comptime

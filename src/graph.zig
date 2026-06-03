@@ -141,6 +141,14 @@ pub const FeedbackEdge = struct {
 pub const max_nodes = 64;
 pub const max_edges = 128;
 
+/// Upper bound on distinct buffer ids a plan can mint: one per pool color
+/// (≤ one per produced value, itself ≤ `max_edges`) PLUS one persistent z⁻¹
+/// buffer per feedback edge (≤ `max_edges`). The buffer-id → byte-window
+/// tables are sized to this so a persistent id `pool_count + fi` never indexes
+/// out of bounds even in the per-edge baseline (no coloring, every value its
+/// own buffer) of a maximally-feedback graph.
+pub const max_buffers = max_edges * 2;
+
 /// Does the block have a sample output port? A `Map` sink (input only) has none;
 /// a `Rate`/`VariRate` always produces through `pull`.
 fn hasOutput(comptime Block: type) bool {

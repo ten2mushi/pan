@@ -227,23 +227,50 @@ pub fn Executor(comptime g: graph.Graph, comptime node_blocks: []const type) typ
 /// computes. The two executors share every kernel, so a divergence is a colorer/
 /// pool bug, never numerics.
 pub fn ExecutorMode(comptime g: graph.Graph, comptime node_blocks: []const type, comptime mode: commit.BufferMode) type {
+    return ExecutorModeParanoid(g, node_blocks, mode, false);
+}
+
+/// As `ExecutorMode`, but with **active paranoid NaN-poison** turned on (the
+/// differential-test correctness obligation, Debug/ReleaseSafe only — the poison
+/// is gated on `std.debug.runtime_safety`, so a release build compiles it out).
+/// After each op renders, every POOL buffer whose live range ends at that op is
+/// filled with a NaN bit pattern, so a colorer / in-place-coalescing bug that
+/// reads a buffer past its last legitimate reader surfaces as a NaN propagating to
+/// the sink instead of as silently-stale audio. Persistent feedback buffers (the
+/// pool tail) are NEVER poisoned — they carry the `z⁻¹` across the callback
+/// boundary. Pairs with the B≡C differential: B≡C catches a reuse-before-last-
+/// reader divergence; paranoid mode is the active net that turns a latent aliasing
+/// bug into a loud NaN. A correct graph renders with NO NaN reaching the sink.
+pub fn ParanoidExecutor(comptime g: graph.Graph, comptime node_blocks: []const type, comptime mode: commit.BufferMode) type {
+    return ExecutorModeParanoid(g, node_blocks, mode, true);
+}
+
+fn ExecutorModeParanoid(comptime g: graph.Graph, comptime node_blocks: []const type, comptime mode: commit.BufferMode, comptime paranoid: bool) type {
     if (node_blocks.len != g.node_count)
         @compileError("pan: Executor needs exactly one block type per graph node");
     const plan = commit.commitComptimeMode(g, mode) catch |e|
         @compileError("pan: graph failed to commit: " ++ @errorName(e));
-    if (plan.footprint_bytes != plan.pool_bytes)
-        @compileError("pan: this executor handles pool buffers only — persistent " ++
-            "delay/feedback state arrives in a later phase");
 
     const InstanceTuple = std.meta.Tuple(node_blocks);
+
+    // The flat pool is the colored scratch prefix [0, pool_bytes) followed by the
+    // persistent feedback z⁻¹ tail [pool_bytes, pool_bytes + persistent_bytes). The
+    // whole thing is zero-initialized: the tail MUST start silent (the first
+    // block's feedback reads zero), and zeroing the scratch too is harmless (every
+    // scratch buffer is written before it is read) and puts the pool in `.bss`.
+    const total_pool_bytes = plan.pool_bytes + plan.persistent_bytes;
 
     return struct {
         const Self = @This();
         /// One block instance per node, in node-id order. The caller seeds these.
+        /// Each instance owns its persistent delay-ring / fused-kernel state and
+        /// per-block coefficients (allocated at construction), counted by the H2
+        /// footprint but living here, not in the pool.
         instances: InstanceTuple,
-        /// The flat colored/per-edge buffer pool. Cache-line aligned so SIMD
-        /// loads on its sub-buffers are aligned.
-        pool: [plan.pool_bytes]u8 align(64) = undefined,
+        /// The flat pool: colored scratch prefix + persistent feedback tail. Cache-
+        /// line aligned so SIMD loads on its sub-buffers are aligned. Zero-init so
+        /// the persistent tail starts silent (the z⁻¹ before the first block).
+        pool: [total_pool_bytes]u8 align(64) = @splat(0),
         /// Running telemetry: `guards_compiled_out` (so a release build can never
         /// silently drop the NaN/Inf safety net), the error-isolation `fault`
         /// flag, and the timing fields populated by `recordTiming`.
@@ -267,11 +294,33 @@ pub fn ExecutorMode(comptime g: graph.Graph, comptime node_blocks: []const type,
         pub fn render(self: *Self, token: RealtimeToken) void {
             _ = token; // witness only
             const guards = std.debug.runtime_safety;
-            inline for (plan.ops[0..plan.op_count]) |op| {
+            inline for (plan.ops[0..plan.op_count], 0..) |op, k| {
                 const nid = op.node_id;
                 const Block = node_blocks[nid];
                 const inst = &self.instances[nid];
                 runOp(Block, inst, &self.pool, op, guards, &self.tele.fault);
+                // Paranoid mode: the op-list is forward-topo, so this op's position
+                // `k` is the topo index a value's last-read `end` is recorded in.
+                // Any pool buffer retiring at `k` is now dead — poison it to NaN so a
+                // stray later read is loud. Compiled out entirely unless paranoid.
+                if (comptime paranoid) {
+                    if (guards) self.poisonRetired(k);
+                }
+            }
+        }
+
+        /// Fill every POOL buffer whose live range ends at op index `k` with a NaN
+        /// bit pattern (`0xFF` bytes ⇒ NaN for f32/f64, garbage for any other lane —
+        /// either way a subsequent read diverges loudly). Persistent feedback ids
+        /// carry the `-1` "never poison" sentinel, so the tail is left intact. `plan`
+        /// is comptime-known here, so the whole sweep resolves at compile time to the
+        /// exact `@memset`s for the buffers retiring at `k` (zero runtime scan).
+        fn poisonRetired(self: *Self, comptime k: usize) void {
+            inline for (0..plan.pool_buffer_count) |id| {
+                if (comptime plan.buffer_last_use[id] == @as(isize, @intCast(k))) {
+                    const off = plan.buffer_offset[id];
+                    @memset(self.pool[off .. off + plan.buffer_byte_len[id]], 0xFF);
+                }
             }
         }
 
@@ -297,7 +346,7 @@ pub fn ExecutorMode(comptime g: graph.Graph, comptime node_blocks: []const type,
         fn runOp(
             comptime Block: type,
             inst: *Block,
-            pool: *[plan.pool_bytes]u8,
+            pool: *[total_pool_bytes]u8,
             comptime op: commit.RenderOp,
             comptime guards: bool,
             fault: *bool,
@@ -818,11 +867,13 @@ pub const Engine = struct {
         const plan = try buildBoundPlan(alloc, ir, bound_owned);
         errdefer alloc.destroy(plan);
 
-        // Pre-size the pool for the worst-case N when one is requested: `pool_bytes`
-        // is exactly linear in N (Σ colors·N·element_size), so the max-N pool is the
-        // committed pool scaled by max_N/N. The active plan uses only its own
-        // [0, pool_bytes) prefix; the headroom lets `reconfigure` swap live.
-        const cap = poolCapacityFor(plan.pool_bytes, cfg.block_size, opts.max_block_size);
+        // Pre-size the pool for the worst-case N when one is requested. The flat
+        // pool is the colored scratch prefix + the persistent feedback tail; BOTH
+        // are exactly linear in N (Σ colors·N·elem and Σ feedback·N·elem), so the
+        // max-N pool is the committed total scaled by max_N/N. The active plan uses
+        // only its own [0, pool_bytes + persistent_bytes) prefix; the headroom lets
+        // `reconfigure` swap live.
+        const cap = poolCapacityFor(plan.pool_bytes + plan.persistent_bytes, cfg.block_size, opts.max_block_size);
         const pool = try allocPool(alloc, cap);
         errdefer freePool(alloc, pool);
 
@@ -869,14 +920,19 @@ pub const Engine = struct {
 
     fn allocPool(alloc: std.mem.Allocator, bytes: usize) ![]align(64) u8 {
         if (bytes == 0) return &[_]u8{};
-        return alloc.alignedAlloc(u8, .@"64", bytes);
+        const mem = try alloc.alignedAlloc(u8, .@"64", bytes);
+        // Zero the whole pool: the persistent feedback tail MUST start silent (the
+        // z⁻¹ before the first block reads zero), and zeroing the scratch is
+        // harmless (written before read).
+        @memset(mem, 0);
+        return mem;
     }
-    /// The pool byte capacity to allocate: the committed `pool_bytes`, or — when a
-    /// larger worst-case N is requested — that figure scaled to max-N (exact, since
-    /// `pool_bytes` is a multiple of N).
-    fn poolCapacityFor(pool_bytes: usize, committed_n: usize, max_n: usize) usize {
-        if (max_n <= committed_n or committed_n == 0 or pool_bytes == 0) return pool_bytes;
-        return pool_bytes / committed_n * max_n;
+    /// The pool byte capacity to allocate: the committed total (scratch +
+    /// persistent), or — when a larger worst-case N is requested — that figure
+    /// scaled to max-N (exact, since both terms are multiples of N).
+    fn poolCapacityFor(total_bytes: usize, committed_n: usize, max_n: usize) usize {
+        if (max_n <= committed_n or committed_n == 0 or total_bytes == 0) return total_bytes;
+        return total_bytes / committed_n * max_n;
     }
     fn freePool(alloc: std.mem.Allocator, pool: []align(64) u8) void {
         if (pool.len != 0) alloc.free(pool);
@@ -1042,7 +1098,7 @@ pub const Engine = struct {
     fn installPlan(self: *Self, new_ir: graph.Graph, new_bound: []const BoundNode) !void {
         const new_plan = try buildBoundPlan(self.alloc, new_ir, new_bound);
         errdefer self.alloc.destroy(new_plan);
-        if (new_plan.pool_bytes > self.pool_cap) return error.PoolCapacityExceeded;
+        if (new_plan.pool_bytes + new_plan.persistent_bytes > self.pool_cap) return error.PoolCapacityExceeded;
 
         // Adopt the new owned bound set, but DON'T free instances the edit dropped
         // yet — the still-active old plan references them. Keep the old set to free
@@ -1095,7 +1151,8 @@ pub const Engine = struct {
         const new_plan = try buildBoundPlan(self.alloc, new_ir, self.bound);
         errdefer self.alloc.destroy(new_plan);
 
-        if (new_plan.pool_bytes <= self.pool_cap) {
+        const new_total = new_plan.pool_bytes + new_plan.persistent_bytes;
+        if (new_total <= self.pool_cap) {
             // Live swap: the pre-sized pool already accommodates the new N.
             const at_swap = self.rcu.epochNow();
             const old = self.rcu.publish(new_plan);
@@ -1103,13 +1160,16 @@ pub const Engine = struct {
             self.alloc.destroy(old);
         } else {
             // The new N exceeds the pre-sized pool — reallocate (transport stopped).
+            // A reconfigure resets the persistent feedback tail to silence (a
+            // route-switch is not glitch-free by contract); carrying z⁻¹ state
+            // across a pool realloc is a later refinement.
             std.debug.assert(!self.running.load(.acquire));
-            const new_pool = try allocPool(self.alloc, new_plan.pool_bytes);
+            const new_pool = try allocPool(self.alloc, new_total);
             const old = self.rcu.publish(new_plan);
             freePool(self.alloc, self.pool);
             self.alloc.destroy(old);
             self.pool = new_pool;
-            self.pool_cap = new_plan.pool_bytes;
+            self.pool_cap = new_total;
         }
         self.ir = new_ir;
         self.cfg.block_size = block_size;
@@ -1647,4 +1707,106 @@ test "reconfigure (live): a max-N pre-sized pool swaps N without reallocation" {
     eng.renderInto(token);
     for (0..16) |i| try std.testing.expectEqual(input[i].ch[0] * 3.0, out_rt[i].ch[0]);
     try std.testing.expect(!eng.telemetry().fault);
+}
+
+// ===========================================================================
+// Graph-level feedback execution (P6): a DelayLine-in-a-cycle runs through the
+// comptime Executor over the persistent z⁻¹ tail, decays, and stays finite.
+// ===========================================================================
+
+const FbSample = types.Sample(f32);
+
+/// Mono source that copies a backing store into its output (a zero-input Map).
+const FbSource = struct {
+    data: [*]const FbSample = undefined,
+    pub fn process(self: *@This(), out: []FbSample) void {
+        @memcpy(out, self.data[0..out.len]);
+    }
+};
+
+/// Two-input feedback summer: `out = dry + g·wet`. The first port is the forward
+/// (dry) input; the second is the feedback (wet) z⁻¹ value, read from the
+/// persistent buffer the loop's delay element wrote last block.
+const FbSum = struct {
+    g: f32 = 0.5,
+    pub fn process(self: *@This(), dry: []const FbSample, wet: []const FbSample, out: []FbSample) void {
+        for (dry, wet, out) |d, w, *y| y.ch[0] = d.ch[0] + self.g * w.ch[0];
+    }
+};
+
+const FbSink = struct {
+    dest: [*]FbSample = undefined,
+    pub fn process(self: *@This(), in: []const FbSample) void {
+        @memcpy(self.dest[0..in.len], in);
+    }
+};
+
+test "graph-level feedback: a DelayLine-in-a-cycle decays through the persistent z⁻¹ tail" {
+    const tmod = @import("time.zig");
+    const N = 4;
+    const Delay = tmod.DelayLine(FbSample, N); // one-block delay element in the loop
+
+    // Topology: src → sum.in0 ; sum → {delay, sink} ; delay → sum.in1 (feedback).
+    // The summer's output is the wet tap (to sink) AND the loop signal (to delay);
+    // the delay's output feeds back into the summer's second input. The delay's
+    // value feeds only the feedback, so it is a persistent (pool-excluded) buffer.
+    const g = comptime blk: {
+        var gg = graph.Graph.empty;
+        gg.block_size = N;
+        const src = gg.add(FbSource);
+        const sum = gg.add(FbSum);
+        const delay = gg.add(Delay);
+        const sink = gg.add(FbSink);
+        gg.connect(port.MapOutPort(FbSource), src, 0, port.MapInPortAt(FbSum, 0), sum, 0);
+        gg.connect(port.MapOutPort(FbSum), sum, 0, port.MapInPort(Delay), delay, 0);
+        gg.connect(port.MapOutPort(FbSum), sum, 0, port.MapInPort(FbSink), sink, 0);
+        gg.connectFeedback(port.MapOutPort(Delay), delay, 0, port.MapInPortAt(FbSum, 1), sum, 1);
+        break :blk gg;
+    };
+
+    // The SCC {sum, delay} contains the delay element ⇒ commits (not DelayFreeLoop).
+    const plan = comptime try commit.commitComptime(g);
+    try std.testing.expect(plan.persistent_bytes >= N * @sizeOf(FbSample)); // a z⁻¹ tail exists
+    try std.testing.expect(plan.persistent_bytes > 0);
+
+    const Exec = Executor(g, &.{ FbSource, FbSum, Delay, FbSink });
+    var impulse: [N]FbSample = @splat(.{ .ch = .{0} });
+    impulse[0] = .{ .ch = .{1} }; // unit impulse on block 0
+    var silence: [N]FbSample = @splat(.{ .ch = .{0} });
+    var out: [N]FbSample = undefined;
+
+    var exec: Exec = .{ .instances = .{
+        .{ .data = &impulse },
+        .{ .g = 0.5 },
+        .{},
+        .{ .dest = &out },
+    } };
+    const token = enterRealtimeThread();
+    defer token.leave();
+
+    // Block 0: the impulse appears immediately (the dry path); the loop has not
+    // recirculated yet (the persistent z⁻¹ tail started silent).
+    exec.render(token);
+    try std.testing.expectEqual(@as(f32, 1), out[0].ch[0]);
+    try std.testing.expect(!exec.telemetry().fault);
+
+    // Switch the source to silence and keep rendering: the loop must keep echoing
+    // (the persistent tail carries the recirculating signal across callbacks) and
+    // the energy must DECAY (|g|<1, stable) and stay finite.
+    exec.instances[0].data = &silence;
+    var prev_peak: f32 = 1;
+    var saw_echo = false;
+    for (0..8) |_| {
+        exec.render(token);
+        var peak: f32 = 0;
+        for (out) |s| {
+            try std.testing.expect(std.math.isFinite(s.ch[0]));
+            peak = @max(peak, @abs(s.ch[0]));
+        }
+        if (peak > 0) saw_echo = true;
+        try std.testing.expect(peak <= prev_peak + 1e-6); // non-growing (stable)
+        if (peak > 0) prev_peak = peak;
+    }
+    try std.testing.expect(saw_echo); // the feedback path actually carried signal
+    try std.testing.expect(!exec.telemetry().fault);
 }

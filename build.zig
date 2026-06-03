@@ -84,6 +84,16 @@ pub fn build(b: *std.Build) void {
         "tests/planar_conformance_test.zig",
         "tests/control_plane_test.zig",
         "tests/runtime_engine_test.zig",
+        "tests/delay_test.zig",
+        "tests/fused_feedback_test.zig",
+        "tests/persistent_feedback_test.zig",
+        "tests/inplace_coalescing_test.zig",
+        "tests/planar_delay_test.zig",
+        "tests/fdn_reverb_test.zig",
+        "tests/ladder_test.zig",
+        "tests/schroeder_reverb_test.zig",
+        "tests/paranoid_poison_test.zig",
+        "tests/example_a_coloring_test.zig",
     };
     for (harnesses) |path| {
         const h_mod = b.createModule(.{
@@ -156,6 +166,8 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Build and run the benchmarks (ReleaseFast)");
     const benches = [_][]const u8{
         "bench/dsp_chain.zig",
+        "bench/feedback_bench.zig",
+        "bench/coloring_bench.zig",
     };
     for (benches) |path| {
         const bench_mod = b.createModule(.{

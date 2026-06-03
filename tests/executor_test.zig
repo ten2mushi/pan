@@ -521,9 +521,13 @@ test "executor: Exec.committed footprint_bytes & op_count match commitComptime f
     try std.testing.expectEqual(plan.pool_bytes, Exec.committed.pool_bytes);
 
     // And the concrete numbers, so the test fails if the layout silently shifts:
-    // one op per node (3); a mono chain ping-pongs two pool buffers of N·4 bytes.
+    // one op per node (3). `Gain` is a single-consumer unary `aliasing_safe` Map,
+    // so the colored pool COALESCES its output in place into the source buffer —
+    // the whole mono chain reuses ONE pool buffer of N·4 bytes (not the naive
+    // two-buffer ping-pong). The B≡C differential proves this in-place result is
+    // bit-identical to the per-edge baseline.
     try std.testing.expectEqual(@as(usize, 3), Exec.committed.op_count);
-    try std.testing.expectEqual(@as(usize, 2 * N * @sizeOf(Sample(f32))), Exec.committed.footprint_bytes);
+    try std.testing.expectEqual(@as(usize, 1 * N * @sizeOf(Sample(f32))), Exec.committed.footprint_bytes);
 }
 
 test "executor: layout-changing chain's footprint sizes the downstream buffer for stereo" {

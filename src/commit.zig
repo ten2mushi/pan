@@ -180,11 +180,28 @@ pub const RenderOp = struct {
 ///
 /// Beyond the op-list and the single footprint figure, the plan carries the
 /// **pool layout** the executor needs to turn an op's `*_buffer_ids` into real
-/// byte slices: each pool buffer id maps to a `[offset, offset+len)` window in
-/// the engine's flat pool. The window is contiguous per element-class (a class's
+/// byte slices: each buffer id maps to a `[offset, offset+len)` window in the
+/// engine's flat pool. The pool window is contiguous per element-class (a class's
 /// `M` colored buffers sit back-to-back), and `len` is `N · element_size` for the
-/// class. Persistent (delay/feedback) state lives past `pool_bytes`; for a graph
-/// with no feedback `pool_bytes == footprint_bytes`.
+/// class.
+///
+/// **The pool tail (persistent region).** Feedback `z⁻¹` buffers live PAST
+/// `pool_bytes`, in `[pool_bytes, pool_bytes + persistent_bytes)`. Each feedback
+/// edge carries one block of `N` elements across the callback boundary (its read
+/// side reads the value its write side stored last block), so it gets one
+/// `N·element_size` buffer that is **never colored and never zeroed mid-stream** —
+/// the colored pool ahead of it is scratch (overwritten every block), the tail is
+/// state (survives every block). The executor therefore allocates
+/// `pool_bytes + persistent_bytes`; the colored prefix is the only part that is
+/// reused across ops within one render.
+///
+/// `footprint_bytes` is the separate **H2 reporting figure** — the static memory
+/// the graph needs by the locked formula `pools + Σ delay-rings + Σ block-state`.
+/// Delay-element rings and per-block state live INSIDE the block instances
+/// (allocated once at `initialize`, like ramp state), so they are counted by
+/// `footprint_bytes` but do not appear in the executor's flat pool; the pool tail
+/// holds only the feedback `z⁻¹` buffers. For a graph with no feedback,
+/// `persistent_bytes == 0` and `pool_bytes == footprint_bytes`.
 pub fn Plan(comptime n_ops: usize) type {
     return struct {
         ops: [n_ops]RenderOp,
@@ -194,13 +211,28 @@ pub fn Plan(comptime n_ops: usize) type {
         buffer_mode: BufferMode,
         /// Number of distinct pool buffer ids (across all element classes).
         pool_buffer_count: usize = 0,
-        /// Total bytes the colored/per-edge pools occupy (the executor's pool
-        /// region). Excludes persistent delay/feedback state.
+        /// Total bytes the colored/per-edge pools occupy (the executor's scratch
+        /// region). Excludes the persistent feedback tail.
         pool_bytes: usize = 0,
-        /// Byte offset of each pool buffer id into the engine's flat pool.
-        buffer_offset: [graph.max_edges]usize = [_]usize{0} ** graph.max_edges,
-        /// Byte length of each pool buffer id (`N · element_size` of its class).
-        buffer_byte_len: [graph.max_edges]usize = [_]usize{0} ** graph.max_edges,
+        /// Bytes the persistent feedback `z⁻¹` buffers occupy in the pool tail
+        /// (`Σ feedback-edge  N · element_size`). The executor's flat pool is
+        /// `pool_bytes + persistent_bytes`; this prefix-vs-tail split is what lets
+        /// a feedback value survive a callback while scratch buffers are reused.
+        persistent_bytes: usize = 0,
+        /// Byte offset of each buffer id (pool color OR persistent feedback) into
+        /// the engine's flat pool.
+        buffer_offset: [graph.max_buffers]usize = [_]usize{0} ** graph.max_buffers,
+        /// Byte length of each buffer id (`N · element_size` of its class).
+        buffer_byte_len: [graph.max_buffers]usize = [_]usize{0} ** graph.max_buffers,
+        /// For each POOL buffer id, the op index (forward-topo position) of the LAST
+        /// read across every value that occupies it — the point after which the
+        /// buffer is dead for the remainder of the render. `-1` marks an unused id
+        /// AND every PERSISTENT feedback id (those survive the callback boundary and
+        /// must NEVER be poisoned). The paranoid NaN-poison executor uses this to
+        /// fill a retired pool buffer with NaN the instant its live range ends, so a
+        /// colorer/coalescing bug that reads a buffer past its last legitimate
+        /// reader surfaces as a NaN at the sink rather than as silently stale data.
+        buffer_last_use: [graph.max_buffers]isize = [_]isize{-1} ** graph.max_buffers,
     };
 }
 
@@ -473,6 +505,13 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
             elem_name: []const u8,
             color: usize = 0,
             buffer_id: usize = 0,
+            /// True iff this value's output port feeds a feedback read-side. Such a
+            /// value carries the loop's z⁻¹ across the callback boundary, so it is
+            /// **pool-excluded** (never colored): the producer writes it once, this
+            /// block's forward consumers read it, and next block's feedback read
+            /// reads the SAME buffer because the persistent region is not reused
+            /// between callbacks. It gets a persistent id past the scratch pool.
+            is_persistent: bool = false,
         };
         var values: [max_edges]Value = undefined;
         var value_count: usize = 0;
@@ -500,8 +539,111 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
                 value_count += 1;
             }
         }
+        // Mark feedback-source values persistent (pool-excluded), so the colorer
+        // below skips them and they receive a persistent id past the scratch pool.
+        for (0..value_count) |vi| {
+            for (g.feedback[0..FC]) |f| {
+                if (values[vi].from_node == f.write_node and values[vi].from_port == f.write_port)
+                    values[vi].is_persistent = true;
+            }
+        }
+
+        // ---- 5b. in-place coalescing gate (colored pool only) --------------
+        // A unary `Map` whose author declared `aliasing_safe` may write its
+        // output INTO its input buffer — eliding the copy — but ONLY when the
+        // colorer proves it safe: (i) the input value is single-consumer (this
+        // Map is its sole reader, so overwriting it harms no one), (ii) input and
+        // output share element type & count (same class, same byte window), and
+        // (iii) the consumer reads before any other producer overwrites — which
+        // holds here because the merged value's live range is colored as ONE
+        // interval, so no sibling value can claim the buffer mid-span. The output
+        // value then *aliases* the input value's buffer (same color), and the emit
+        // hands the Map the same pool slice for in and out.
+        //
+        // This is a hint the colorer MAY honor; a falsely-declared `aliasing_safe`
+        // is not trusted but CAUGHT — the B≡C differential renders the same graph
+        // pooled (this path, aliased) and per-edge (separate buffers) and asserts
+        // bit-identical output, so an unsafe in-place read-after-write diverges and
+        // the paranoid NaN-poison names the block. Mode B (`per_edge`) never
+        // coalesces: it is exactly that obviously-correct baseline.
+        //
+        // `alias_root[v]` is a union-find parent: a coalesced output points at the
+        // input value it shares a buffer with (chains a→b→c collapse to one root).
+        var alias_root: [max_edges]usize = undefined;
+        for (0..value_count) |vi| alias_root[vi] = vi;
+        if (mode == .colored) {
+            for (0..value_count) |vi| {
+                const m = values[vi].from_node;
+                // The producer must be a rate-1:1 author Map declaring aliasing_safe,
+                // and not a source/delay (a generator has no input to alias; a delay
+                // / feedback producer's output must persist, never share scratch).
+                if (!g.nodes[m].aliasing_safe) continue;
+                if (g.nodes[m].is_source or g.nodes[m].is_delay) continue;
+                if (g.nodes[m].out_per_in_p != g.nodes[m].out_per_in_q) continue;
+                var writes_feedback = false;
+                for (g.feedback[0..FC]) |f| {
+                    if (f.write_node == m) writes_feedback = true;
+                }
+                if (writes_feedback) continue;
+                // M must be unary: exactly one forward (non-param) sample input, and
+                // this value its only produced value.
+                var sample_in: usize = 0;
+                var in_edge: usize = 0;
+                for (g.edges[0..EC], 0..) |e, ei| {
+                    if (e.to_node == m and !e.is_param) {
+                        sample_in += 1;
+                        in_edge = ei;
+                    }
+                }
+                if (sample_in != 1) continue;
+                var out_vals: usize = 0;
+                for (0..value_count) |k| {
+                    if (values[k].from_node == m) out_vals += 1;
+                }
+                if (out_vals != 1) continue;
+                // Resolve the input VALUE u feeding M.
+                const ein = g.edges[in_edge];
+                var u: ?usize = null;
+                for (0..value_count) |k| {
+                    if (values[k].from_node == ein.from_node and values[k].from_port == ein.from_port) {
+                        u = k;
+                        break;
+                    }
+                }
+                const ui = u orelse continue;
+                // Identical element type & count (same pool class & byte window).
+                if (!std.mem.eql(u8, values[ui].elem_name, values[vi].elem_name)) continue;
+                // u must be single-consumer: exactly one reader of its producer port
+                // across BOTH forward edges and feedback read-sides.
+                var consumers: usize = 0;
+                for (g.edges[0..EC]) |e2| {
+                    if (e2.from_node == ein.from_node and e2.from_port == ein.from_port) consumers += 1;
+                }
+                for (g.feedback[0..FC]) |f| {
+                    if (f.write_node == ein.from_node and f.write_port == ein.from_port) consumers += 1;
+                }
+                if (consumers != 1) continue;
+                // Merge v into u's buffer; extend the root's live range to cover v.
+                var root = ui;
+                while (alias_root[root] != root) root = alias_root[root];
+                alias_root[vi] = root;
+                if (values[vi].end > values[root].end) values[root].end = values[vi].end;
+            }
+        }
 
         // ---- 6. buffer-id assignment (per_edge baseline OR colored pool) ---
+        // The pool class key is the element TYPE name (`@typeName`), and a class's
+        // stride is `N · element_size`. Element_count is part of the element type's
+        // identity — a `Frame`'s channel count rides in its layout name, a
+        // `FeatureFrame(K)`'s K and a `Complex` bin width ride in their names — so
+        // two values sharing an `elem_name` necessarily share `@sizeOf` (their type
+        // is the same), and a class is UNIFORM-SIZE by construction. The spec's
+        // first-fit-decreasing fallback for "heterogeneous element_count within one
+        // class" (§4) is therefore UNREACHABLE under this keying: a differing count
+        // is a differing name is a differing class. We keep the pure linear
+        // left-edge colorer below and ASSERT the invariant here (a uniform-count
+        // guard) rather than carry dead FFD bin-packing code — if a future keying
+        // ever made a class non-uniform, this assert fires in Debug/ReleaseSafe.
         var class_names: [max_edges][]const u8 = undefined;
         var class_elem_size: [max_edges]usize = undefined;
         var class_M: [max_edges]usize = [_]usize{0} ** max_edges;
@@ -514,17 +656,25 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
                     break;
                 }
             }
-            if (ci == null) {
+            if (ci) |c| {
+                // Same class name ⇒ same element type ⇒ same size (uniform class).
+                std.debug.assert(values[vi].elem_size == class_elem_size[c]);
+            } else {
                 class_names[class_count] = values[vi].elem_name;
                 class_elem_size[class_count] = values[vi].elem_size;
                 class_count += 1;
             }
         }
         for (0..class_count) |c| {
-            // Gather this class's value indices, sorted by (start, value id).
+            // Gather this class's value indices, sorted by (start, value id). Only
+            // buffer ROOTS are colored: a value coalesced in-place into another
+            // shares that root's buffer and is assigned its color afterward (so it
+            // consumes no color of its own and does not inflate `M_class`).
             var order: [max_edges]usize = undefined;
             var order_len: usize = 0;
             for (0..value_count) |vi| {
+                if (alias_root[vi] != vi) continue;
+                if (values[vi].is_persistent) continue; // pool-excluded z⁻¹ value
                 if (std.mem.eql(u8, values[vi].elem_name, class_names[c])) {
                     order[order_len] = vi;
                     order_len += 1;
@@ -576,6 +726,14 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
                 },
             }
         }
+        // Propagate each coalesced value's color from its buffer root (a no-op in
+        // per_edge mode, where every value is its own root).
+        for (0..value_count) |vi| {
+            if (alias_root[vi] == vi) continue;
+            var root = vi;
+            while (alias_root[root] != root) root = alias_root[root];
+            values[vi].color = values[root].color;
+        }
         var class_base: [max_edges]usize = undefined;
         var total_pool: usize = 0;
         for (0..class_count) |c| {
@@ -583,6 +741,7 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
             total_pool += class_M[c];
         }
         for (0..value_count) |vi| {
+            if (values[vi].is_persistent) continue; // gets a persistent id below
             for (0..class_count) |c| {
                 if (std.mem.eql(u8, values[vi].elem_name, class_names[c])) {
                     values[vi].buffer_id = class_base[c] + values[vi].color;
@@ -590,8 +749,38 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
                 }
             }
         }
-        // Forward edge → its value's pool id. Feedback read/write sides get
-        // persistent ids past the pool region (pool-excluded z⁻¹ state).
+        // Persistent feedback z⁻¹ buffers: one per DISTINCT feedback source
+        // (write_node, write_port), with ids past the scratch pool. A source that
+        // is also a forward value shares this id — its producer writes it once, and
+        // both this block's forward consumers and next block's feedback read-side
+        // reference the same persistent buffer. `persist_elem[k]` is that id's
+        // element size, for the footprint byte-window layout below.
+        var fb_buf: [max_edges]usize = undefined;
+        var persist_count: usize = 0;
+        var persist_elem: [graph.max_edges]usize = [_]usize{0} ** graph.max_edges;
+        for (0..FC) |fi| {
+            const f = g.feedback[fi];
+            var shared: ?usize = null;
+            for (0..fi) |fj| {
+                if (g.feedback[fj].write_node == f.write_node and g.feedback[fj].write_port == f.write_port) {
+                    shared = fb_buf[fj];
+                    break;
+                }
+            }
+            if (shared) |id| {
+                fb_buf[fi] = id;
+                continue;
+            }
+            const id = total_pool + persist_count;
+            persist_elem[persist_count] = f.elem_size;
+            persist_count += 1;
+            fb_buf[fi] = id;
+            for (0..value_count) |vi| {
+                if (values[vi].from_node == f.write_node and values[vi].from_port == f.write_port)
+                    values[vi].buffer_id = id;
+            }
+        }
+        // Forward edge → its (pool or persistent) producer-value buffer id.
         var edge_buf: [max_edges]usize = undefined;
         for (g.edges[0..EC], 0..) |e, ei| {
             for (0..value_count) |vi| {
@@ -601,8 +790,6 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
                 }
             }
         }
-        var fb_buf: [max_edges]usize = undefined;
-        for (0..FC) |fi| fb_buf[fi] = total_pool + fi;
 
         // ---- 7. rate scheduling — demand N propagated upstream ------------
         // want[v] = frames v must produce this callback. Sinks want N; a producer
@@ -667,15 +854,25 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
                 }
             }
             // Feedback read-sides are this node's persistent inputs; feedback
-            // write-sides are its persistent outputs (the z⁻¹ split).
+            // write-sides are its persistent outputs (the z⁻¹ split). The write-side
+            // is deduped against the forward outputs: when the producer's output
+            // port ALSO has a forward edge, its value is persistent and the forward
+            // edge already routed `out` to the same persistent buffer — the producer
+            // still writes exactly one output buffer.
             for (g.feedback[0..FC], 0..) |f, fi| {
                 if (f.read_node == v) {
                     in_ids[in_n] = fb_buf[fi];
                     in_n += 1;
                 }
                 if (f.write_node == v) {
-                    out_ids[out_n] = fb_buf[fi];
-                    out_n += 1;
+                    var seen = false;
+                    for (0..out_n) |k| {
+                        if (out_ids[k] == fb_buf[fi]) seen = true;
+                    }
+                    if (!seen) {
+                        out_ids[out_n] = fb_buf[fi];
+                        out_n += 1;
+                    }
                 }
             }
             ops[i] = .{
@@ -694,13 +891,29 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
         }
 
         // ---- 9. footprint + pool layout -----------------------------------
-        // pools + persistent (delay rings / feedback read-sides) + per-block
-        // state. The plugin-delay-compensation term is zero until that pass lands.
-        // While summing the pools, record each buffer id's byte window so the
-        // executor can resolve an op's buffer ids into real slices: a class's M
-        // colored buffers sit contiguously, each N·element_size bytes wide.
-        var buffer_offset: [max_edges]usize = [_]usize{0} ** max_edges;
-        var buffer_byte_len: [max_edges]usize = [_]usize{0} ** max_edges;
+        // Two distinct quantities live here, and conflating them is a bug:
+        //
+        //   (a) The executor's FLAT POOL = the colored/per-edge scratch region
+        //       [0, pool_bytes) PLUS the persistent feedback tail
+        //       [pool_bytes, pool_bytes + persistent_bytes). The scratch prefix is
+        //       reused across ops; the tail holds each feedback edge's z⁻¹ value
+        //       (one block of N elements) so it survives the callback boundary,
+        //       never colored and never zeroed mid-stream.
+        //
+        //   (b) The H2 FOOTPRINT FIGURE — the static memory the graph needs by the
+        //       locked formula `pools + Σ delay-ring + Σ block-state (+ Σ PDC)`.
+        //       Delay-element rings and per-block state live INSIDE the block
+        //       instances (allocated once at initialize, like ramp state), so they
+        //       are reported here but are NOT in the flat pool; the flat pool's
+        //       tail holds only the feedback z⁻¹ buffers. The plugin-delay term is
+        //       zero until that pass lands.
+        //
+        // While summing, record each buffer id's byte window so the executor can
+        // resolve an op's buffer ids into real slices: a class's M colored buffers
+        // sit contiguously (each N·element_size wide), then the feedback z⁻¹
+        // buffers follow in the tail (ids `total_pool + fi`).
+        var buffer_offset: [graph.max_buffers]usize = [_]usize{0} ** graph.max_buffers;
+        var buffer_byte_len: [graph.max_buffers]usize = [_]usize{0} ** graph.max_buffers;
         var pool_bytes: usize = 0;
         for (0..class_count) |c| {
             const stride = N * class_elem_size[c];
@@ -711,11 +924,36 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
                 pool_bytes += stride;
             }
         }
+        // Persistent feedback z⁻¹ buffers, in the pool tail past the scratch pool —
+        // one per distinct feedback source (deduped above), each one block wide.
+        var persistent_bytes: usize = 0;
+        for (0..persist_count) |k| {
+            const id = total_pool + k;
+            const stride = N * persist_elem[k];
+            buffer_offset[id] = pool_bytes + persistent_bytes;
+            buffer_byte_len[id] = stride;
+            persistent_bytes += stride;
+        }
+        // The H2 reporting figure (delay rings + per-block state are instance-
+        // resident — counted, not pooled).
         var footprint: usize = pool_bytes;
         for (0..NC) |v| {
             if (g.nodes[v].is_delay)
                 footprint += g.nodes[v].delay_len * g.nodes[v].out_elem_size;
             footprint += g.nodes[v].state_size;
+        }
+
+        // Per-pool-buffer last-use op index (for the paranoid NaN-poison executor).
+        // Persistent feedback values are skipped, so their ids stay at the `-1`
+        // "never poison" sentinel; a pool id's last use is the max `end` over every
+        // value (including in-place-coalesced ones, which carry the root's id) that
+        // shares it.
+        var buffer_last_use: [graph.max_buffers]isize = [_]isize{-1} ** graph.max_buffers;
+        for (0..value_count) |vi| {
+            if (values[vi].is_persistent) continue;
+            const id = values[vi].buffer_id;
+            const e: isize = @intCast(values[vi].end);
+            if (e > buffer_last_use[id]) buffer_last_use[id] = e;
         }
 
         return Plan(graph.max_nodes){
@@ -725,8 +963,10 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
             .buffer_mode = mode,
             .pool_buffer_count = total_pool,
             .pool_bytes = pool_bytes,
+            .persistent_bytes = persistent_bytes,
             .buffer_offset = buffer_offset,
             .buffer_byte_len = buffer_byte_len,
+            .buffer_last_use = buffer_last_use,
         };
     }
 }
@@ -747,8 +987,10 @@ pub fn commitComptimeMode(comptime g: graph.Graph, comptime mode: BufferMode) Co
             .buffer_mode = full.buffer_mode,
             .pool_buffer_count = full.pool_buffer_count,
             .pool_bytes = full.pool_bytes,
+            .persistent_bytes = full.persistent_bytes,
             .buffer_offset = full.buffer_offset,
             .buffer_byte_len = full.buffer_byte_len,
+            .buffer_last_use = full.buffer_last_use,
         };
         for (0..g.node_count) |i| p.ops[i] = full.ops[i];
         return p;
