@@ -1,6 +1,9 @@
 # pan — Testing Methodology & Gold-Vector Contract (the ≈ tier, pinned to implementation precision)
 
-> **Status: LOCKED** (2026-06-03). Change-control: conforms to [`catalog.md`](catalog.md); an edit
+> **Status: LOCKED** (2026-06-03; includes the parameter-port amendment, catalog §15 — the §5.7b
+> parameter-edge harness; **then §5.7c parallel≡sequential + §5.7d offline-differential harnesses**
+> for the COMMITTED Tiers B/C — see [`pan_parallel_and_offline_execution.md`](pan_parallel_and_offline_execution.md),
+> catalog §8.10/§2.5/§15). Change-control: conforms to [`catalog.md`](catalog.md); an edit
 > that changes a definition or law must update catalog.md and every citing section in the same commit.
 > Support document for [`pan_architecture_formalisation.md`](pan_architecture_formalisation.md)
 > (the hub). Siblings: [`pan_execution_model.md`](pan_execution_model.md) ·
@@ -295,9 +298,102 @@ not arbitrary coverage.
 - **Honest bound:** this is ⊢ **for the smoke graph only** — *not* a proof for arbitrary graphs
   ([`catalog.md` §8.5 honest bound](catalog.md), audit A5).
 
+### 5.7b Parameter-edge — ramp/hold & one-source (catalog §2.4) · ≈ + ⊢
+
+- **Muxes:** `TestSampleMux` feeding both the consumer's sample port and a control-rate **parameter
+  edge** (`node.param.<name>`), driven by a step/sweep modulator.
+- **What it checks (≈, bit-exact):** a wired parameter edge produces output **bit-identical** to the
+  same target sequence applied via `set` (P3 — one ramp policy, two sources); the ramp is **zipper-
+  free** (no discontinuity at block boundaries); a control-rate producer emitting 0 this call → the
+  consumer **holds** the previous value.
+- **What it checks (⊢, assert the error):** declaring **both** `set`/`schedule` and a wired parameter
+  edge for one slot ⇒ a **commit error** (P2 one-source); a delay-free parameter feedback loop ⇒
+  `error.DelayFreeLoop` (P4).
+
+### 5.7c Parallel≡sequential — Tier-B executor correctness (catalog §8.10) · ≈ · **bit-exact**
+
+- **Executors:** Tier A (sequential pull) vs Tier B (static-parallel: HEFT schedule + point-to-point
+  ready-flags + concurrency-aware coloring), **same graph, same inputs**.
+- **What it checks (≈, bit-exact):** Tier B output is **bit-identical** to Tier A — the direct analogue
+  of B≡C, justified because op-granular scheduling preserves per-op reduction order (catalog §8.10 A17).
+  The concurrency-aware colorer's pool (§8.11) must change nothing observable; **paranoid mode** extends
+  to catch a buffer reused before its last reader across the *concurrency-aware* interference graph
+  (a cross-worker live-range overlap). Run with `P = 2..ncores`; all must match Tier A and each other.
+- **Why bit-exact (Rule 9):** this is a pan-vs-pan check (§2) — the parallel executor is a pure
+  scheduling/storage remapping; any float drift is a colorer or sync bug, not numerics.
+
+### 5.7d Offline differential — OfflineBatch reproducibility (catalog §11.1b O3) · ≈
+
+- **Executors:** OfflineBatch with `K=1` (sequential) vs `K=ncores` (data-parallel chunking), and the
+  pipeline-parallel path vs sequential.
+- **What it checks (≈):** pipeline-parallel and **exact-warmup** (`warmup_exact=true`, FIR/STFT) chunked
+  renders are **bit-identical** to sequential; **IIR-chunked** (`warmup_exact=false`) renders are
+  **allclose within the block's declared tolerance** (catalog §2.5 W2). The ordered merge makes the
+  timeline partition invisible (O3); fan-in reductions use fixed port order.
+- **⊢ adjunct:** chunking a stateful block that **omits** `warmup_samples` is a commit/build error
+  (W1 / A18) — asserted by attempting it and expecting the error.
+
+### 5.7e Layout negotiation — registered up/down-mix & channel-order codec (catalog §1.3 L2 / §6) · ≈ + ⊢
+
+- **Mux:** `TestSampleMux` on the **composite** (the §5.1 oracle harness applied across the inserted
+  matrix), the same way Format negotiation is tested on the composite (§7.1).
+- **What it checks (≈, allclose):** a wired **registered** layout mismatch (`.stereo → .surround_5_1`)
+  causes negotiation (§6) to **auto-insert the canonical up/down-mix matrix**, and the composite output
+  matches the **gold-vector oracle** within the manifest tolerance — the matrix is a float numeric
+  ([`catalog.md` §1.3 L2](catalog.md)).
+- **What it checks (≈, bit-exact):** the I/O codec's **channel-order reconciliation**
+  (device/file order ↔ internal canonical order, [`catalog.md` §10](catalog.md)) **round-trips** — a
+  pure permutation, so a decode∘encode is **bit-identical** (pan-vs-pan permutation, §2).
+- **What it checks (⊢, assert the error):** a wired **unregistered** pair (`.custom → .ambisonic`) is a
+  **hard mismatch** rejected **at commit** (no auto-coercion; requires an explicit spatial block) —
+  asserted by attempting the wiring and expecting the negotiation error.
+- **Tier:** ≈ ([`catalog.md` §12.2 B14](catalog.md)); the unregistered-pair rejection is ⊢ (A22).
+
+### 5.7f VariRate latency/demand & determinism — the interval contract (catalog §2.6 V1/V2/V4) · ≈
+
+- **Mux:** `TestSampleMux` feeding a **unit impulse** (delay measurement) and a swept `param.ratio`
+  driving the `VariRate` block across `rate_bounds` (the §5.5 latency-contract extended to the interval).
+- **What it checks (≈, V1/V2):** the declared `rate_bounds`/`max_latency` are **real** — measure the
+  actual **out:in** ratio across the interval and assert it lies in `[min, max]`, and the impulse-response
+  group delay is **≤ `max_latency`** at every operating point; `needed_input(want)` is **sound &
+  monotone** over a `want` range **and across ratios** (the §8 deferred property-harness applied to the
+  interval; latency-contract + dual-mux generalised — [`catalog.md` §2.6 V1/V2](catalog.md)).
+- **What it checks (≈, V4 — the honest split):** a **parameter-driven** `VariRate` render is
+  **O3-reproducible** — offline `K=1` is **bit-identical** to `K=ncores` where chunkable (the §5.7d
+  differential applied to the `VariRate` seam); a **controller-driven** `VariRate` (drift PI / ASRC) is
+  **exercised but asserted ≈-only**, *not* bit-reproducible — drift compensation cannot be
+  ([`catalog.md` §2.6 V4](catalog.md), the §10 ASRC bound).
+- **Tier:** ≈ ([`catalog.md` §12.2 B15/B16](catalog.md)).
+
+### 5.7g Source generators — generator gold-vectors & anti-aliasing (catalog §2.7 SR1) · ≈
+
+- **Mux:** `TestSampleMux` exposing only the **output** buffer (a Source has **zero sample-input
+  ports**, [`catalog.md` §2.7 SR1](catalog.md)); the generator is driven by its parameter ports.
+- **What it checks (≈, allclose):** oscillator / noise / wavetable output matches the **SciPy oracle**
+  within the manifest tolerance, **including** oscillator **anti-aliasing** measured against a
+  **bandlimited reference** (e.g. PolyBLEP) — an aliased naive ramp/saw is the failure mode the oracle
+  rejects.
+- **What it checks (bit-exact length):** the Source classifier sets **`out.len` == the pull demand `N`**
+  (length from the pull, not from `in.len`, [`catalog.md` §2.7 SR1](catalog.md)) — a pan-vs-pan length
+  invariant.
+- **Tier:** ≈ ([`catalog.md` §12.2 B17](catalog.md)).
+
+### 5.7h Typed events + PolyVoice — event lane & voice behaviour (catalog §8.6 / §8.12) · ≈
+
+- **Mux:** the dual-mux pair (§5.2) applied to a block consuming a **typed `EventLane(NoteEvent)`**
+  ([`catalog.md` §8.6](catalog.md)) — push vs pull agreement over the *same* event-driven render.
+- **What it checks (≈):** `PolyVoice` voice **allocation / stealing is click-free** (no discontinuity
+  when a slot is stolen and release-ramped, Y3); a `note_id` / **MPE expression** event **routes to the
+  owning voice** (EV2); a **note onset is sample-accurate** via the sub-block split (Y2 / EV3) — the
+  onset lands at the declared `sample_offset`, verified by the state-granularity sub-block mechanism
+  (§5.6).
+- **Comparison:** behavioural / gold-vector (≈) for the voice response; **bit-exact** for the dual-mux
+  push↔pull agreement and the sub-block onset split (pan-vs-pan, §2).
+- **Tier:** ≈ ([`catalog.md` §12.2 B18](catalog.md)).
+
 ### 5.8 Comparison-mode summary
 
-| Harness | Mux(es) | Compare against | Mode | Tier |
+| Harness | Mux(es) / executors | Compare against | Mode | Tier |
 |---|---|---|---|---|
 | GoldVectorTester (§5.1) | `TestSampleMux` | external SciPy oracle | tolerance (float) / bit-exact (int) | ≈ |
 | Dual-mux (§5.2) | `TestSampleMux` vs `PullTestSampleMux` | pan (other mux) | **bit-exact**, latency-aligned | ≈ |
@@ -305,6 +401,13 @@ not arbitrary coverage.
 | Aliasing (§5.4) | aliased vs non-aliased | pan (other mux) | **bit-exact** | ≈ |
 | Latency-contract (§5.5) | `TestSampleMux` (impulse) | declared `algorithmic_latency` | group-delay == declared | ≈ |
 | State-granularity (§5.6) | `TestSampleMux` (full vs split) | pan (other split) | **bit-exact** | ≈ |
+| Parameter-edge (§5.7b) | `TestSampleMux` + param edge | pan (`set` vs wired edge) | **bit-exact** ramp; ⊢ one-source/SCC | ≈ + ⊢ |
+| **Parallel≡sequential (§5.7c)** | Tier A vs Tier B (`P=2..ncores`) | pan (Tier A) | **bit-exact** + paranoid NaN | ≈ |
+| **Offline differential (§5.7d)** | OfflineBatch `K=1` vs `K=ncores` / pipeline | pan (sequential) | **bit-exact** (exact-warmup) / allclose (IIR); ⊢ no-warmup error | ≈ + ⊢ |
+| **Layout negotiation (§5.7e)** | `TestSampleMux` on the composite | SciPy oracle (matrix) / pan (codec round-trip) | **allclose** (matrix) / **bit-exact** (codec permutation); ⊢ unregistered-pair error | ≈ + ⊢ |
+| **VariRate latency/demand (§5.7f)** | `TestSampleMux` (impulse) + swept `param.ratio` / OfflineBatch `K=1` vs `K=ncores` | declared `rate_bounds`/`max_latency`/`needed_input` / pan (parameter-driven) | out:in ∈ `[min,max]`, delay ≤ `max_latency`, monotone `needed_input`; **bit-exact** (parameter-driven O3) / allclose-only (controller ASRC) | ≈ |
+| **Source generators (§5.7g)** | `TestSampleMux` (output only) | SciPy / bandlimited (PolyBLEP) oracle | **allclose**; `out.len`==pull `N` (bit-exact length) | ≈ |
+| **Typed events + PolyVoice (§5.7h)** | `TestSampleMux` vs `PullTestSampleMux` + `EventLane(NoteEvent)` | gold-vector (voice response) / pan (push↔pull) | behavioural ≈; **bit-exact** push↔pull + onset split | ≈ |
 | Smoke gate (§5.7) | — (comptime) | compiles | compile ⊢ | **⊢** (smoke graph only) |
 
 ### 5.9 Reference harness skeletons (Zig 0.16, verified compiling)
@@ -370,6 +473,16 @@ the operational *definition* of the block's behaviour ([`catalog.md` §4.2](cata
 | Format negotiation | the negotiation/coercion-insertion pass | rate-mismatch auto-inserts a resampler; commuting diagram | §5.1 on the composite |
 | `PullSampleMux` | the synchronous-pull executor seam | upstream-rendered-first; pull == push | §5.2 |
 | `Framer` (Rate) | `needed_input`/`pull` + `algorithmic_latency` | latency-contract + monotone `needed_input` | §5.5 |
+| Parameter ports | the ramp/hold coercion + one-source check ([`catalog.md` §2.4](catalog.md)) | wired edge ≡ `set`, zipper-free; both-sources ⇒ commit error; delay-free param loop ⇒ `error.DelayFreeLoop` | §5.7b |
+| Tier-B executor | the HEFT schedule + point-to-point sync + concurrency-aware colorer ([`catalog.md` §8.10–§8.11](catalog.md)) | Tier B ≡ Tier A bit-exact (`P=2..ncores`); paranoid mode finds no cross-worker reuse-before-last-read | §5.7c |
+| Cost-model gate | the commit-time `W`/`S` gate ([`catalog.md` §8.10](catalog.md)) | refuses Tier B on a near-linear chain (`W/S≈1`); enables it when work/span + headroom justify | (⊢; assert the decision) |
+| OfflineBatch / chunker | the pipeline + data-parallel chunker + `warmup_samples` merge ([`catalog.md` §2.5/§11.1b](catalog.md)) | `K=1`≡`K=ncores` bit-exact (exact-warmup) / allclose (IIR); no-`warmup` stateful chunk ⇒ commit error | §5.7d |
+| Render-workgroup HAL | the `{create,join,leave}` co-scheduling seam ([`pan_parallel_and_offline_execution.md` §4](pan_parallel_and_offline_execution.md)) | bounded cross-worker spin under load; spin-time telemetry present | §5.7c (under load) |
+| Layout negotiation | the layout up/down-mix matrix insertion + the I/O-codec channel-order reconciliation ([`catalog.md` §1.3 L2 / §6](catalog.md)) | a **registered** pair (`.stereo → .surround_5_1`) auto-inserts the canonical matrix, output matches the gold-vector oracle (allclose); an **unregistered** pair (`.custom → .ambisonic`) is a commit-time **hard mismatch**; codec channel-order round-trips (bit-exact) (≈ B14) | §5.7e |
+| `VariRate` latency/demand | `rate_bounds`/`max_latency`/`needed_input` over the interval ([`catalog.md` §2.6 V1/V2](catalog.md)) | measured out:in lies in `[min,max]` across the interval; impulse delay ≤ `max_latency`; `needed_input(want)` sound & monotone over a `want` range and across ratios (≈ B15) | §5.7f |
+| `VariRate` determinism | the parameter-driven vs controller-driven (ASRC) render ([`catalog.md` §2.6 V4](catalog.md)) | parameter-driven render is O3-reproducible (`K=1`≡`K=ncores` bit-exact where chunkable); controller-driven (ASRC) exercised ≈-only, not bit-reproducible (≈ B16) | §5.7f |
+| Source generators | the Source classifier + oscillator/noise/wavetable `process` ([`catalog.md` §2.7 SR1](catalog.md)) | generator output matches the oracle (allclose), oscillator anti-aliasing matches a bandlimited (PolyBLEP) reference (allclose); `out.len`==pull `N` (bit-exact length) (≈ B17) | §5.7g |
+| Typed events + `PolyVoice` | the `EventLane(NoteEvent)` dispatch + `PolyVoice` allocation/stealing/routing ([`catalog.md` §8.6 EV1/EV2 / §8.12 Y2/Y3](catalog.md)) | a block dual-muxes under a typed `EventLane(NoteEvent)`; voice alloc/stealing is click-free; `note_id`/MPE expression routes to the owning voice; note onset is sample-accurate via the sub-block split (≈ B18) | §5.7h |
 | Smoke gate | `commitComptime` in ReleaseSmall | compiles ⊢ (smoke graph) | §5.7 |
 
 ### 7.2 Tests directory layout & naming convention
@@ -385,6 +498,10 @@ tests/
   aliasing_test.zig                # §5.4 aliased vs non-aliased
   latency_contract_test.zig        # §5.5 impulse group-delay
   state_granularity_test.zig       # §5.6 full vs sub-block
+  layout_negotiation_test.zig      # §5.7e registered up/down-mix + codec channel-order round-trip
+  varirate_latency_test.zig        # §5.7f rate_bounds/max_latency/needed_input + determinism class
+  generator_gold_vector_test.zig   # §5.7g Source generators + oscillator anti-aliasing
+  polyvoice_behaviour_test.zig     # §5.7h EventLane(NoteEvent) + voice alloc/stealing/MPE routing
 ```
 
 - **One file per harness**, named `<harness>_test.zig`; the `_test.zig` suffix is the discovery
@@ -406,7 +523,10 @@ adequate coverage:
 - **R3 — `needed_input` monotonicity & soundness** ([`catalog.md` §2.2 R3](catalog.md)): sweep `want`
   over a range, assert `needed_input` is monotone non-decreasing, zero only at `want = 0`, and that
   pulling `needed_input(want)` inputs yields `≥ want` outputs. Upgrades the §5.5 latency-contract gate
-  from a single impulse to a swept property.
+  from a single impulse to a swept property. **`VariRate` extension (V1/V2, [`catalog.md` §2.6](catalog.md)):**
+  the same sweep across the **`rate_bounds` interval** — `needed_input(want)` sound & monotone over both
+  `want` *and* the operating ratio, with the measured out:in inside `[min, max]` and the impulse delay
+  ≤ `max_latency` at every point — promoting the §5.7f gate from interval endpoints to a swept property.
 - **M4 — `aliasing_safe` over random inputs** ([`catalog.md` §2.1 M4](catalog.md)): the §5.4 aliasing
   check over randomized signals rather than one fixed vector.
 - **B≡C over random graph topologies** ([`catalog.md` §7.5](catalog.md)): the §5.3 differential over

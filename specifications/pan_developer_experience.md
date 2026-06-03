@@ -12,6 +12,10 @@
 > [`pan_memory_model.md`](pan_memory_model.md) ·
 > [`pan_type_and_numeric_model.md`](pan_type_and_numeric_model.md) ·
 > [`pan_io_realtime_and_pipeline.md`](pan_io_realtime_and_pipeline.md) ·
+> [`pan_concurrency_and_memory_ordering.md`](pan_concurrency_and_memory_ordering.md) ·
+> [`pan_commit_pass_algorithms.md`](pan_commit_pass_algorithms.md) ·
+> [`pan_parallel_and_offline_execution.md`](pan_parallel_and_offline_execution.md) ·
+> [`pan_testing_and_vector_contract.md`](pan_testing_and_vector_contract.md) ·
 > [`pan_categorical_bridge_and_roadmap.md`](pan_categorical_bridge_and_roadmap.md).
 >
 > **⚠️ All Zig below is illustrative.** pan does not exist yet; none of this has been compiled.
@@ -57,6 +61,14 @@ Four things you must internalise before you write a line:
 If you've used ZigRadio, two of these are familiar (type-signature-is-the-API, the `SampleMux`
 seam) and two are new (the Map/Rate split, the synchronous pull executor). If you've used JUCE's
 `AudioProcessorGraph`, the commit→op-list→replay loop will feel like home.
+
+And one framing to hold onto: **pan is a general-purpose audio DSP graph engine, not an
+analysis-only tool.** The same core — typed-stream objects, Map/Rate blocks, the SampleMux probe,
+colored pools, clock-driven pull roots — serves *two* canonical graph shapes from one codebase: an
+**Analyzer** (file/device → features → collector sink; the `notes/1.md` viz, §6) and an
+**Instrument** (generators + an event/MIDI source → synthesis → device sink; §6b). The direction the
+stream flows — mic-to-features or oscillator-to-speaker — is a *use* of the core, not a fork of it.
+([catalog §8.13, C8](catalog.md))
 
 ---
 
@@ -130,14 +142,15 @@ Now a constant-power panner — the block that gives the library its name. It *c
 count* (mono → stereo), which rides in the port's element type via the channel layout.
 
 ```zig
-// The channel-carrying element is the pinned Frame(Lane, C): struct { ch: [C]Lane }, C comptime,
-// Sample(T) == Frame(Lane,1), planar internally ([type §1, §2.1]).
+// The channel-carrying element is the pinned Frame(Lane, L): struct { ch: [L.count()]Lane },
+// L : pan.ChannelLayout comptime (count + position + order); Sample(T) == Frame(Lane,.mono),
+// planar internally ([type §1, §2.1]; catalog §1.3).
 pub fn ConstantPowerPan(comptime Num: pan.Numeric) type {
     return struct {
         const Self = @This();
         const Lane = Num.Lane;
-        const In = pan.Frame(Lane, 1);   // mono frame element
-        const Out = pan.Frame(Lane, 2);  // stereo frame element
+        const In = pan.Frame(Lane, .mono);    // mono frame element
+        const Out = pan.Frame(Lane, .stereo); // stereo frame element
 
         position: Lane = 0.0, // -1 = hard left, +1 = hard right
 
@@ -157,6 +170,15 @@ pub fn ConstantPowerPan(comptime Num: pan.Numeric) type {
     };
 }
 ```
+
+One thing the panner makes concrete: the `L` in `Frame(Lane, L)` is a comptime **channel-layout
+identity** — count **+** positional tags **+** canonical channel order — and a layout mismatch on a
+wired edge (count, position, *or* order) is a **commit-time type error** (law L1), not a runtime
+surprise. Crucially, only the *identity* rides in the type; the *geometry* — speaker azimuth/
+elevation, the panning law, VBAP triangulation, ambisonic decode coefficients — is **block
+configuration**, never the stream type (L3, exactly mirroring how precision `T` is in the type but
+behaviour is in the Numeric trait). So `ConstantPowerPan` carries `.mono → .stereo` in its ports and
+its equal-power *law* in its `process` body — the right cut. ([catalog §1.3](catalog.md))
 
 **Ergonomics verdict for Map blocks:** clean. The struct is the block, the method is the API,
 precision is a comptime parameter you mostly ignore inside the kernel. The one genuine newcomer
@@ -242,6 +264,54 @@ pub fn Decimator(comptime Lane: type, comptime D: usize) type {
     };
 }
 ```
+
+### `VariRate` — when the ratio isn't a constant
+
+`Framer` and `Decimator` have a *fixed* `out_per_in`. A whole family of blocks does not: a sampler
+playing back at pitch, a varispeed/scrub transport, a time-stretch (TSM)/pitch-shifter, the
+device-boundary drift-ASRC. For these the out:in ratio **varies at runtime**, so you declare a
+**bounded interval** instead of a point ratio — discriminated `⊢` at comptime by field presence
+(`rate_bounds` *xor* `out_per_in`), exactly like Map-vs-Rate. The `pull` contract is *already*
+rate-elastic, so the operational path is identical; only the **static planning** generalises.
+*Illustrative.*
+
+```zig
+/// A sample-playback voice that plays at arbitrary pitch — a VariRate source (§2.7 SR2).
+pub fn SamplePlayer(comptime Num: pan.Numeric) type {
+    return struct {
+        // ... cursor over a loaded sample asset (persistent state) ...
+
+        // --- the VariRate declarations pan DEMANDS (the R1 analogue, V1) ---
+        pub const rate_bounds: pan.RatioInterval = .{
+            .min     = .{ .p = 1, .q = 2 },  // slowest playback (0.5x) — the MOST input per output
+            .nominal = .{ .p = 1, .q = 1 },
+            .max     = .{ .p = 2, .q = 1 },  // fastest (2x)
+        };
+        pub const max_latency: usize = 64;                 // worst case over the interval; PDC uses THIS (V2)
+        pub const ratio_source: enum { parameter, internal_controller } = .parameter;
+        pub const params = .{ .pitch = pan.Scalar(f32) };  // the operating ratio, as a parameter port (§5)
+
+        pub fn needed_input(_: *@This(), want: usize) usize { return want * 2; } // MIN ratio: worst-case input
+        pub fn pull(self: *@This(), want: usize, out: []pan.Sample(f32)) usize { _ = .{ self, want, out }; return 0; }
+    };
+}
+```
+
+What the author carries here, and what pan checks: buffer sizing and `needed_input` plan against the
+**`min` ratio** (the most input you could ever need), PDC plans against **`max_latency`** (the worst
+delay over the interval) — both decidable from the declaration, so H2 stays bounded even though the
+ratio is live (V2). The operating ratio is **sampled once per render call and held across the
+buffer** (V3, same hold policy as any parameter), never mid-call — so reduction order and sub-block
+determinism are preserved. And there's an honest reproducibility split (V4): a **parameter-driven**
+ratio (deterministic automation) is **O3-reproducible** offline; a **controller-driven** drift-ASRC
+(a PI loop on a wall-clock FIFO) is **≈-only** — the same class as clock drift, and *correctly* so
+(drift compensation cannot be bit-reproducible). ([catalog §2.6](catalog.md))
+
+**Ergonomics verdict for `VariRate`:** the surface is small — one interval, one `max_latency`, one
+ratio source — and it reuses the `pull` you already wrote. The newcomer trap is planning against the
+*nominal* ratio; pan forces you to declare the bounds and plans against the worst-case endpoints for
+you, so a varispeed block can't silently under-size its input pull. The fixed-`out_per_in` `Rate`
+contract above is unchanged — `VariRate` is a strict superset you opt into only when the ratio moves.
 
 **Why this is a *different* contract and what the author carries:** the scheduler's recursion is
 `needed_input(want)` upstream, not "pull N everywhere." The block owns the misalignment when the
@@ -437,6 +507,19 @@ mechanism you get*. `set` is atomic-scalar + ramp (and **not** sample-accurate b
 asking for sample-accuracy on the wrong verb is a compile error of omission, steering you to
 `schedule` ([io §7](pan_io_realtime_and_pipeline.md)).
 
+**The event lane is a fourth thing, not a fourth verb.** The three verbs above drive *parameters*
+(coefficients). Note onsets, MPE expression, MIDI control are a separate, typed channel: the **event
+lane** is now `EventLane(Event)` — generic over a comptime `Event` type the consuming block chooses
+(exactly as ports are element-generic), carrying a time-sorted `(sample_offset, event)` list that
+the pull scheduler dispatches at sub-block boundaries. For instruments the blessed library union is
+**`NoteEvent`**, and its pitch is **in Hz** (tuning-agnostic, microtonal-friendly — a note#→Hz
+tuning block is library, not core): `note_on{note_id, pitch_hz, velocity}`, `note_off`, `pressure`,
+`expression` (MPE per-note bend/timbre), `control{cc}`, `pitch_bend`, `program`. The `note_id` field
+is what makes **MPE per-note routing** work — an `expression` event routes to the specific voice slot
+that owns that `note_id` (§6b). Onsets are sample-accurate via the sub-block split; note that
+`schedule` remains the only sample-accurate *parameter* source — events and parameters are distinct
+mechanisms. An Analyzer simply picks a trivial `Event` and pays no music-model cost. ([catalog §8.6](catalog.md))
+
 A genuinely subtle correctness corner the user inherits — now a **named law**, *bypass preserves
 latency*: a bypassed block that has latency must **still delay** its signal by exactly its
 `algorithmic_latency` ([io §7](pan_io_realtime_and_pipeline.md), [mem §7](pan_memory_model.md)), or
@@ -545,11 +628,130 @@ it shows up in the API as "just a different root, same graph."
 
 ---
 
-## 7. Offline render (Tier C) vs real-time (Tier A) — same blocks, different runner
+## 6b. The synthesis path — authoring an Instrument
 
-The promise of the architecture is that Tier C is *the same blocks via a different mux*
-([exec §5](pan_execution_model.md)). From the user's side it should be a one-line change to the
-runner, not a re-author. *Illustrative.*
+If §6 is the headline of the analysis side, this is its mirror: pan is a **synthesis platform** too,
+and an **Instrument** is the second canonical graph shape ([catalog §8.13, C8](catalog.md)). Same
+authoring model, same `add`/`connect`/`commit`/`start` — but now the stream *originates* at a
+generator and an event source, and *terminates* at the audio device. The pull root is the
+audio-device callback (RT, §3), not a non-RT analysis timer.
+
+Three constructs carry the synthesis story, and all three are *spec-grounded core/library*, not
+hand-waving:
+
+1. **A Source generator is a zero-sample-input `Map`** (SR1). An oscillator/noise/wavetable has **no
+   sample-input ports**; M1 is vacuous, and pan sets `out.len` from the **pull demand `N`** instead.
+   Its phase/RNG/table-cursor is ordinary per-sample Mealy state advanced by `N`. ([catalog §2.7](catalog.md))
+2. **A `Voice` is a composite block**, and **`PolyVoice(Voice, Vmax)`** is fixed-capacity polyphony
+   *inside one block* — a `VoiceMap` over voices + a note→slot allocator (steal oldest/quietest with
+   a release ramp) + a summing mix. `Vmax` is comptime, so the footprint is bounded (H2) and the
+   block stays **one static op** — note-on does **not** spawn a graph node (Y1/Y4). ([catalog §8.12](catalog.md))
+3. **An `EventLane(NoteEvent)`** drives it: note-on/off and MPE expression arrive sample-accurately at
+   sub-block boundaries, routed per-note by `note_id` (§5, [catalog §8.6](catalog.md)).
+
+Here is a worked monosynth-grown-polyphonic — oscillator → envelope = a `Voice`, wrapped in a
+`PolyVoice`, through a layout-typed `pan` to the device. *Illustrative.*
+
+```zig
+// A single voice is a composite block: a generator + an envelope, packaged and flattened (§3).
+// pitch/velocity/gate are PARAMETER ports the PolyVoice allocator sets per note (§2.4, §5).
+pub fn SawVoice(comptime Num: pan.Numeric) type {
+    return struct {
+        const Self = @This();
+        osc: pan.gen.PolyBlepSaw(Num) = .{},  // a zero-sample-input Map source (SR1); anti-aliasing is the author's (Y6)
+        env: pan.env.Adsr(Num) = .{},          // a Map: gate -> amplitude
+
+        // the voice's control surface — the allocator drives these per note_id
+        pub const params = .{
+            .pitch_hz = pan.Scalar(f32),       // NoteEvent.note_on.pitch_hz lands here (Hz, not note#)
+            .velocity = pan.Scalar(f32),
+            .gate     = pan.Scalar(f32),        // 1 on note_on, 0 on note_off -> ADSR release
+        };
+
+        // out.len == pull N (the voice's source root sets the length, SR1)
+        pub fn process(self: *Self, out: []pan.Sample(f32)) void { _ = .{ self, out }; }
+    };
+}
+
+pub fn main() !void {
+    // ... gpa / alloc / cfg as in §3 ...
+    const Num = comptime pan.numericFor(.f32, .{});
+    var g = pan.Graph.init(alloc, .{ .precision = .f32, .sample_rate = 48_000, .channels = .stereo });
+    defer g.deinit();
+
+    // 16-voice polyphony, fixed capacity. Vmax comptime => bounded footprint, single static op (Y1).
+    const poly = try g.add(pan.synth.PolyVoice(SawVoice(Num), 16), .{
+        .steal = .oldest,            // voice-stealing policy; the stolen voice gets a release ramp (Y3)
+    });
+    // The event source: a MIDI input (live) or a timeline (offline) feeding NoteEvents.
+    const notes = try g.add(pan.io.MidiEventSource(pan.NoteEvent), .{ .port = .default });
+    const panner = try g.add(ConstantPowerPan(Num), .{ .position = 0.0 }); // mono voice-sum -> stereo (L1-typed)
+    const sink   = try g.add(pan.io.CoreAudioSink(Num), .{});
+
+    // Wire the event lane into the voice block, then the audio path to the device.
+    try g.connect(notes, poly.events);   // EventLane(NoteEvent) edge: note_on/off + MPE by note_id
+    try g.connect(poly,  panner);         // summed mono voice output
+    try g.connect(panner, sink);
+
+    var engine = try g.commit();          // same commit: type-check, schedule, color, PDC, op-list
+    defer engine.deinit();
+
+    // Playing a note is just an event on the lane — sample-accurate onset (EV3):
+    engine.sendEvent(notes, .{ .at_sample = 0,  .event = .{ .note_on  = .{ .note_id = 1, .pitch_hz = 440.0, .velocity = 0.8 } } });
+    engine.sendEvent(notes, .{ .at_sample = 64, .event = .{ .expression = .{ .note_id = 1, .axis = .timbre, .value = 0.3 } } }); // MPE: routes to voice owning note_id 1
+    engine.sendEvent(notes, .{ .at_sample = 96, .event = .{ .note_off = .{ .note_id = 1, .velocity = 0.5 } } });
+
+    try engine.start();                   // the CoreAudio callback drives the op-list, exactly as §3
+    defer engine.stop();
+    try pan.waitForSignal(.interrupt);
+}
+```
+
+What's load-bearing for a newcomer:
+
+- **No dynamic graph.** A note-on does **not** add a node — it allocates a *slot* inside the
+  fixed-capacity `PolyVoice` (Y1/Y4). The 16 voices are persistent state allocated once at commit;
+  the static op-list (§8.9) is untouched. If you reach for "spawn a voice node per key," pan refuses
+  by construction — that's the very thing the static op-list rules out. ([catalog §8.12](catalog.md))
+- **Two voice realisations, your call.** The *fused* `PolyVoice` (preferred for large `Vmax`) runs an
+  opaque internal `for active_voices` loop — only sounding voices cost CPU — exactly like the §4
+  tight-feedback kernels. The *replicated* `VoiceMap` runs all `Vmax` every callback (compute-and-
+  discard, simpler, good for a small fixed count). Either way it's **one static op**. ([catalog §8.12](catalog.md))
+- **Pitch is Hz, end to end.** `note_on.pitch_hz` lands directly in the voice's `pitch_hz` parameter.
+  Microtonal/MPE tuning is a note#→Hz block upstream, not a core concern — the lane never assumes
+  12-TET.
+
+**Ergonomics verdict for Instruments:** the pleasant surprise is how *little* is new. A generator is
+"a `Map` with no input" — no new contract. Polyphony is "a block with `Vmax` voice slots" — no
+dynamic graph, no allocator on the audio thread, a comptime footprint number you see at commit just
+like §3. Events are a typed lane, not a side channel of magic. The genuine authoring burden is the
+DSP itself (oscillator anti-aliasing vs a band-limited oracle, voice-stealing policy, click-free
+release — all ▷/≈ obligations, Y3/Y6), which is real regardless of pan. The framework's job — keep
+synthesis inside H1/H2/H3 with no dynamic nodes — it does, and the same `add/connect/commit/start`
+arc you learned for analysis is *literally* the arc here.
+
+---
+
+## 7. Offline render (OfflineBatch / Tier C) vs real-time (RealtimeStreaming / Tier A or B) — same blocks, different runner
+
+This used to be a "deferred Tier C" promise; it is now **committed**. The corpus pins **two
+dev-facing execution modes** ([catalog §8.10, C6](catalog.md);
+[`pan_parallel_and_offline_execution.md`](pan_parallel_and_offline_execution.md)):
+
+- **RealtimeStreaming** — pull/clock-driven, hard `N/Fs` deadline, invariants **H1–H3**. Runs on
+  **Tier A** (single-core synchronous-in-the-callback, the frozen ground truth) *or* **Tier B**
+  (static-parallel across P cores — a commit-time HEFT schedule + point-to-point ready-flags + the OS
+  audio workgroup, cost-model-gated and auto-demoting to Tier A; **bit-identical to Tier A** by
+  op-granular scheduling).
+- **OfflineBatch** — push/input-exhaustion-driven, **no deadline** (throughput rules), a distinct
+  relaxed invariant set **O1–O3**. This is **Tier C**: pipeline parallelism + data-parallel timeline
+  chunking (via `warmup_samples`, §2.5), **bit-reproducible** regardless of thread count (O3).
+
+The crucial DX fact: **the graph and its blocks are execution-mode-invariant** — the Yoneda/SampleMux
+payoff ([catalog §4.2/§8.10](catalog.md)). The mode (and tier) is the **Executor**, chosen *at engine
+instantiation*, not a property of the graph; the `process`/`pull` signatures and port types never
+change between modes. From the user's side it is a one-line change to *how you instantiate*, not a
+re-author. *Illustrative.*
 
 ```zig
 // Identical graph construction as §3 — gain -> biquad -> pan — but file->file, offline.
@@ -559,24 +761,41 @@ const src  = try g.add(pan.io.LpcmSource(Num), .{ .path = "in.f64.lpcm", .format
 const sink = try g.add(pan.io.FileRenderSink(Num), .{ .path = "out.f64.lpcm" });
 // ... connect ...
 
-var engine = try g.commit();
+// THE ONLY DIFFERENCE: pick the execution MODE at instantiation. Same committed graph `g`.
+//   .realtime_streaming -> Tier A (1 core) or Tier B (P cores), hard deadline, H1-H3
+//   .offline_batch      -> Tier C, no deadline, throughput, O1-O3, RingSampleMux push transport
+var engine = try pan.Engine.init(alloc, g, .{ .mode = .offline_batch, .threads = .auto });
 
-// THE ONLY DIFFERENCE: a push runner instead of a clock-driven RT root.
 // Latency is irrelevant; throughput rules; blocking is fine (it's the RingSampleMux path).
-try engine.renderOffline(.{ .runner = .tier_c_push }); // bit-reproducible, deterministic timeline
+try engine.renderToCompletion(.{ .clock = .input_exhaustion }); // bit-reproducible (O3), deterministic timeline
 ```
 
-The same `Gain`/`Biquad`/`ConstantPowerPan` structs you wrote in §1 drive both. On the offline
+The same `Gain`/`Biquad`/`ConstantPowerPan` structs you wrote in §1 drive both. On the OfflineBatch
 path the `SampleMux` is the ring-based push mux, threads-per-block and large rings are *fine*
 because there's no deadline — and this is exactly where ZigRadio's inherited ring machinery earns
 its keep ([hub §2](pan_architecture_formalisation.md)). Notice you can also bump precision to
 `f64` for an offline master render where you'd never afford it live; precision being a comptime
 parameter makes that a config change, not a code change.
 
-**Ergonomics verdict:** if pan delivers this, it's a quiet superpower — author once, render live or
-offline. The risk the docs themselves flag: the `Map`/`Rate` *surface* must not leak between push
-and pull, which is why **every block is tested under both muxes** ([roadmap §3](pan_categorical_bridge_and_roadmap.md)).
-As a user you mostly benefit from that discipline without seeing it.
+**And the Instrument bounces too.** The §6b synthesizer graph — `PolyVoice` + `EventLane(NoteEvent)`
+→ device sink — runs *unchanged* under OfflineBatch: swap the live MIDI source for a timeline event
+source and the device sink for a `FileRenderSink`, instantiate `.offline_batch`, and you bounce a
+MIDI timeline to disk. When the synthesis is deterministic (parameter-driven, no
+controller-driven `VariRate` drift) the bounce is **O3-reproducible** — bit-identical across thread
+counts ([catalog §8.13](catalog.md)). That's the dual-purpose claim paying off: one core, two graph
+shapes, two execution modes, all orthogonal.
+
+**Ergonomics verdict:** if pan delivers this, it's a quiet superpower — author once, run it *four
+ways* (Tier A single-core RT, Tier B multicore RT, Tier C offline, plus the §8 embedded
+specialization) from the same blocks. The two reproducibility stories are honest and worth
+internalising: Tier B is **bit-identical to Tier A** (op-granular scheduling preserves reduction
+order), and OfflineBatch is **bit-reproducible across thread count** (O3) — except a
+controller-driven drift-`VariRate`, which is ≈-only by nature (§2.6 V4). The risk the docs flag: the
+`Map`/`Rate` *surface* must not leak between push and pull, which is why **every block is tested
+under both muxes** and Tier B carries a **parallel≡sequential differential test**
+([roadmap §3](pan_categorical_bridge_and_roadmap.md),
+[`pan_parallel_and_offline_execution.md`](pan_parallel_and_offline_execution.md)). As a user you
+mostly benefit from that discipline without seeing it.
 
 ---
 
@@ -704,8 +923,11 @@ std.log.info("xruns={d} headroom={d:.0}% peak_block_us={d:.1} nan_guards_active=
 ```
 
 - **xrun / deadline-miss counters** are first-class. If this number is nonzero, you missed a
-  deadline and the user heard a click — it is the single most important signal, and it's also the
-  gate that *would* enable a future Tier B ([exec §5](pan_execution_model.md)). Watch it.
+  deadline and the user heard a click — it is the single most important signal. It is also tied to
+  **Tier B** (now committed, §7): the static-parallel RT executor is cost-model-gated and
+  **auto-demotes to Tier A** under sustained low headroom, and its cross-worker spin bound is backed
+  by spin-time/headroom telemetry alongside these counters ([catalog §8.10](catalog.md),
+  [`pan_parallel_and_offline_execution.md`](pan_parallel_and_offline_execution.md)). Watch it.
 - **Per-block CPU / deadline headroom** tells you "30% or 95% of budget?" — the knob you turn is
   block size (bigger = more headroom, more latency).
 - **Denormal FTZ (the M3 footgun) — now structurally closed.** On a decaying reverb tail, floats
@@ -744,7 +966,17 @@ longer silent.
   "you forgot `algorithmic_latency`" build error — these turn category-theory invariants into
   plain actionable messages. This is the strongest part of the DX.
 - **Same blocks across RT / offline / embedded.** Author `Gain` once; run it in a CoreAudio
-  callback, a file→file batch, or an STM32 DMA ISR. If this holds up it's a rare achievement.
+  callback (Tier A *or* Tier B multicore), a file→file batch (Tier C), or an STM32 DMA ISR. The
+  graph is **execution-mode-invariant** — the mode is an instantiation choice, not a re-author. If
+  this holds up it's a rare achievement. ([catalog §8.10](catalog.md))
+- **One core, two graph shapes — analysis *and* synthesis.** pan is a general-purpose engine, not an
+  analysis tool: an **Analyzer** (§6) and an **Instrument** (§6b) are the same `add/connect/commit/
+  start` arc, the same blocks, the same colored pools. And the synthesis primitives stay inside the
+  invariants by construction — a **generator is a zero-input `Map`** (`out.len` = pull `N`),
+  **polyphony is a fixed-capacity block** (`PolyVoice(Voice, Vmax)`, no dynamic graph nodes), a
+  **sampler-at-pitch is a `VariRate`** (bounded interval, worst-case planning), and notes ride a
+  **typed `EventLane(NoteEvent)`** (pitch in Hz, MPE by `note_id`). These are all spec-grounded, not
+  aspirational ([catalog §8.13/§2.6/§2.7/§8.6/§8.12](catalog.md)).
 - **Click-free by default.** Parameters ramp, bypass ramps, you can't accidentally zipper.
 - **Test against an independent oracle, under both muxes.** Trustworthy, and ergonomic via
   `@embedFile` + `inline for`.

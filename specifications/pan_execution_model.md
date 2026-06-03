@@ -1,6 +1,13 @@
 # pan — Execution Model
 
-> **Status: LOCKED** (2026-06-02). Change-control: conforms to [`catalog.md`](catalog.md); an edit
+> **Status: LOCKED** (2026-06-02; **amended 2026-06-03** — parameter ports exempt from M1 (§2.1);
+> `out_per_in` single-rate (§2.2); multi-input pull rule (§2.3); data-gating-only; **then §5 tiers B/C
+> COMMITTED (phased)** under two execution modes — see [`pan_parallel_and_offline_execution.md`](pan_parallel_and_offline_execution.md)
+> and catalog §8.10/§15; **then the source/variable-rate/event amendment** — the zero-sample-input
+> Source contract SR1–SR3 (§2.1/§2.2/§6), `VariRate` bounded-rate `Rate` (§2.2.1), the typed
+> `EventLane(Event)` + blessed `NoteEvent` (§4.4), and the Analyzer/Instrument graph shapes (§6) —
+> catalog §2.6/§2.7/§8.6/§8.12/§8.13).
+> Change-control: conforms to [`catalog.md`](catalog.md); an edit
 > that changes a definition or law must update catalog.md and every citing section in the same commit.
 > Support document for [`pan_architecture_formalisation.md`](pan_architecture_formalisation.md)
 > (the hub). Siblings: [`pan_memory_model.md`](pan_memory_model.md) ·
@@ -63,6 +70,26 @@ pub fn process(self: *Self, in: []const In, out: []Out) void;
 - May declare `pub const aliasing_safe = true` when the author asserts the kernel is free of
   intra-call read-after-write aliasing hazards and input is single-consumer & last-use here (the
   colorer may then alias `in` and `out`; see [`pan_memory_model.md` §3](pan_memory_model.md)).
+- May declare **parameter ports** via `pub const params = .{ ... }` (control-rate side inputs —
+  `Scalar`/`FeatureFrame` coefficients exposed as `node.param.<name>`). Parameter ports are **exempt
+  from the rate-1:1 law** (M1's `out.len == in.len` ranges over sample ports only) and are the
+  in-graph analogue of `set` — see [`catalog.md` §2.4](catalog.md),
+  [`pan_type_and_numeric_model.md` §1.1](pan_type_and_numeric_model.md).
+- **Source refinement (zero sample-input, SR1; [`catalog.md` §2.7](catalog.md)).** A **pure generator**
+  (oscillator, noise, wavetable, constant) is a `Map` with **zero sample-input ports**: M1 is **vacuous**
+  over the empty `in`, and the complementary rule sets **`out.len` = the pull demand `N`** delivered by
+  the mux's `getOutputBuffer` (§3). Its phase / RNG / table-cursor is ordinary per-sample Mealy state
+  advanced by `N`; it is driven only by parameter ports and the event lane (§4.4). The classifier reads
+  *zero sample-input ⇒ length from the pull, not from `in.len`*.
+
+```zig
+// illustrative — Zig 0.16: pure generator = Map, zero sample-input
+const Oscillator = struct {
+    phase: f32 = 0,                                // internal Mealy state
+    pub const params = .{ .freq = Scalar(f32), .shape = Scalar(f32) };
+    pub fn process(self: *@This(), out: []Sample(f32)) void { _ = self; _ = out; } // out.len == pull N
+};
+```
 
 ### 2.2 `Rate` — rate-elastic transducer
 ```zig
@@ -79,6 +106,45 @@ pub fn pull(self: *Self, want: usize, out: []Out) usize;    // returns produced 
 - Members: `Framer(N,H,window)`, decimator/interpolator, rational/arbitrary resampler (including the
   drift-ASRC of [`pan_io_realtime_and_pipeline.md` §1](pan_io_realtime_and_pipeline.md)),
   STFT/iSTFT, partitioned-convolution.
+- **`out_per_in` is single-rate per block** ([`catalog.md` §2.2 R5](catalog.md)): a processor whose
+  outputs run at *different* rates (wavelet/octave decomposition, multi-rate CQT) is **not** one
+  `Rate` block — it decomposes into a cascade/bank of uniform-rate `Rate` stages (each stage's outputs
+  share one rate). This keeps the `pull`/`needed_input` recursion (§2.3) decidable.
+- **Stream / sample source = `Rate` (or `VariRate`) source, zero sample-input** (SR2;
+  [`catalog.md` §2.7](catalog.md)). A source over a backing store / prefetch FIFO owns a read cursor and
+  `pull(want, out)`s from it; the off-thread prefetch source
+  ([`pan_io_realtime_and_pipeline.md` §5](pan_io_realtime_and_pipeline.md)) is this kind.
+  **Sample playback at arbitrary pitch is `VariRate`** (`param.pitch`). **Every non-feedback path must
+  be source-rooted** (SR3): a path whose head is neither a Source nor a persistent generator
+  ([`pan_memory_model.md` §6](pan_memory_model.md)) is empty — a commit error.
+
+#### 2.2.1 `VariRate` — bounded-variable-rate `Rate` ([`catalog.md` §2.6](catalog.md))
+A `Rate` whose actual out:in ratio **varies at runtime** declares a **bounded interval** instead of a
+point ratio, discriminated **at comptime by field presence** (`rate_bounds` **xor** `out_per_in`),
+exactly as Map-vs-Rate is discriminated. The pull contract (`pull(want, out) → produced`, §2.2) is
+*already* rate-elastic, so the **operational path is unchanged**; only the **static-planning** quantities
+generalise from a point ratio to an interval. This is **additive** — fixed-`out_per_in` blocks are
+unaffected.
+```zig
+// illustrative — Zig 0.16
+pub const RatioInterval = struct { min: Ratio, nominal: Ratio, max: Ratio };
+pub const rate_bounds: RatioInterval = .{ .min = ..., .nominal = ..., .max = ... };
+pub const max_latency: usize = 2048;                              // worst case over the interval — for PDC
+pub const ratio_source: enum { parameter, internal_controller }; // .parameter ⇒ in-graph operating point (param port, §2.1)
+```
+- **Worst-case static planning.** Buffer sizing and `needed_input(want)` use the **`min` ratio** (the most
+  input ever needed); PDC ([`pan_memory_model.md` §7](pan_memory_model.md)) uses **`max_latency`**. The
+  scheduler recursion (§2.3) plans on the interval's worst-case endpoints, keeping H2 footprint bounded.
+- **Ratio held per call** — sampled **once per render call** (held across the buffer like any parameter,
+  §2.1), never mid-call, preserving per-call reduction order and sub-block determinism.
+- **Determinism class.** A **parameter-driven** ratio (deterministic automation) is **O3-reproducible**; a
+  **controller-driven** ratio (the drift-PI ASRC on a wall-clock FIFO) is **≈ only** — the same class as
+  clock drift, not a defect.
+- **Membership.** The device-boundary **adaptive drift-ASRC** (`ratio_source = .internal_controller`);
+  **varispeed / scrub sample-playback**; **runtime-stretch TSM / phase-vocoder** (STFT/iSTFT stay
+  fixed-rate; the *variable synthesis hop* is the `VariRate` seam) and **pitch-shift** (TSM ∘ resample)
+  compose from it. A *fixed* stretch factor needs none of this — it is an ordinary fixed-`out_per_in`
+  cascade.
 
 > **One struct shape, two trait obligations.** The comptime port machinery (verified to read
 > `.pointer.child` of each `process`/`pull` param — see [hub §2](pan_architecture_formalisation.md))
@@ -94,6 +160,13 @@ produce `want`, and may buffer the remainder. The scheduler asks each input edge
 `producer.needed_input(want)` and recurses; a `Rate` block absorbs `H ∤ N` misalignment in its own
 ring. Forcing `N ≡ 0 (mod H)` (the tempting alternative) would couple the device buffer size to an
 algorithm's internal hop and break on every route switch — **rejected**.
+
+**Multi-input pull rule (catalog §8.8).** Each input edge is satisfied **independently** via its
+producer's `needed_input(want)`. **Same-rate** multi-input (AEC mic+reference, sidechain, crossover
+sum, summing mixer) is ordinary; latency across inputs is aligned by PDC
+([`pan_memory_model.md` §7](pan_memory_model.md)). **Mixed-rate *sample* inputs require an explicit
+rate adapter** (resampler/framer) — no implicit reconciliation. The only auto-reconciled cross-rate
+input is a **parameter port** ([`catalog.md` §2.4](catalog.md)), via ramp/hold coercion.
 
 > **Decision rule (newcomer sidebar — "do I need a `Map` or a `Rate`?").** The biggest newcomer
 > hazard is psychological: people reach for *"a `Map` with state."* The rule:
@@ -170,8 +243,39 @@ for op in plan.ops:  op.fn_ptr(op.self_ptr, gather(op.inputs), scatter(op.output
 One indirect call per *buffer* per block (free; the compiler often devirtualizes; on embedded the
 whole plan inlines). **Sub-block rendering** (events, hop boundaries) is "just a shorter N over a
 prefix of the same buffers" — see [`pan_io_realtime_and_pipeline.md` §6](pan_io_realtime_and_pipeline.md)
-for the event lane. This is a genuine *advantage* of pull over push: buffer granularity never fights
-you.
+and §4.4 below for the event lane. This is a genuine *advantage* of pull over push: buffer granularity
+never fights you.
+
+### 4.4 The typed event lane ([`catalog.md` §8.6](catalog.md))
+The **event lane** parallel to the sample lanes is **`EventLane(Event)`**, parameterised by a **comptime
+`Event` type** the consuming block chooses (event-type-**generic**, exactly as ports are
+element-generic). It carries a time-sorted `(sample_offset, event)` list; the scheduler renders in
+**sub-blocks bounded by event offsets** — pull `[0,k)`, apply the event, pull `[k,N)`. Free for `Map`
+by sub-block splitting (§4.2); `Rate` blocks quantize events to their hop grid.
+
+- **(EV1) Event-generic mechanism.** Sample-accurate dispatch and the sub-block split hold for *any*
+  `Event` — the split keys **only** on `sample_offset`, never on the payload — so an Analyzer (§6) may
+  pick a trivial/automation `Event` and pay no music-model cost.
+- **(EV2) `note_id` routing.** `note_id` enables per-note (MPE) routing to a specific voice in
+  `PolyVoice` (intra-block fixed-capacity polyphony — [`catalog.md` §8.12](catalog.md)).
+- **(EV3) onset accuracy.** Note onsets are sample-accurate via the sub-block split; `schedule`
+  ([`pan_io_realtime_and_pipeline.md` §7](pan_io_realtime_and_pipeline.md)) remains the only
+  sample-accurate *parameter* source.
+
+pan ships a blessed **`NoteEvent`** library union for instruments — **pitch is in Hz** (tuning-agnostic,
+microtonal-friendly; a note#→Hz tuning block is library, not core):
+```zig
+// illustrative — Zig 0.16, LIBRARY type (not core)
+pub const NoteEvent = union(enum) {
+    note_on:    struct { note_id: u32, pitch_hz: f32, velocity: f32 },
+    note_off:   struct { note_id: u32, velocity: f32 },
+    pressure:   struct { note_id: u32, value: f32 },                 // poly AT / MPE pressure
+    expression: struct { note_id: u32, axis: ExprAxis, value: f32 }, // MPE per-note bend / timbre
+    control:    struct { cc: u16, value: f32 },
+    pitch_bend: f32,
+    program:    u16,
+};
+```
 
 ### 4.3 Installing a new plan (T3)
 A graph edit builds a *new* plan off-thread, then publishes it by **atomic pointer swap (RCU)**
@@ -189,10 +293,15 @@ Control-plane mechanics in
 | Tier | What | Status | Rationale |
 |---|---|---|---|
 | **A** | Single-thread synchronous pull in the callback | **CORE (frozen)** | Meets sub-5 ms; wait-free; the always-correct ground truth. |
-| **B** | Static-parallel: pre-spawned RT-pinned workers, compile-time level schedule, bounded-spin barrier per level | **DEFERRED library, not core** | A spin barrier *busy-waits on the RT thread*; on M3's asymmetric P/E clusters (no userland core isolation, macOS migrates threads) its worst case is unbounded. The budget (1.3–2.7 ms) is ample single-core; *heavy* graphs are better served by **algorithmic** parallelism (partitioned convolution, SIMD, polyphase) inside one thread. It also contaminates the colorer (per-worker privatization). **Keep the level-schedule analysis; defer the executor.** |
-| **C** | Threaded push (ZigRadio verbatim): thread-per-block, large rings, condvars | **DEFERRED library, not core** | Offline file→file / batch; latency irrelevant, throughput rules. Reuses the same `Map`/`Rate` blocks via `RingSampleMux`. Touches none of H1–H3 (no deadline), so it is off the freeze-critical path. This is where the inherited ring machinery earns its keep. |
+| **B** | Static-parallel RT: pre-spawned workers (callback thread = worker 0) joined to the OS **audio workgroup**; commit-time **HEFT** schedule; **point-to-point** release/acquire ready-flags (no global barrier); concurrency-aware coloring; **cost-model-gated**; **auto-demotes to A** | **COMMITTED (phased)** | The deferral's premise — *a spin barrier busy-waits the RT thread; M3 P/E migration → unbounded* — is **removed by workgroup co-scheduling**, which bounds the cross-worker spin to one op (▷/≈, the FTZ honesty class). The gate enables B only when work/span and headroom justify it (a near-linear chain is refused); for a *single fat op*, algorithmic parallelism (SIMD, partitioned convolution) inside the op still applies — decompose it into per-partition ops to let B parallelize them. The colorer is **not** contaminated for a *static* schedule (interval coloring on the schedule-time axis — [`catalog.md` §8.11](catalog.md)). A naïve **level-barrier fork-join** is retained as the simpler evolution stage on the same foundation. Full design: [`pan_parallel_and_offline_execution.md` §2](pan_parallel_and_offline_execution.md). |
+| **C** | Threaded push: thread-per-stage, large rings, condvars **+ data-parallel timeline chunking** (`warmup_samples`) | **COMMITTED (phased)** | The **OfflineBatch** mode. Offline file→file / batch; latency irrelevant, throughput rules. Reuses the same `Map`/`Rate` blocks via `RingSampleMux`. Runs under the offline invariants **O1–O3** ([`catalog.md` §11.1b](catalog.md)), not H1–H3. This is where the inherited ring machinery earns its keep. Full design: [`pan_parallel_and_offline_execution.md` §3](pan_parallel_and_offline_execution.md). |
 
-> One authoring surface, three execution contracts via three muxes — but only **Tier A** is frozen.
+> One authoring surface, two **execution modes** ([`catalog.md` §8.10](catalog.md)) over three
+> execution contracts via the mux family: **RealtimeStreaming** = Tier A (1 core) or Tier B (P cores);
+> **OfflineBatch** = Tier C. **Tier A remains the frozen ground truth and the always-available
+> fallback** (the cost-gate and auto-demote fall back to it); Tiers B/C are committed, phased overlays
+> that each discharge their mode's invariants. The graph and blocks are execution-mode-invariant
+> (Yoneda probe, [`catalog.md` §4.2](catalog.md)).
 
 ---
 
@@ -211,6 +320,18 @@ ClockSource ∈ { AudioDeviceCallback, WallClockTimer(rate), InputExhaustion(fil
   in [`1.md`](../notes/1.md)) is a *separate* `PullRoot` on a **non-RT thread**, driven by a timer or by
   input exhaustion. It is **never slaved to the audio deadline** — an expensive feature/viz path
   must not be able to cause an xrun.
+- Each non-feedback path bottoms out at a **Source** (zero sample-input, §2.1/§2.2 — SR1/SR2): a pure
+  generator's `out.len` and a stream source's `pull(want, …)` both take their length from the **pull
+  demand** at the root, so a Source is itself a pull head. A **`VariRate`** block on the path plans on
+  the rate interval's **worst-case endpoints** (the `min` ratio for input demand, `max_latency` for PDC —
+  §2.2.1); cross-ref [`catalog.md` §2.6](catalog.md), [`catalog.md` §2.7](catalog.md).
+
+> **Two canonical graph shapes ([`catalog.md` §8.13](catalog.md)).** These roots are
+> direction-/purpose-agnostic by construction; the core serves two framing shapes from this one root
+> machinery: an **Instrument** (generators SR1 + an event/MIDI source → the **audio-device sink = the RT
+> callback root**, §1) and an **Analyzer** (a device/file audio source SR2 → `FeatureCollectorSink`/taps
+> driven by a **non-RT analysis root**). The device-sink RT root drives an Instrument; the non-RT analysis
+> roots drive an Analyzer. Both compose freely; the execution **modes** (§5) are orthogonal.
 - **Shared upstream is rendered once** and fanned to both roots; cross-root hand-off is **only** via
   a lock-free SPSC ring (a tap), never via shared pool coloring (each root colors its own subplan).
 
@@ -248,3 +369,18 @@ long-running instrument). The offline path (Tier C) keeps collapse semantics. Na
   a readable `@compileError` past 8 ports per direction). `connect` type-checks ports against it.
   See [`pan_type_and_numeric_model.md` §1](pan_type_and_numeric_model.md),
   [hub §2](pan_architecture_formalisation.md).
+- The **parameter-port** classification (`node.param.*` exempt from M1, ramped/held, one-source
+  `set`/`schedule`-xor-edge rule; [`catalog.md` §2.4](catalog.md)), the **multi-input pull rule**
+  ([`catalog.md` §8.8](catalog.md): independent per-edge `needed_input`; explicit adapter for
+  mixed-rate sample inputs), and **data-gating-only** ([`catalog.md` §8.9](catalog.md): the static
+  op-list is **unconditional** — there is no conditional/gated execution; VAD/onset/power gating is a
+  `Scalar` the consumer applies, never a skipped op).
+- The **Source classifier** (zero sample-input ⇒ `out.len`/`pull` length from the demand `N`, not
+  `in.len`; SR1/SR2 and the source-rooted-path check SR3; [`catalog.md` §2.7](catalog.md)) and the
+  **`VariRate`** field-presence discrimination (`rate_bounds` xor `out_per_in`) with **worst-case static
+  planning** on the interval endpoints ([`catalog.md` §2.6](catalog.md)).
+- The **typed event lane** `EventLane(Event)` (comptime-`Event`-generic; sub-block split keys on
+  `sample_offset` only) and the blessed Hz-pitched **`NoteEvent`** library union (§4.4;
+  [`catalog.md` §8.6](catalog.md)), with **`PolyVoice(Voice, Vmax)`** intra-block fixed-capacity
+  polyphony ([`catalog.md` §8.12](catalog.md)) and the two canonical graph shapes
+  (Analyzer / Instrument; [`catalog.md` §8.13](catalog.md)).

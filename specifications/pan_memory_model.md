@@ -1,6 +1,9 @@
 # pan — Memory Model
 
-> **Status: LOCKED** (2026-06-02). Change-control: conforms to [`catalog.md`](catalog.md); an edit
+> **Status: LOCKED** (2026-06-02; **amended 2026-06-03** — element-generic `UnitDelay`/FDN (§6),
+parameter ramp/hold state as persistent, parameter edges colored on control-element pools; **then §8a
+concurrency-aware coloring** for the COMMITTED Tier-B parallel executor + footprint addendum — see
+[`pan_parallel_and_offline_execution.md`](pan_parallel_and_offline_execution.md) and catalog §8.11/§15). Change-control: conforms to [`catalog.md`](catalog.md); an edit
 that changes a definition or law must update catalog.md and every citing section in the same commit.
 > Support document for [`pan_architecture_formalisation.md`](pan_architecture_formalisation.md)
 > (the hub). Siblings: [`pan_execution_model.md`](pan_execution_model.md) ·
@@ -48,7 +51,7 @@ pool per element-type-class** (canonical definition: [`catalog.md` §7.2](catalo
 ```
 Pool(class)  where class = (element_type, element_count)
    e.g.  Pool(Sample(f32), N=512)
-         Pool(Frame(Lane, C), N)          // C-channel frame; Sample(T) == Frame(Lane,1)
+         Pool(Frame(Lane, L), N)          // layout-L frame, count C := L.count(); Sample(T) == Frame(Lane,.mono)
          Pool(Complex(f32), 257)
          Pool(FeatureFrame, 40)
          Pool(Scalar(f32), 1)
@@ -58,6 +61,10 @@ Pool(class)  where class = (element_type, element_count)
   linear-time** (interval graphs are optimally k-colorable in linear time; this is the classic
   left-edge algorithm).
 - Across classes **there is no interference** (different element types can never alias).
+- The channel **layout `L`** ([`catalog.md` §1.3](catalog.md)) rides *inside* the element type
+  `A = Frame(Lane, L)`, so the pool key `(Frame(Lane,L), N)` and the coloring are **unchanged** — a
+  layout difference is already a distinct element type (a distinct class), exactly as a count
+  difference was. ⊢.
 - Pool sizing falls out as `M_class · element_count · @sizeOf(element_type)` — exactly the audit's
   demand to size by `element_count · sizeof(elem)`, not `N · sizeof(T)`.
 - For the few graphs where one class still has heterogeneous *counts* (rare), M is so small (≤ ~8)
@@ -67,6 +74,11 @@ Pool(class)  where class = (element_type, element_count)
 > This single refinement does double duty: it makes coloring tractable **and** it unifies "typed
 > ports" with "the buffer pool" into one mechanism (the element-type *is* the pool key). See
 > [`pan_type_and_numeric_model.md` §1](pan_type_and_numeric_model.md) for the typed-port catalog.
+
+**Parameter edges** ([`catalog.md` §2.4](catalog.md)) carry `Scalar`/`FeatureFrame` control elements
+and are colored on those **same** per-class pools — a parameter edge is an ordinary edge for coloring,
+scheduling, and the SCC-has-delay check (catalog §2.4 P4); only its *ramp/hold state* is persistent
+(§6.2).
 
 ---
 
@@ -150,9 +162,17 @@ deferred** as a layered library subject to a real use case (Rule 2).
 The delay buffer for a feedback edge — and a `Framer`'s overlap ring, and any cross-frame history
 (delta cepstra, flux previous-spectrum, leaky maxes, tempo hypotheses) — has a live range **spanning
 callbacks**. These are a **distinct, pool-excluded category**: allocated once at `initialize`,
-persisting across the hot path. The library ships a canonical `UnitDelay(z⁻¹)` / `DelayLine(L)`
-primitive so reverbs (comb/all-pass/FDN), Karplus-Strong, and feedback IIR are expressible *and*
-safe.
+persisting across the hot path. The library ships a canonical **element-generic** `UnitDelay(z⁻¹)` /
+`DelayLine(len)` primitive — over `Sample`/`Frame`/`Complex`/`FeatureFrame` ([`catalog.md` §5.5](catalog.md))
+— so reverbs (comb/all-pass; **FDN = N delay lines + a matrix-mix `Map` over `Frame(Lane,.discrete(N))`**),
+Karplus-Strong, feedback IIR, and **frame-/spectrum-granular feedback** (`UnitDelay(Complex)` /
+`UnitDelay(Frame(Lane,L))`) are expressible *and* safe. *(Symbol note: in `Frame(Lane, L)` the second
+parameter is the channel **layout** §1.3; in `DelayLine(len)` it is the delay **length** — distinct
+local bindings.)* Synth **voice pools** (`PolyVoice`, [`catalog.md` §8.12](catalog.md)) and instrument
+**assets** (wavetables, sample sets, impulse responses) are likewise persistent (pool-excluded) —
+allocated once at `initialize`, sized by a comptime capacity. A **parameter port's ramp/hold state**
+(the previous/target value smoothed across the buffer, [`catalog.md` §2.4 P3](catalog.md)) is likewise
+persistent (pool-excluded), allocated once at `initialize`.
 
 ### 6.3 State-update granularity (audit S6)
 When a block is rendered in two sub-blocks per hop (events, §[exec 4.2](pan_execution_model.md)),
@@ -197,6 +217,34 @@ through the compensating delay.
 - **Device reconfiguration** (route switch changes N) re-sizes the *backing bytes* of each pool to
   the new max-N; the *assignment map* (which edge → which buffer id) is N-independent topology and is
   unchanged ([`pan_io_realtime_and_pipeline.md` §8](pan_io_realtime_and_pipeline.md)).
+
+## 8a. Concurrency-aware coloring under the Tier-B parallel executor (COMMITTED 2026-06-03)
+
+The locked text above warned that the parallel tier "contaminates the colorer (per-worker
+privatization)." For a **static** Tier-B schedule (commit-time HEFT, [`catalog.md` §8.10](catalog.md))
+this is **overstated** (Rule 7 — surfaced disagreement): with each op's start/finish fixed by the
+schedule,
+
+> two edges interfere **iff their producing/consuming ops' execution intervals overlap in the static
+> schedule** — an **interval graph on the schedule-time axis**, so the §2 / [`catalog.md`
+> §7.2](catalog.md) optimal linear-time left-edge coloring **still applies** (only the time axis changes
+> from sequential topological order to scheduled wall-time).
+
+Consequences ([`catalog.md` §8.11](catalog.md)):
+- **`M_class` grows** to the peak *concurrent* live-edge count (a whole parallel span, not the 3–6 of a
+  near-linear chain) → larger but **statically bounded** pools (H2 holds).
+- **In-place coalescing (§3) gains a fourth condition: (iv) producer and consumer are not concurrently
+  scheduled.** The `aliasing_safe` alias is honoured only for non-overlapping ops. ⊢ (decidable from
+  the schedule).
+- **Per-worker scratch.** Buffers internal to one op (a fused sub-chain's transients) are worker-local
+  pools (`P` copies) — the `+ Σ_worker scratch(worker)` term in the footprint formula (§10).
+- **The B≡C differential test (§9) extends to the parallel schedule** (the **parallel≡sequential
+  differential test**, [`catalog.md` §8.10](catalog.md)): the colored pool under the concurrency-aware
+  interference graph must produce output **bit-identical** to the per-edge double-buffer baseline *and*
+  to Tier A (op-granular scheduling preserves per-op reduction order). Paranoid mode (NaN-poison
+  released buffers) extends to catch a buffer reused before its last reader across the concurrency-aware
+  graph. The **offline** colorer/footprint (rings + per-chunk pools, O2) is separate:
+  [`pan_parallel_and_offline_execution.md` §3.6](pan_parallel_and_offline_execution.md).
 
 ---
 
@@ -245,6 +293,12 @@ render_memory =  Σ_class  M_class · element_count_class · @sizeOf(element_typ
 All terms known at commit (at `comptime` on embedded) → **one up-front allocation, zero hot-path
 alloc**. On heap-less MCUs this is a `comptime`-sized `[render_memory]u8` in `.bss` behind a
 `FixedBufferAllocator` (skill ch.05). This is the concrete realization of hub invariant **H2**.
+
+**Tier-B addendum (§8a).** Under the static-parallel executor, `M_class` is the peak *concurrent*
+live-edge count and a per-worker scratch term is added: `+ Σ_worker scratch(worker)`. Both stay
+commit-known and statically bounded → H2 holds. **OfflineBatch (O2)** uses a separate, larger-but-
+pre-sized footprint (rings + per-chunk pools):
+[`pan_parallel_and_offline_execution.md` §3.6](pan_parallel_and_offline_execution.md).
 
 ---
 

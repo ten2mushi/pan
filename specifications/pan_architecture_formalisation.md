@@ -1,6 +1,10 @@
 # pan — Architecture Formalisation (scope-narrowing for the spec phase)
 
-> **Status: LOCKED** (2026-06-02). This is the **hub** document. It commits the
+> **Status: LOCKED** (2026-06-02; **amended 2026-06-03** — C1 gains *parameter ports* (catalog §2.4);
+> **then commitments C6/C7 added** (two execution modes + static-parallel RT executor) and invariants
+> H1–H3 paired with offline O1–O3 — scheduler Tiers B/C COMMITTED (phased); see
+> [`pan_parallel_and_offline_execution.md`](pan_parallel_and_offline_execution.md), catalog §15 change
+> log). This is the **hub** document. It commits the
 > decisions that the category-theory `specifications/` will formalise as the single source of
 > truth. Where the earlier ideation left options open, this document *picks one and says why*
 > (CLAUDE.md Rule 7). Change-control: this hub conforms to [`catalog.md`](catalog.md), the single
@@ -61,8 +65,11 @@ replays it inside the audio callback, wait-free; (3) a **per-element-class color
 sized at graph-commit, zero hot-path allocation; (4) **precision (`T`) comptime, block-size (`N`)
 runtime, SIMD-width (`W`) comptime-per-target**, with a Numeric trait carrying accumulator and
 saturation policy; (5) **clock-driven pull roots** so audio output and analysis sinks are
-independent demand sources. The embedded profile is then a *strict comptime specialization* of the
-desktop core — every runtime degree of freedom collapses to comptime or vanishes on an MCU — which
+independent demand sources — plus two **committed-mode** commitments added 2026-06-03: (6) **two
+execution modes** (RealtimeStreaming / OfflineBatch) over the mode-invariant graph, and (7) a
+**static-parallel RT executor** (Tier B) for heavy graphs exceeding one core (§3 C6/C7). The embedded
+profile is then a *strict comptime specialization* of the desktop core — every runtime degree of
+freedom collapses to comptime or vanishes on an MCU (Tiers B/C simply do not exist there) — which
 is the strongest evidence the core is factored correctly.
 
 ---
@@ -83,6 +90,12 @@ callback contract*, not preferences. (Detail and the latency-budget arithmetic:
 - **H3 — Port/graph correctness provable at comptime.** Mis-wiring (type, channel, rate mismatch)
   is a compile-time or commit-time error, never a runtime crash. This is the one inherited asset
   that pays for itself immediately.
+
+> **H1–H3 are the *RealtimeStreaming* invariants.** The **OfflineBatch** mode (Tier C, C6) runs under
+> a distinct, relaxed set **O1–O3** (blocking-legal / pre-sized bounded footprint / bit-reproducibility)
+> — see [`catalog.md` §11.1b](catalog.md). Tier B (C7) discharges H1–H3, with H1's wait-freedom
+> carrying a workgroup-conditional ▷/≈ bound on its bounded cross-worker spin (never weakening Tier A's
+> structural ⊢).
 
 > **Litmus test for "is it core?"** *A concept is core iff it must hold at comptime/commit for the
 > render path to stay wait-free (H1), statically-bounded (H2), and type-correct (H3).* Anything
@@ -116,7 +129,7 @@ The double-mapped contiguous ring survives only as an offline buffer strategy.
 
 ---
 
-## 3. The five core commitments (decision record)
+## 3. The eight core commitments (decision record)
 
 Each entry: the decision, what it changes versus the ideation, and where it is formalised.
 
@@ -132,6 +145,13 @@ Be honest: there are **two morphism kinds**, discriminated at comptime.
   are distinct — latency ≠ decimation). Framer/STFT, decimator/interpolator, resampler (incl. the
   drift-ASRC), partitioned convolution. A `Rate` block that fails to declare its ratio/latency is a
   **build error** (Rule 12).
+- **Parameter ports (control ports)** *(refinement, LOCKED 2026-06-03)* — a port **kind** orthogonal
+  to the two morphism classes: a control-rate side input carrying `Scalar`/`FeatureFrame` (a node's
+  coefficient), **exempt from the rate-1:1 law**, ramped/held like `set`, and the **in-graph analogue
+  of `set`** (one source per slot — `set`/`schedule` xor a wired edge). It lifts the control-rate
+  modulation ceiling (decoupled LFO/feature → filter; adaptive coefficients as a graph edge)
+  **without** adding a third morphism class. The port-kind machinery is core; modulation blocks are
+  library. Canonical: [`catalog.md` §2.4](catalog.md).
 > **Why this is the keystone:** it resolves the audit's S2 and the systems-design "(a)" objection
 > at once, and it makes the pull scheduler's recursion arithmetic correct. Formalised in
 > [`pan_execution_model.md` §2](pan_execution_model.md).
@@ -142,9 +162,12 @@ Following JUCE's `AudioProcessorGraph`: **compile topology → an ordered list o
 (on graph change, off-thread), then the callback just **replays the op-list** — no graph walking or
 pointer chasing on the hot path. A `PullSampleMux` satisfies the inherited 10-method vtable;
 `waitInputAvailable` returns immediately because the scheduler renders upstream first; `update` is a
-no-op commit. **Tier A (single-thread pull) is the entire frozen core.** Tier B (static-parallel)
-and Tier C (offline threaded push) are **deferred libraries** (§5), reusing the same blocks via
-different muxes. Formalised in [`pan_execution_model.md` §3–§5](pan_execution_model.md).
+no-op commit. **Tier A (single-thread pull) remains the entire frozen core** and the always-available
+fallback. Tier B (static-parallel RT) and Tier C (offline threaded push) are now **COMMITTED (phased)
+layered libraries** (§5; promoted 2026-06-03) under two dev-facing **execution modes** (C6) — they
+reuse the same blocks via different muxes and each **discharges its mode's invariants** (RealtimeStreaming
+⇒ H1–H3; OfflineBatch ⇒ O1–O3). Formalised in [`pan_execution_model.md` §3–§5](pan_execution_model.md)
+and [`pan_parallel_and_offline_execution.md`](pan_parallel_and_offline_execution.md).
 
 ### C3 — Per-element-class colored buffer pool
 Per-callback execution of a known schedule = **register allocation**: edges=virtual registers,
@@ -180,6 +203,36 @@ root on a non-RT thread**, fed from the audio graph through an SPSC ring (a tap)
 audio deadline. Shared upstream is rendered once and fanned to both roots. Resolves the audit's S3.
 Formalised in [`pan_execution_model.md` §6](pan_execution_model.md).
 
+### C6 — Two execution modes via the mux family (COMMITTED 2026-06-03)
+The graph is **execution-mode-invariant** (the Yoneda probe): one diagram, runnable under
+**RealtimeStreaming** (pull, hard deadline, H1–H3; Tier A 1-core *or* Tier B P-core) or **OfflineBatch**
+(push, throughput, O1–O3; Tier C). The mux family **is** the mode selector; no block changes between
+modes. Formalised in [`catalog.md` §8.10](catalog.md),
+[`pan_parallel_and_offline_execution.md` §0](pan_parallel_and_offline_execution.md).
+
+### C7 — Static-parallel RT executor (Tier B) (COMMITTED 2026-06-03)
+Heavy RT graphs exceeding one core are served by a **commit-time HEFT schedule + point-to-point
+release/acquire ready-flags + OS audio workgroup + concurrency-aware interval coloring**, **cost-model
+gated** (enabled only when work/span and headroom justify it) and **auto-demoting to Tier A**. Output is
+**bit-identical to Tier A** (op-granular scheduling preserves per-op reduction order). The workgroup
+removes the original deferral premise (M3 P/E migration → unbounded spin); the bounded-spin claim is
+▷/≈ (workgroup-conditional, the FTZ honesty class), never weakening Tier A's structural ⊢. Formalised in
+[`catalog.md` §8.10–§8.11](catalog.md),
+[`pan_parallel_and_offline_execution.md` §2](pan_parallel_and_offline_execution.md).
+
+### C8 — Purpose-agnostic core: two canonical graph shapes (COMMITTED 2026-06-03)
+The core is **direction- and purpose-agnostic by construction** (the Yoneda/`SampleMux` probe read across
+*direction* as well as transport): one executor serves an **Analyzer** (analysis-rooted feature
+extraction; the `notes/1.md` viz) and an **Instrument** (audio-device-sink-rooted synthesis / digital
+instruments) from one codebase. The supporting refinements are all small core additions or library
+blessings, none weakening H1–H3: **`ChannelLayout` identity** in the element type
+([`catalog.md` §1.3](catalog.md)), **`VariRate`** bounded-variable rate (§2.6), the **Source**
+zero-sample-input contract (§2.7), the **typed event lane** `EventLane(Event)` + the blessed `NoteEvent`
+(§8.6), and **intra-block fixed-capacity polyphony** `PolyVoice` (§8.12). Formalised in
+[`catalog.md` §8.13 + §11.2 C8](catalog.md). *(pan was conceived for feature extraction; the locked
+architecture is a genuine general-purpose audio DSP engine — synthesis is within scope and enumerated in
+the block taxonomy, [`pan_categorical_bridge_and_roadmap.md` §2](pan_categorical_bridge_and_roadmap.md).)*
+
 ---
 
 ## 4. The shape of the thing
@@ -214,7 +267,9 @@ Formalised in [`pan_execution_model.md` §6](pan_execution_model.md).
 **Freeze in the spec (each is orthogonal; removing any one breaks H1/H2/H3):**
 
 1. **Two block contracts** `Map` / `Rate` with comptime-extracted typed ports carrying
-   `{element_type, channels, out_per_in, algorithmic_latency, aliasing_safe}`.
+   `{element_type, channels, out_per_in, algorithmic_latency, aliasing_safe}`, **plus parameter
+   (control) ports** — a control-rate side-input port kind (catalog §2.4), exempt from the rate-1:1
+   law, the in-graph analogue of `set` (port-kind machinery core; modulation blocks library).
 2. **Numeric kernel trait** `{Lane, Acc, saturate, W}`, comptime, bound once via the HAL; N runtime
    for stream ports, comptime for fixed-K ports.
 3. **The `SampleMux` seam** — the only coupling between blocks and transport.
@@ -230,8 +285,12 @@ Formalised in [`pan_execution_model.md` §6](pan_execution_model.md).
 7. **Persistent-state buffers** (delay lines, `z⁻¹`, framer rings) as a pool-excluded category.
 8. **Generalized clock-driven pull roots** (one abstraction; the device callback is one instance).
 
-**Defer as layered libraries (build on the above; touch none of H1–H3 on the RT path):**
-Tier C (offline push), Tier B (static-parallel + parallel-aware colorer), concrete DSP blocks
+**Committed (phased) layered libraries (build on the above; each discharges its mode's invariants —
+H1–H3 for RT, O1–O3 for offline):** **Tier C (OfflineBatch — pipeline + data-parallel chunking via
+`warmup_samples`)** and **Tier B (static-parallel RT — HEFT + point-to-point + audio workgroup +
+concurrency-aware colorer, cost-gated, auto-demote)** are no longer deferred — promoted 2026-06-03 (C6/C7,
+[`pan_parallel_and_offline_execution.md`](pan_parallel_and_offline_execution.md)); they remain *layered*
+(not frozen core — Tier A is), so the litmus is unchanged. Other layered libraries: concrete DSP blocks
 (biquad, FFT/STFT, oscillators, reverb), the adaptive **drift resampler** (a `Rate` block + a clock
 comparator), **off-thread prefetch source** (a `Rate` source over an SPSC ring), click-free ramps /
 NaN guards / FTZ-DAZ (FTZ/DAZ set via the **required realtime token** — `enterRealtimeThread()`,
@@ -243,8 +302,13 @@ combinators, and the `FeatureCollectorSink`. Catalogued in
 [`pan_categorical_bridge_and_roadmap.md`](pan_categorical_bridge_and_roadmap.md).
 
 **Cut entirely as a *contract*:** the "single unified block surface" (it is two contracts, C1) and
-Tier-B's parallel executor *in the core* (it busy-waits the RT thread and is unnecessary at the
-target budget — see [`pan_execution_model.md` §5](pan_execution_model.md)).
+**Tier-B's parallel executor *as frozen core*** — it stays a *layered* library, never on the frozen
+RT-critical path, so Tier A remains the structural-⊢ ground truth. (The earlier rationale "busy-waits
+the RT thread, unnecessary at budget" is **superseded for the *deferral***: the executor is now
+COMMITTED as a cost-gated, workgroup-co-scheduled, auto-demoting overlay — the naïve unmanaged-spin
+barrier is what was rejected, not parallelism per se. See
+[`pan_execution_model.md` §5](pan_execution_model.md),
+[`pan_parallel_and_offline_execution.md` §2](pan_parallel_and_offline_execution.md).)
 
 ---
 

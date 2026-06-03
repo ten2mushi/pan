@@ -1,6 +1,7 @@
 # pan — Commit-Pass Algorithms (the graph→op-list compiler, to implementation precision)
 
-> **Status: LOCKED** (2026-06-03). Change-control: conforms to [`catalog.md`](catalog.md); an edit
+> **Status: LOCKED** (2026-06-03; includes the parameter-port amendment, catalog §15 — ramp/hold
+> coercion + one-source check in the negotiate pre-stage). Change-control: conforms to [`catalog.md`](catalog.md); an edit
 > that changes a definition or law must update catalog.md and every citing section in the same commit.
 > Support document for [`pan_architecture_formalisation.md`](pan_architecture_formalisation.md)
 > (the hub). Siblings: [`pan_execution_model.md`](pan_execution_model.md) ·
@@ -32,8 +33,8 @@ then replays the op-list with zero graph walking ([`pan_execution_model.md` §4.
 The stage order is **fixed by [`catalog.md` §8.2](catalog.md)** and is not negotiable:
 
 ```
-format-negotiate                         (§6 catalog — unification; coercion morphisms)
-  → topo-sort (DAG minus feedback edges)  (§2 here)  ⊢
+format-negotiate                         (§6 catalog — layout-identity unification; coercion morphisms)
+  → topo-sort (DAG minus feedback edges)  (§2 here)  ⊢  (+ source-rooted SR3 check)
   → liveness                              (§3 here)  ⊢
   → per-element-class coloring            (§4 here)  ⊢ (optimality imported) / ≈ (impl: B≡C)
   → SCC-has-delay check (FULL graph)      (§5 here)  ⊢
@@ -71,8 +72,8 @@ Node = {
   kind                : Map | Rate,    // ⊢ comptime-classified (catalog §2)
   fn_ptr              : *const fn(...), // monomorphized kernel (precision-comptime, catalog §9.1)
   self_ptr            : *anyopaque,     // block state
-  algorithmic_latency : usize,         // 0 for pure Map; worst-case for Rate (catalog §7.7)
-  out_per_in          : Ratio,         // 1:1 for Map; rational p:q for Rate (catalog §2)
+  algorithmic_latency : usize,         // 0 for pure Map; worst-case for Rate; max_latency for VariRate (catalog §7.7 / §2.6 V2)
+  out_per_in          : Ratio,         // 1:1 for Map; rational p:q for Rate; VariRate carries rate_bounds (min/nominal/max), plan on min (catalog §2 / §2.6 V2)
   rate_domain         : RateDomainId,  // which clock grid this node's I/O lives on (§6)
   aliasing_safe       : bool,          // M4 author assertion (catalog §2.1) — ▷/≈
   state_size          : usize,         // per-block persistent state bytes (footprint term)
@@ -92,18 +93,39 @@ FeedbackEdge = {                       // catalog §5.2 — the z⁻¹ split
 ```
 
 The `class` key `(element_type, element_count)` is the sub-tuple of `Format` of
-[`catalog.md` §1.2](catalog.md): precision `T` and channel count `C` are *inside* `element_type`
-(`Sample(T)`, `Frame(Lane,C)`, `Complex(T)`, …), so the pool keys off the element type directly. The
+[`catalog.md` §1.2](catalog.md): precision `T` and channel **layout** `L : ChannelLayout` (count +
+positional tags + canonical channel order — [`catalog.md` §1.3](catalog.md)) are *inside*
+`element_type` (`Sample(T)`, `Frame(Lane,L)`, `Complex(T)`, …; channel count `C := L.count()`), so the
+pool keys off the element type directly. The
 `out_per_in`/`algorithmic_latency` field presence is the comptime `Map`/`Rate` discriminator (R1,
 [`catalog.md` §2.2](catalog.md)) and is assumed already validated on entry.
 
 **Pre-stage (format-negotiate).** Before topo-sort, the negotiation pass of
 [`catalog.md` §6](catalog.md) has already unified Formats along every edge and **inserted coercion
-morphisms** (resampler / channel-matrix / cast / framer) where the user wired compatible-but-coercible
-Formats, so that the diagram commutes. After this pre-stage **every edge's two endpoints agree on
-`class`** — element-type/direction/channel identity is a ⊢ type error if violated (A1/A6,
-[`catalog.md` §6](catalog.md)). The algorithms below therefore assume a Format-consistent graph; the
-inserted coercion nodes are ordinary `Map`/`Rate` nodes from here on.
+morphisms** (resampler / channel up/down-mix matrix / cast / framer / **parameter ramp-hold**) where
+the user wired compatible-but-coercible Formats, so that the diagram commutes. The channel axis is
+unified on **layout identity `L`**, not merely channel count: each wired edge imposes equality of
+**count + positional tags + canonical channel order** ([`catalog.md` §1.3](catalog.md), L1) — a
+layout mismatch is a ⊢ error exactly as a count mismatch is, generalising (not replacing) the
+channel-count check. For a **registered** layout pair (e.g. `.stereo → .surround_5_1`) the pass inserts
+the canonical up/down-mix matrix; an **unregistered** pair (e.g. `.custom → .ambisonic`) is a **hard
+mismatch** — a commit error requiring an explicit spatial block, never an auto-coercion (L2,
+[`catalog.md` §6](catalog.md)). A `.discrete(N)` layout opts out of positional identity (count-only).
+After this pre-stage **every edge's two endpoints agree on `class`** — element-type/direction/layout
+identity is a ⊢ type error if violated (A1/A6/A21/A22, [`catalog.md` §6](catalog.md)). The algorithms
+below therefore assume a Format-consistent graph; the inserted coercion nodes are ordinary `Map`/`Rate`
+nodes from here on.
+
+> **Parameter ports (catalog §2.4) at commit.** A wired **parameter edge** is reconciled to the
+> consumer's render rate by a **ramp/hold coercion** node inserted here (the parameter analogue of a
+> resampler). The negotiation pre-stage additionally enforces the **one-source rule** ⊢: a parameter
+> slot driven by **both** `set`/`schedule` **and** a wired edge is rejected at commit (P2). A
+> parameter edge is otherwise an **ordinary edge** for the stages below — it is liveness-analysed and
+> colored on its control-element class (§3–§4), participates in topo order (§2), and is subject to
+> SCC-has-delay (§5, P4); only its ramp/hold *state* is persistent (pool-excluded, §3). It is
+> **exempt from the rate-1:1 law** (it does not constrain the consumer's `out.len`). Multi-output
+> `Rate` blocks are single-rate per block (catalog §2.2 R5): a multi-rate filterbank arrives here
+> already decomposed into uniform-rate stages, so the scheduler (§7) sees only single-ratio blocks.
 
 ---
 
@@ -127,6 +149,27 @@ side* is satisfied from persistent state produced last block, so it imposes no s
    *undeclared* cycle (a wiring error distinct from a feedback loop) → `error.UndeclaredCycle`. (A
    *declared* feedback loop never reaches here because its back-edge was removed; its delay-freeness is
    checked in §5 on the full graph.)
+
+**Source-rooted check (SR3, [`catalog.md` §2.7](catalog.md)) — ⊢ decidable.** Every non-feedback path
+must be **source-rooted**: its head (a node with zero non-feedback sample-input in-edges — exactly a
+Kahn seed) must be either a **Source** (a zero-sample-input pure generator — `Map`, SR1 — or a
+stream/file source — `Rate`/`VariRate`, SR2) or a **persistent generator** ([`catalog.md` §5.3](catalog.md)).
+A head that is none of these has no producer for its sample inputs — the path is **empty/unrooted** → a
+commit error:
+
+```text
+error.UnrootedPath: non-feedback path head is neither a Source nor a persistent generator.
+   node: <id>  (zero non-feedback sample-input edges, not a generator)
+   every non-feedback path must be source-rooted (SR3): its head is a Source
+   (zero-sample-input generator, or a stream/file source) or a persistent generator.
+   see catalog.md §2.7.
+```
+
+A pure generator at a head is well-formed precisely because its `out.len` is set by the **pull demand
+`N`** rather than by any `in.len` (SR1, [`catalog.md` §2.7](catalog.md)) — see the rate-scheduling
+stage (§7). The check is a single scan over the Kahn seeds (the `indegree == 0` set on non-feedback
+sample edges), classifying each as Source / persistent-generator / unrooted; **⊢** (a decidable graph
+check, A26 [`catalog.md` §12.1](catalog.md)).
 
 **Deterministic tie-break — load-bearing.** The ready set is a **min-priority queue keyed by
 `NodeId`** (insertion order), not a plain FIFO. This makes the op-list **bit-reproducible**: the same
@@ -251,7 +294,7 @@ legal **iff** its SCC contains ≥1 delay element.
 1. Run Tarjan over the **full** edge set (including each feedback edge's write→read closure) →
    strongly-connected components.
 2. For each **nontrivial SCC** (≥2 nodes) **and** each **self-loop** (a node with a feedback edge onto
-   itself): scan its member nodes for ≥1 **delay element** (a `UnitDelay(z⁻¹)` / `DelayLine(L)`, or a
+   itself): scan its member nodes for ≥1 **delay element** (a `UnitDelay(z⁻¹)` / `DelayLine(len)`, or a
    fused tight-feedback kernel whose internal `z⁻¹` is declared — [`catalog.md` §5.4](catalog.md)).
 3. If a nontrivial SCC (or self-loop) has **no** delay member →
    `error.DelayFreeLoop` **naming the cycle nodes** (Rule 12: fail loud).
@@ -300,8 +343,10 @@ each fan-in, so that signals re-align sample-accurately ([`catalog.md` §7.7](ca
    **persistent / pool-excluded category** ([`catalog.md` §5.3](catalog.md)) — they do not perturb the
    §4 pool coloring; they add a PDC term to the footprint (§9).
 4. **Static only.** A `Rate` block reports a **static worst-case** `algorithmic_latency`
-   ([`catalog.md` §7.7](catalog.md)); pan mandates static reported latency (variable-latency plugins
-   are out). **Bypass-preserves-latency** ([`catalog.md` §10](catalog.md)): a bypassed block with
+   ([`catalog.md` §7.7](catalog.md)); a `VariRate` block ([`catalog.md` §2.6](catalog.md)) reports its
+   declared **`max_latency`** — the worst case over the rate interval — so the longest-path DP plans on
+   that constant (V2, the worst-case-endpoint rule); pan mandates static reported latency
+   (variable-latency plugins are out). **Bypass-preserves-latency** ([`catalog.md` §10](catalog.md)): a bypassed block with
    `algorithmic_latency > 0` keeps routing through its already-allocated compensating `DelayLine`, so
    bypass never shifts timing on parallel paths. Built-in bypass honors this ⊢; custom bypass is ▷.
 
@@ -328,11 +373,17 @@ producer for `producer.needed_input(want)` and recurses upstream.
 1. **Demand propagation (reverse topo).** Starting from each `PullRoot`'s sink with `want = N`, walk
    **upstream** in reverse-topo order. For a `Map`, `needed_input(want) = want` (rate-1:1, M1). For a
    `Rate`, `needed_input(want)` is the block's declared function (e.g. a hop-`H` `Framer` needs
-   `want·H` input samples — modulo its ring fill, R3). Record each edge's required count
+   `want·H` input samples — modulo its ring fill, R3). For a **`VariRate`** block
+   ([`catalog.md` §2.6](catalog.md)), `needed_input(want)` and the edge buffer sizing use the **`min`
+   ratio** of its `rate_bounds` — the worst-case interval endpoint (the most input ever needed for a
+   given `want`), so the edge is sized for the maximum demand (V2). Record each edge's required count
    `want_edge`.
 2. **Compile to op order.** Because the op-list executes **upstream-before-downstream**
    (forward-topo), each op's `n_or_pull_spec` is the `want` resolved for *its* output(s) in step 1.
-   For a `Map` op the spec is simply the slice length `n` (`out.len == in.len`, M1). For a `Rate` op
+   For a `Map` op the spec is simply the slice length `n` (`out.len == in.len`, M1) — **except a Source
+   pure generator** (zero sample-input `Map`, the SR3 path head, [`catalog.md` §2.7](catalog.md)):
+   having no `in`, its `out.len` is set directly by the **pull demand `N`** propagated to it, not by any
+   `in.len` (SR1). For a `Rate` op
    the spec is a **pull spec**: `pull(want, out)` driven by the downstream `want`, with the block's
    internal ring absorbing any surplus/deficit. The scheduler emits ops in forward-topo order so that
    when a `Rate` op runs, its inputs are already present in their pool buffers
@@ -526,11 +577,11 @@ template in §12.)
 ## 11. WORKED EXAMPLE B — Feedback comb (SCC-has-delay + persistent buffer + coloring + footprint)
 
 ```
-in → Sum → DelayLine(L) → Gain ──(declared feedback edge back into Sum)──→ out
+in → Sum → DelayLine(len) → Gain ──(declared feedback edge back into Sum)──→ out
 ```
 
-**Parameters:** device `N = 256` audio frames, `f32`, delay length `L = 480` samples (a 10 ms comb at
-48 kHz).
+**Parameters:** device `N = 256` audio frames, `f32`, delay length `len = 480` samples (a 10 ms comb at
+48 kHz). *(`len` = delay length, distinct from the channel-layout `L` of `Frame(Lane, L)`, §1.3.)*
 
 ### 11.1 Topo (feedback edge removed) + SCC (full graph)
 
@@ -539,12 +590,12 @@ in → Sum → DelayLine(L) → Gain ──(declared feedback edge back into Sum
   state produced last block (the `z⁻¹` split, §5).
 - **SCC on the FULL graph** (§5, Tarjan including the feedback edge): the back-edge closes the cycle
   `{Sum, DelayLine, Gain}` into one **nontrivial SCC**. Scanning its members for a delay element finds
-  **`DelayLine(L)`** → the SCC contains ≥1 delay ⇒ **passes SCC-has-delay** (⊢, no
+  **`DelayLine(len)`** → the SCC contains ≥1 delay ⇒ **passes SCC-has-delay** (⊢, no
   `error.DelayFreeLoop`).
 
 ### 11.2 Liveness, coloring, persistent split
 
-**Persistent (pool-excluded, §3/§5.3):** the `DelayLine(L)` storage — it *is* the feedback read-side
+**Persistent (pool-excluded, §3/§5.3):** the `DelayLine(len)` storage — it *is* the feedback read-side
 buffer; live range spans callbacks. **Not colored.**
 
 **Class `Sample(f32, 256)`** pool-eligible edges (the forward chain):
@@ -649,9 +700,16 @@ sentinel array is required. With that shape the body is fully comptime-evaluable
 ## 14. What the spec must pin down here
 
 - The **`CommittedGraph` / `Node` / `Edge` / `FeedbackEdge`** data shapes (§1) and that the pass runs
-  **after** format-negotiation (so every edge agrees on `class`).
+  **after** format-negotiation (so every edge agrees on `class`), with the channel axis unified on
+  **layout identity `L`** (count + position + order, L1) and coercion **registered-canonical-or-hard-
+  mismatch** (L2, catalog §1.3/§6).
+- **Parameter edges** (catalog §2.4): ramp/hold coercion insertion, the **one-source `set`/`schedule`-
+  xor-edge** ⊢ commit check, exemption from the rate-1:1 law, and that they are otherwise ordinary
+  edges (colored/scheduled/SCC-checked) with only their ramp/hold state persistent (pre-stage above).
 - **Kahn with the insertion-order (`NodeId`) min-priority tie-break** (§2) and the resulting
-  **bit-reproducible** op-list; `error.UndeclaredCycle` vs the §5 feedback path.
+  **bit-reproducible** op-list; `error.UndeclaredCycle` vs the §5 feedback path; the **source-rooted
+  SR3** check (`error.UnrootedPath` — every non-feedback path head is a Source or persistent
+  generator, catalog §2.7).
 - The **liveness interval convention** (end-inclusive, free-test `prev_end < start`, fan-out → last
   reader) and the **persistent / pool-excluded** category boundary (§3).
 - The **per-class left-edge colorer**, the **interval-graph optimality** import (⊢) vs the **B≡C**
@@ -659,9 +717,12 @@ sentinel array is required. With that shape the body is fully comptime-evaluable
   counts at `M≤8`, and the **three-condition + `aliasing_safe`** in-place gate (§4).
 - **Tarjan on the full graph** + delay-membership → `error.DelayFreeLoop` naming the cycle nodes (§5).
 - The **PDC longest-path DP**, the **per-rate-domain conversion** before `max`, comp-delay insertion
-  from the persistent category, static-latency mandate, and bypass-preserves-latency (§6).
-- The compilation of **`needed_input` recursion** into op order + each op's `n_or_pull_spec`, and that
-  the scheduler **never assumes `H | N`** (the ring absorbs it — T4) (§7).
+  from the persistent category, static-latency mandate (a `VariRate` block plans on its declared
+  **`max_latency`** — worst case over the interval, catalog §2.6 V2), and bypass-preserves-latency (§6).
+- The compilation of **`needed_input` recursion** into op order + each op's `n_or_pull_spec`, a
+  **`VariRate`** block sizing edges by its **`min`-ratio** worst-case input demand (catalog §2.6 V2), a
+  Source generator's `out.len` set by the pull `N` (SR1), and that the scheduler **never assumes
+  `H | N`** (the ring absorbs it — T4) (§7).
 - The **`RenderOp`** record, **N-independent** buffer-id assignment, and the hot-path replay loop (§8).
 - The **footprint formula** as a single commit/comptime constant (§9), and the two worked totals
   (Example A `= 14352 B + Σ state`; Example B `= 3968 B + Σ state`).

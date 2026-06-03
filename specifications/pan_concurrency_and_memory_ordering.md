@@ -1,6 +1,9 @@
 # pan — Concurrency & Memory Ordering (the lock-free control plane, pinned to exact orderings)
 
-> **Status: LOCKED** (2026-06-03). Change-control: conforms to [`catalog.md`](catalog.md); an edit
+> **Status: LOCKED** (2026-06-03; includes the parameter-port amendment, catalog §15 — §3.3 clarifies
+> a wired parameter edge is in-graph dataflow, not a control-plane atomic; **then §4a adds the
+> intra-render cross-worker ready-flag orderings** for the COMMITTED Tier-B parallel executor — see
+> [`pan_parallel_and_offline_execution.md`](pan_parallel_and_offline_execution.md), catalog §8.10/§15). Change-control: conforms to [`catalog.md`](catalog.md); an edit
 > that changes a definition or law must update catalog.md and every citing section in the same commit.
 > Support document for [`pan_architecture_formalisation.md`](pan_architecture_formalisation.md)
 > (the hub). Siblings: [`pan_execution_model.md`](pan_execution_model.md) ·
@@ -32,6 +35,13 @@ There are exactly two thread roles in scope, and the whole document is about the
 - **Control thread (the producer / writer).** A single non-RT thread that originates all control-plane
   mutations: knob moves (`set`), scheduled events (`schedule`), and topology edits (`edit`→`commit`).
   It may block, allocate, and spin freely — it never holds the RT thread up.
+
+> **A third role under the COMMITTED Tier-B executor (§4a):** the **render workers**. When
+> RealtimeStreaming runs on multiple cores ([`catalog.md` §8.10](catalog.md)), the RT *render* is
+> performed by a small pool of pre-spawned workers co-scheduled in the OS audio workgroup, with the
+> callback thread as worker 0. This adds **intra-render** cross-worker handoff (a single-writer
+> release/acquire **ready-flag**, §4a) — distinct from, and not interacting with, the control-plane
+> handoff above. The §1–§5 control-plane contract is unchanged; §4a adds the render-side ordering.
 
 > **The single rule.** All cross-thread cost is paid on the control thread. The RT thread only ever
 > *reads what has already been published* and *acknowledges* (bumps an epoch). Every ordering choice
@@ -251,6 +261,17 @@ is deliberately **no `at_sample` parameter on `set`** — its omission is a ⊢ 
 (sample-accurate intent is only expressible on `schedule`, §2). The ordering choice here is consistent
 with that contract: a relaxed store has no defined sample-position semantics, and none is promised.
 
+### 3.3 The in-graph alternative — a wired parameter edge (not a control-plane mechanism)
+
+The same parameter slot may instead be driven *from inside the graph* by a **parameter edge**
+([`catalog.md` §2.4](catalog.md)) — another node's control-rate output wired into `node.param.<name>`.
+This is **out of scope for this document's atomics contract**: a parameter edge is **in-graph
+dataflow** rendered within the single RT pass (colored, scheduled, read with ordinary loads — no
+cross-thread atomic, SPSC ring, or RCU involved). It applies the *same* per-block ramp as `set` (P3),
+sourcing the target from the edge each call. A slot has **one source** — `set`/`schedule` **xor** a
+wired edge (catalog §2.4 P2). So the three verbs here remain the **only** cross-thread control
+mechanisms; the wired-edge variant adds no new concurrency primitive.
+
 ---
 
 ## 4. RCU plan swap — the `edit`→`commit` verb
@@ -372,6 +393,46 @@ Delay-line / overlap-ring / history buffers are the **pool-excluded persistent c
 This handoff happens during the off-thread build (before (W)), so it costs the RT thread nothing.
 
 ---
+
+## 4a. Intra-render cross-worker synchronization — the Tier-B ready-flag (COMMITTED 2026-06-03)
+
+Under the static-parallel executor ([`catalog.md` §8.10](catalog.md);
+[`pan_parallel_and_offline_execution.md` §2.4](pan_parallel_and_offline_execution.md)), each render op
+runs on exactly one worker per callback (the static HEFT schedule). Same-worker dependencies are
+implicit in the worker's op sequence (no sync). A **cross-worker** dependency uses one release/acquire
+flag per producing op, keyed by the per-callback **generation** `g` (bumped once by worker 0 at
+callback start, after the RCU `plan.load`):
+
+```zig
+// Producer worker, on finishing op `p`:  (single writer of ready[p] this callback ⇒ no CAS)
+ready[p].store(g, .release);                     // (RF-W) PUBLISH: release orders p's pool-buffer
+                                                 //        writes before any acquirer that sees g
+// Consumer worker, before starting op `c`, for each cross-worker predecessor `p`:
+while (ready[p].load(.acquire) != g) std.atomic.spinLoopHint(); // (RF-R) pairs with RF-W
+```
+
+- **(RF-W) `.release` store / (RF-R) `.acquire` load** — the identical "publish a pointer/flag to data
+  you finished writing" idiom as the RCU swap (§4, W/R): seeing `g` guarantees the producer's output
+  buffer writes are visible, so the consumer's plain reads of that buffer are not a race.
+- **No CAS.** Each `ready[p]` has exactly **one writer** (the worker owning op `p` this callback), so a
+  plain release store suffices — the same single-writer property that keeps the SPSC ring (§2) and the
+  RCU pointer (§4.5) CAS-free, now applied per op. (This is why the work-stealing alternative — which
+  *does* require CAS on the steal path — was rejected for the RT executor.)
+- **Generation `g`** avoids a per-callback memset of the flag array: a flag still holding `g−1` reads as
+  "not ready." `g` is monotone `usize`.
+- **Bounded spin (RF-R) — the honest ▷/≈ bound.** The spin terminates within the producer's WCET
+  **only while the OS honours workgroup co-scheduling** (the producer is not descheduled while the
+  consumer spins). This is **▷/≈**, the same honesty class as FTZ ([`catalog.md` §10](catalog.md)) — a
+  strong structural nudge, not a proof — and is **strictly weaker** than Tier A's structural
+  wait-freedom (Tier A has no spin). It is backed ≈ by per-worker spin-time / deadline-headroom
+  telemetry and the **auto-demote to Tier A** ([`catalog.md` §8.10](catalog.md)). The cost-model gate
+  refuses Tier B entirely if no workgroup is available.
+
+> **Why this is not in the §5 ⊢ column the way §2–§4 are.** The control-plane primitives (§2–§4) are
+> ⊢ wait-free *by code shape* (single ops or fixed-bound counted loops with no contended backward
+> dependence). The Tier-B ready-flag spin (RF-R) is a loop whose bound depends on the *scheduler*
+> honouring the workgroup — hence ▷/≈, not ⊢. §5's table is for the always-on control plane; this row
+> applies only when Tier B is enabled.
 
 ## 5. Wait-freedom of the RT thread (H1) — the argument
 
