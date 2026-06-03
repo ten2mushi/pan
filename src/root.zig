@@ -74,6 +74,9 @@ pub const EdgeFormat = commit.EdgeFormat;
 pub const coercionFor = commit.coercionFor;
 pub const commitComptime = commit.commitComptime;
 pub const commitComptimeMode = commit.commitComptimeMode;
+pub const commitRuntime = commit.commitRuntime;
+pub const commitGraph = commit.commitGraph;
+pub const insertCoercions = commit.insertCoercions;
 
 /// The developer-facing graph builder — `pan.Graph.init / add / connect /
 /// commit`. Wraps the IR and the commit pass.
@@ -82,8 +85,20 @@ pub const Graph = builder.Graph;
 pub const NodeHandle = builder.NodeHandle;
 pub const Endpoint = builder.Endpoint;
 
+/// The lock-free control plane: the SPSC `CommandRing` (`schedule`), the atomic
+/// `Param` + `Ramp` (`set`), and the `Rcu` plan-swap cell (`edit → commit`) — each
+/// at its exact memory ordering, wait-free on the audio thread.
+pub const control = @import("control.zig");
+pub const CommandRing = control.CommandRing;
+pub const Command = control.Command;
+pub const Param = control.Param;
+pub const Ramp = control.Ramp;
+pub const Rcu = control.Rcu;
+
 pub const engine = @import("engine.zig");
 pub const Engine = engine.Engine;
+pub const RuntimePlan = engine.RuntimePlan;
+pub const BoundNode = engine.BoundNode;
 pub const ExecutionMode = engine.ExecutionMode;
 pub const EngineOptions = engine.EngineOptions;
 pub const Threads = engine.Threads;
@@ -230,19 +245,19 @@ test "DX surface: Concat named fan-in wires by name and commits" {
         .mfcc = FeatureFrame(13),
         .centroid = Scalar(f32),
     });
+    // Feature-producing sources (zero sample input → legal path heads), so the
+    // fan-in graph is source-rooted and the real commit accepts it.
     const Mfcc = struct {
         const Self = @This();
-        pub fn process(self: *Self, in: []const Sample(f32), out: []FeatureFrame(13)) void {
+        pub fn process(self: *Self, out: []FeatureFrame(13)) void {
             _ = self;
-            _ = in;
             _ = out;
         }
     };
     const Centroid = struct {
         const Self = @This();
-        pub fn process(self: *Self, in: []const Sample(f32), out: []Scalar(f32)) void {
+        pub fn process(self: *Self, out: []Scalar(f32)) void {
             _ = self;
-            _ = in;
             _ = out;
         }
     };
@@ -255,5 +270,5 @@ test "DX surface: Concat named fan-in wires by name and commits" {
     try g.connect(centroid, collect.in.centroid);
     var eng = try g.commit();
     defer eng.deinit();
-    try std.testing.expectEqual(@as(usize, 2), eng.op_count);
+    try std.testing.expectEqual(@as(usize, 3), eng.op_count); // one op per node
 }

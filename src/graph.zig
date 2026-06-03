@@ -77,6 +77,19 @@ pub const Node = struct {
     /// rejects a slot that is ALSO fed by a wired parameter edge. `set`/`schedule`
     /// populate this in a later phase; the commit-time check lives here now.
     set_param_slots: u8,
+    /// True iff this node was synthesized by the negotiation pass as a COERCION
+    /// (a resampler on a sample-rate mismatch, a cast, a ramp/hold) inserted to
+    /// make the diagram commute — not an author node. The runtime engine binds a
+    /// built-in coercion kernel for it rather than looking it up in the author's
+    /// bound-instance set.
+    is_coercion: bool = false,
+    /// True iff this node is BYPASSED. The bypass-preserves-latency law: a bypassed
+    /// block with `algorithmic_latency > 0` must still delay its signal by exactly
+    /// that latency (else bypassing shifts timing and breaks alignment on parallel
+    /// paths). Until the plugin-delay-compensation pass inserts the compensating
+    /// delay (a later phase), a bypassed latent block is uncompensated and the
+    /// commit rejects it loudly rather than silently shifting timing.
+    bypassed: bool = false,
 };
 
 /// A forward edge: a wiring from `(from_node, from_port)` to `(to_node, to_port)`.
@@ -239,6 +252,13 @@ pub const Graph = struct {
     /// call this in a later phase; exposed now so the check is real and testable.)
     pub fn markSetParam(self: *Self, node_id: usize, slot: port.PortIndex) void {
         self.nodes[node_id].set_param_slots |= (@as(u8, 1) << slot);
+    }
+
+    /// Mark a node as bypassed. The commit then enforces the bypass-preserves-
+    /// latency law: a bypassed block with latency must route through a compensating
+    /// delay, else it is rejected (see `Node.bypassed`).
+    pub fn markBypassed(self: *Self, node_id: usize) void {
+        self.nodes[node_id].bypassed = true;
     }
 
     /// Connect an output `PortId` to an input `PortId`. Type-checks element

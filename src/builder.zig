@@ -199,24 +199,51 @@ pub const Graph = struct {
     ir: graph.Graph,
     alloc: std.mem.Allocator,
     cfg: config.Config,
+    /// One bound node per `add`, in node-id order: the heap instance plus the
+    /// monomorphized render/destroy/set thunks the runtime engine needs to replay
+    /// the op-list by indirect call. The builder allocates the instances off-thread
+    /// (so the eventual commit + RCU swap perform no allocation on the RT path) and
+    /// transfers ownership to the engine on a successful `commit`.
+    bound: [graph.max_nodes]engine.BoundNode = undefined,
+    /// Whether ownership of the bound instances has passed to a committed engine. If
+    /// not, `deinit` frees them (an abandoned or failed-to-commit graph leaks
+    /// nothing).
+    transferred: bool = false,
 
     const Self = @This();
 
-    /// Create a graph for `cfg`. The allocator backs the graph's arena (unused
-    /// by this fixed-array stub; the real arena lands with the runtime commit).
+    /// Create a graph for `cfg`. The allocator owns the block instances until a
+    /// successful `commit` transfers them to the engine.
     pub fn init(alloc: std.mem.Allocator, cfg: config.Config) Self {
-        return .{ .ir = graph.Graph.empty, .alloc = alloc, .cfg = cfg };
+        var g = graph.Graph.empty;
+        g.block_size = cfg.block_size;
+        g.sample_rate = cfg.sample_rate;
+        return .{ .ir = g, .alloc = alloc, .cfg = cfg };
     }
 
     pub fn deinit(self: *Self) void {
-        _ = self;
+        if (self.transferred) return; // engine owns the instances now
+        for (self.bound[0..self.ir.node_count]) |b| b.destroy(self.alloc, b.self_ptr);
     }
 
-    /// Add a block instance; returns its typed node handle. `params` configures
-    /// the instance (applied at `initialize` in a later phase).
+    /// Add a block instance; returns its typed node handle. `params` is an
+    /// anonymous struct overriding the instance's named fields (gain, coefficients,
+    /// device-buffer pointers) on top of `Block{}`. The instance is heap-allocated
+    /// here and its render/destroy/set thunks captured, so commit binds them into
+    /// the op-list with no further reflection.
     pub fn add(self: *Self, comptime Block: type, params: anytype) !NodeHandle(Block) {
-        _ = params;
         const id = self.ir.add(Block);
+        const inst = try self.alloc.create(Block);
+        errdefer self.alloc.destroy(inst);
+        inst.* = Block{};
+        engine.applyParams(Block, inst, params);
+        self.bound[id] = .{
+            .self_ptr = inst,
+            .render = engine.renderThunk(Block),
+            .destroy = engine.destroyThunk(Block),
+            .set = engine.setThunkFor(Block),
+        };
+
         var h: NodeHandle(Block) = undefined;
         h.id = id;
         h.out = buildOutAccessor(Block, id);
@@ -247,62 +274,88 @@ pub const Graph = struct {
         self.ir.connectFeedback(@TypeOf(out_ep).Port, out_ep.node_id, out_ep.index, @TypeOf(in_ep).Port, in_ep.node_id, in_ep.index);
     }
 
-    /// Report the static op count and pool footprint to the engine. Stub
-    /// footprint: the sum of edge element sizes (the obviously-correct per-edge
-    /// baseline; the colored-pool footprint lands with the runtime commit pass).
-    pub fn summarize(self: *const Self) engine.Summary {
-        var bytes: usize = 0;
-        for (self.ir.edges[0..self.ir.edge_count]) |e| bytes += e.elem_size;
-        return .{ .op_count = self.ir.edge_count, .footprint_bytes = bytes };
+    /// Declare that parameter slot `slot` of node `node_id` is driven by an
+    /// external `set`/`schedule` verb. The one-source rule then makes `commit`
+    /// reject the graph (`error.ParameterMultiplyDriven`) if that same slot is
+    /// ALSO fed by a wired parameter edge — a slot has exactly one source.
+    pub fn markSet(self: *Self, node_id: usize, slot: port.PortIndex) void {
+        self.ir.markSetParam(node_id, slot);
     }
 
-    /// Commit the graph to a frozen, runnable engine (realtime default).
-    /// Everything that can go wrong with the topology is reported here.
+    /// Commit the graph to a frozen, runnable engine (realtime default). Runs the
+    /// runtime commit pass (negotiate → topo → SCC-has-delay → liveness → coloring
+    /// → emit → footprint), binds each op's kernel + instance, and allocates the
+    /// pool. Everything that can go wrong with the topology is reported here. On
+    /// success, ownership of the block instances transfers to the returned engine.
     pub fn commit(self: *Self) !engine.Engine {
-        return engine.Engine.init(self.alloc, self, .{ .mode = .realtime_streaming });
+        const eng = try engine.Engine.bind(self.alloc, self.ir, self.bound[0..self.ir.node_count], self.cfg, .{
+            .mode = .realtime_streaming,
+            .max_block_size = self.cfg.max_block_size,
+        });
+        self.transferred = true;
+        return eng;
     }
 };
 
-test "DX arc: init → add → connect (handle + indexed) → commit → start" {
+test "DX arc: init → add → connect → commit → renderInto (runtime engine, real path)" {
     const types = @import("types.zig");
+    const en = @import("engine.zig");
+    // A source filling its output from a preloaded buffer, a halving gain, and a
+    // sink copying its input to a destination — a runnable, source-rooted chain.
+    const BufSource = struct {
+        const Self = @This();
+        data: [*]const types.Sample(f32) = undefined,
+        pub fn process(self: *Self, out: []types.Sample(f32)) void {
+            @memcpy(out, self.data[0..out.len]);
+        }
+    };
     const Gain = struct {
         const Self = @This();
         gain: f32 = 1.0,
         pub fn process(self: *Self, in: []const types.Sample(f32), out: []types.Sample(f32)) void {
-            _ = self;
-            @memcpy(out, in);
+            for (in, out) |x, *o| o.ch[0] = x.ch[0] * self.gain;
         }
     };
-    const Sum2 = struct {
+    const BufSink = struct {
         const Self = @This();
-        pub fn process(self: *Self, in0: []const types.Sample(f32), in1: []const types.Sample(f32), out: []types.Sample(f32)) void {
-            _ = self;
-            for (in0, in1, out) |a, b, *o| o.ch[0] = a.ch[0] + b.ch[0];
+        dest: [*]types.Sample(f32) = undefined,
+        pub fn process(self: *Self, in: []const types.Sample(f32)) void {
+            @memcpy(self.dest[0..in.len], in);
         }
     };
 
-    var g = Graph.init(std.testing.allocator, .{ .precision = .f32, .channels = .mono });
+    var input: [8]types.Sample(f32) = undefined;
+    for (&input, 0..) |*s, i| s.ch[0] = @floatFromInt(i + 1);
+    var output: [8]types.Sample(f32) = undefined;
+
+    var g = Graph.init(std.testing.allocator, .{ .precision = .f32, .channels = .mono, .block_size = 8 });
     defer g.deinit();
 
-    const a = try g.add(Gain, .{ .gain = 0.8 });
-    const b = try g.add(Gain, .{});
-    const mixer = try g.add(Sum2, .{});
+    const src = try g.add(BufSource, .{ .data = @as([*]const types.Sample(f32), &input) });
+    const gain = try g.add(Gain, .{ .gain = 0.5 });
+    const sink = try g.add(BufSink, .{ .dest = @as([*]types.Sample(f32), &output) });
 
-    try g.connect(a, b); // bare handle → handle (out port 0 → in port 0)
-    try g.connect(a, mixer.in(0)); // handle → indexed input endpoint
-    try g.connect(b, mixer.in(1));
-
-    a.set(.gain, 0.5); // control verb stub
+    try g.connect(src, gain); // bare handle → handle (out 0 → in 0)
+    try g.connect(gain, sink);
 
     var eng = try g.commit();
     defer eng.deinit();
-    try eng.start();
-    defer eng.stop();
-    eng.schedule(.{ .at_sample = 64, .node = a, .value = 0.0 });
-    try std.testing.expectEqual(@as(usize, 3), eng.op_count); // three edges
+    try std.testing.expectEqual(@as(usize, 3), eng.op_count); // one op per node
+
+    const token = en.enterRealtimeThread();
+    defer token.leave();
+    eng.renderInto(token);
+
+    for (input, output) |x, y| try std.testing.expectEqual(x.ch[0] * 0.5, y.ch[0]);
+    try std.testing.expect(!eng.telemetry().fault);
 }
 
-test "DX arc: parameter port endpoint node.param.<name>" {
+test "DX arc: parameter port endpoint node.param.<name> mints + records the edge" {
+    // The named parameter accessor `node.param.<name>` mints a typed endpoint and
+    // wiring it records a control edge. (Rendering a wired parameter edge through
+    // the executor — the ramp/hold body and its persistent state — is reserved for
+    // the feedback/persistent-state phase; here we verify the builder surface and
+    // that the edge is recorded.)
     const types = @import("types.zig");
     const Lfo = struct {
         const Self = @This();
@@ -323,8 +376,67 @@ test "DX arc: parameter port endpoint node.param.<name>" {
     defer g.deinit();
     const lfo = try g.add(Lfo, .{});
     const bq = try g.add(Biquad, .{});
-    try g.connect(lfo, bq.param.cutoff); // output → named parameter endpoint
-    var eng = try g.commit();
-    defer eng.deinit();
-    try std.testing.expectEqual(@as(usize, 1), eng.op_count);
+    const ep = bq.param.cutoff;
+    try std.testing.expect(@TypeOf(ep).Port.Elem == types.Scalar(f32)); // typed param endpoint
+    try g.connect(lfo, ep); // output → named parameter endpoint
+    try std.testing.expectEqual(@as(usize, 1), g.ir.edge_count);
+}
+
+test "one-source (P2): a slot driven by BOTH a wired edge and `set` is a commit error" {
+    // A parameter slot has exactly one source: a wired parameter edge XOR an
+    // external set/schedule. Declaring `set` on a slot that is ALSO wired must be
+    // rejected at commit (the negotiate stage runs this check before topology, so
+    // the one-source violation is reported regardless of rooting).
+    const types = @import("types.zig");
+    const Lfo = struct {
+        const Self = @This();
+        pub fn process(self: *Self, out: []types.Scalar(f32)) void {
+            _ = self;
+            _ = out;
+        }
+    };
+    const Biquad = struct {
+        const Self = @This();
+        pub const params = .{ .cutoff = types.Scalar(f32) };
+        pub fn process(self: *Self, in: []const types.Sample(f32), out: []types.Sample(f32)) void {
+            _ = self;
+            @memcpy(out, in);
+        }
+    };
+    var g = Graph.init(std.testing.allocator, .{});
+    defer g.deinit();
+    const lfo = try g.add(Lfo, .{});
+    const bq = try g.add(Biquad, .{});
+    g.markSet(bq.id, 0); // declare cutoff (slot 0) externally set
+    try g.connect(lfo, bq.param.cutoff); // ALSO wire a parameter edge to slot 0
+    try std.testing.expectError(error.ParameterMultiplyDriven, g.commit());
+}
+
+test "param edge is subject to SCC-has-delay (P4): a delay-free parameter loop is rejected" {
+    // A parameter edge is an ordinary graph edge — colored, scheduled, AND subject
+    // to the delay-free-loop rule. A cycle of parameter edges with no delay element
+    // is not causal (this period's coefficient would depend on itself), so commit
+    // rejects it exactly as it would a sample loop.
+    const types = @import("types.zig");
+    const ScalarNode = struct {
+        const Self = @This();
+        pub const params = .{ .x = types.Scalar(f32) };
+        pub fn process(self: *Self, out: []types.Scalar(f32)) void {
+            _ = self;
+            _ = out;
+        }
+        pub fn setParam(self: *Self, slot: u8, v: f32) void {
+            _ = self;
+            _ = slot;
+            _ = v;
+        }
+    };
+    var g = Graph.init(std.testing.allocator, .{});
+    defer g.deinit();
+    const a = try g.add(ScalarNode, .{});
+    const b = try g.add(ScalarNode, .{});
+    try g.connect(a, b.param.x); // forward parameter edge a → b.x
+    try g.connectFeedback(b, a.param.x); // back parameter edge b → a.x closes the cycle
+    // The SCC {a, b} contains no delay element ⇒ delay-free parameter loop.
+    try std.testing.expectError(error.DelayFreeLoop, g.commit());
 }

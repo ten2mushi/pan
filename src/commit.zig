@@ -160,6 +160,18 @@ pub const RenderOp = struct {
     /// Frames produced/consumed by this op this callback — the device demand N
     /// resolved for this node through the upstream rate ratios.
     n_or_pull_spec: usize,
+    /// PARAMETER-edge inputs, kept SEPARATE from sample inputs. A parameter port
+    /// is a control-rate side input (catalog §2.4 P1): it does not appear in the
+    /// block's `process` signature (M1 ranges over sample slices only), so the
+    /// executor must NOT consume it as a `process` argument. Instead, before
+    /// invoking `process`, the executor reads the latest control value from each
+    /// param-edge buffer and applies it to the block's parameter slot via the
+    /// block's `setParam(slot, value)` — the in-graph analogue of `set`, ramped/
+    /// held by the consumer exactly as `set` is (P3). `param_input_slots[i]` is the
+    /// parameter-port index the i-th param edge drives.
+    param_input_buffer_ids: [port.max_ports_per_direction]usize = [_]usize{0} ** port.max_ports_per_direction,
+    param_input_slots: [port.max_ports_per_direction]u8 = [_]u8{0} ** port.max_ports_per_direction,
+    param_input_count: usize = 0,
 };
 
 /// The committed plan: a flat op-list (one op per node, forward-topo order) plus
@@ -214,6 +226,11 @@ pub const CommitError = error{
     MalformedGraph,
     /// More than 8 ports on one direction of a node (also caught at port mint).
     PortCeilingExceeded,
+    /// A BYPASSED block with `algorithmic_latency > 0` has no compensating delay,
+    /// so bypassing it would shift timing and break alignment on parallel paths
+    /// (the bypass-preserves-latency law). Route the bypass through a compensating
+    /// delay (the plugin-delay-compensation pass) instead of around it.
+    BypassLatencyUncompensated,
 };
 
 /// Commit a graph at COMPTIME with the shipped colored pool. See `commitComptimeMode`.
@@ -221,16 +238,21 @@ pub fn commitComptime(comptime g: graph.Graph) CommitError!Plan(g.node_count) {
     return commitComptimeMode(g, .colored);
 }
 
-/// Commit a graph at COMPTIME under an explicit buffer mode. `.colored` is the
-/// shipped pool; `.per_edge` is the obviously-correct baseline the colored pool is
-/// differenced against. Both share every other stage, so the only thing that
-/// varies between them is the buffer-id assignment (and the footprint that follows
-/// from it) — which is exactly what the differential test must isolate.
-pub fn commitComptimeMode(comptime g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(g.node_count) {
-    comptime {
+/// The shared commit ALGORITHM — the single body both the comptime and the
+/// runtime entry points run. It is ordinary Zig (no `comptime` block), so it
+/// evaluates at compile time when called in a comptime context (the embedded
+/// smoke gate, the `Executor`) AND runs at runtime when called from the runtime
+/// `Engine`'s `edit → commit`. It returns a FIXED-CAPACITY `Plan(graph.max_nodes)`
+/// (op count valid in `op_count`); the comptime wrapper repacks it to the exact
+/// `Plan(g.node_count)` its callers expect. Sharing this body is the whole point:
+/// the comptime path inlines the op-list (zero-overhead Tier-A render) and the
+/// runtime path binds `fn_ptr`/`self_ptr` into the SAME `RenderOp`/pool model —
+/// only the dispatch differs, never the plan.
+fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph.max_nodes) {
+    {
         // The Tarjan and per-class colorer loops are bounded by the graph
         // dimensions but their product can be large for a near-max graph; give
-        // the comptime interpreter generous branch headroom.
+        // the comptime interpreter generous branch headroom (a no-op at runtime).
         @setEvalBranchQuota(10_000_000);
 
         const NC = g.node_count;
@@ -294,6 +316,18 @@ pub fn commitComptimeMode(comptime g: graph.Graph, comptime mode: BufferMode) Co
                 if (g.nodes[e.to_node].set_param_slots & bit != 0)
                     return error.ParameterMultiplyDriven;
             }
+        }
+
+        // ---- 1b. bypass-preserves-latency law ------------------------------
+        // A bypassed block that has algorithmic latency must STILL delay its signal
+        // by exactly that latency, or bypassing shifts timing and breaks alignment
+        // on parallel paths. The compensating delay is routed by the plugin-delay-
+        // compensation pass (a later phase); until it exists, a bypassed latent
+        // block is uncompensated and we reject it loudly rather than silently
+        // mis-aligning the audio. A coercion node is never the bypass target.
+        for (0..NC) |v| {
+            if (g.nodes[v].bypassed and g.nodes[v].algorithmic_latency > 0)
+                return error.BypassLatencyUncompensated;
         }
 
         // ---- 2. topo — Kahn with a min-node-id tie-break -------------------
@@ -596,17 +630,30 @@ pub fn commitComptimeMode(comptime g: graph.Graph, comptime mode: BufferMode) Co
         }
 
         // ---- 8. emit — one op per node, forward-topo order ----------------
-        var ops: [NC]RenderOp = undefined;
+        var ops: [graph.max_nodes]RenderOp = undefined;
         for (0..NC) |i| {
             const v = topo[i];
             var in_ids: [port.max_ports_per_direction]usize = undefined;
             var in_n: usize = 0;
+            var pin_ids: [port.max_ports_per_direction]usize = undefined;
+            var pin_slots: [port.max_ports_per_direction]u8 = undefined;
+            var pin_n: usize = 0;
             var out_ids: [port.max_ports_per_direction]usize = undefined;
             var out_n: usize = 0;
             for (g.edges[0..EC], 0..) |e, ei| {
                 if (e.to_node == v) {
-                    in_ids[in_n] = edge_buf[ei];
-                    in_n += 1;
+                    // A parameter (control) edge is NOT a sample input — it is a
+                    // side input applied to a parameter slot before `process`, so
+                    // it is gathered separately and never consumed as a `process`
+                    // argument. An ordinary sample edge feeds the next process port.
+                    if (e.is_param) {
+                        pin_ids[pin_n] = edge_buf[ei];
+                        pin_slots[pin_n] = e.to_port;
+                        pin_n += 1;
+                    } else {
+                        in_ids[in_n] = edge_buf[ei];
+                        in_n += 1;
+                    }
                 }
                 if (e.from_node == v) {
                     var seen = false;
@@ -640,6 +687,9 @@ pub fn commitComptimeMode(comptime g: graph.Graph, comptime mode: BufferMode) Co
                 .output_buffer_ids = out_ids,
                 .output_count = out_n,
                 .n_or_pull_spec = want[v],
+                .param_input_buffer_ids = pin_ids,
+                .param_input_slots = pin_slots,
+                .param_input_count = pin_n,
             };
         }
 
@@ -668,7 +718,7 @@ pub fn commitComptimeMode(comptime g: graph.Graph, comptime mode: BufferMode) Co
             footprint += g.nodes[v].state_size;
         }
 
-        return Plan(NC){
+        return Plan(graph.max_nodes){
             .ops = ops,
             .op_count = NC,
             .footprint_bytes = footprint,
@@ -679,6 +729,116 @@ pub fn commitComptimeMode(comptime g: graph.Graph, comptime mode: BufferMode) Co
             .buffer_byte_len = buffer_byte_len,
         };
     }
+}
+
+/// Commit a graph at COMPTIME under an explicit buffer mode. `.colored` is the
+/// shipped pool; `.per_edge` is the obviously-correct baseline the colored pool is
+/// differenced against. Repacks the shared `computePlan` result into the exact
+/// `Plan(g.node_count)` the comptime callers (`Executor`, smoke gate) consume — a
+/// pure copy of the first `node_count` ops, so the returned plan is byte-identical
+/// to the pre-refactor output (the layout-agnostic, share-the-algorithm proof).
+pub fn commitComptimeMode(comptime g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(g.node_count) {
+    comptime {
+        const full = try computePlan(g, mode);
+        var p: Plan(g.node_count) = .{
+            .ops = undefined,
+            .op_count = full.op_count,
+            .footprint_bytes = full.footprint_bytes,
+            .buffer_mode = full.buffer_mode,
+            .pool_buffer_count = full.pool_buffer_count,
+            .pool_bytes = full.pool_bytes,
+            .buffer_offset = full.buffer_offset,
+            .buffer_byte_len = full.buffer_byte_len,
+        };
+        for (0..g.node_count) |i| p.ops[i] = full.ops[i];
+        return p;
+    }
+}
+
+/// Commit an already-finalized graph to a fixed-capacity plan (`op_count` valid),
+/// running the SAME `computePlan` algorithm at runtime — no coercion insertion
+/// (the graph is taken as-is). The runtime `Engine` uses this on the
+/// post-`insertCoercions` graph so it can bind coercion-node kernels itself.
+pub fn commitGraph(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph.max_nodes) {
+    return computePlan(g, mode);
+}
+
+/// Commit a RUNTIME-built graph: first NEGOTIATE — insert the coercion morphisms a
+/// Format mismatch needs (a resampler on a sample-rate mismatch) so the diagram
+/// commutes — then run the shared `computePlan` over the result. This is the
+/// `edit → commit` control verb's off-thread plan build. The caller (the runtime
+/// `Engine`) binds each op's `fn_ptr`/`self_ptr` to the node's render thunk +
+/// instance (a built-in kernel for an inserted coercion node), and publishes the
+/// result with an RCU pointer swap. Reuses `RenderOp`/`Plan`/the pool-by-buffer-id
+/// layout verbatim — there is no second IR.
+pub fn commitRuntime(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph.max_nodes) {
+    return computePlan(insertCoercions(g), mode);
+}
+
+/// The negotiation insertion step (runtime path): where a wired edge crosses a
+/// sample-rate boundary, insert a **resampler** coercion node so the producer →
+/// consumer square commutes — the categorical "make the diagram commute" made
+/// concrete (catalog §6). `producer → consumer` becomes `producer → resampler →
+/// consumer`; the resampler's output sits at the consumer's rate. The resampler's
+/// numerical body (polyphase sinc) is a later phase; the node is tagged
+/// `is_coercion` and the runtime engine binds a built-in kernel for it. Only
+/// sample-rate mismatches are auto-inserted here; an unregistered channel-layout
+/// pair is a hard mismatch (rejected in `computePlan`), and a precision cast on a
+/// wired edge cannot arise (element identity is proven at `connect`). Iterates the
+/// ORIGINAL edges once (snapshot), appending the coercion nodes/edges past them.
+pub fn insertCoercions(g: graph.Graph) graph.Graph {
+    var g2 = g;
+    const orig_edges = g2.edge_count;
+    var ei: usize = 0;
+    while (ei < orig_edges) : (ei += 1) {
+        const e = g2.edges[ei];
+        const producer_rate = g2.nodes[e.from_node].sample_rate;
+        const consumer_rate = g2.nodes[e.to_node].sample_rate;
+        if (producer_rate == consumer_rate) continue; // diagram already commutes
+        if (g2.node_count >= graph.max_nodes or g2.edge_count >= graph.max_edges) continue; // capacity guard
+
+        const cid = g2.node_count;
+        const orig_to = e.to_node;
+        const orig_to_port = e.to_port;
+        g2.nodes[cid] = .{
+            .id = cid,
+            .class = .Map,
+            .type_name = "(resampler)",
+            .out_elem_size = e.elem_size,
+            .out_elem_name = e.elem_name,
+            .is_source = false,
+            .is_delay = false,
+            .delay_len = 0,
+            .algorithmic_latency = 0,
+            .out_per_in_p = 1,
+            .out_per_in_q = 1,
+            .aliasing_safe = false,
+            .state_size = 0,
+            .rate_domain = g2.nodes[orig_to].rate_domain,
+            .sample_rate = consumer_rate, // the resampler emits at the consumer's rate
+            .set_param_slots = 0,
+            .is_coercion = true,
+            .bypassed = false,
+        };
+        g2.node_count += 1;
+
+        // Rewire: producer → resampler (this edge), then resampler → consumer (new).
+        g2.edges[ei].to_node = cid;
+        g2.edges[ei].to_port = 0;
+        g2.edges[g2.edge_count] = .{
+            .from_node = cid,
+            .from_port = 0,
+            .to_node = orig_to,
+            .to_port = orig_to_port,
+            .feedback = false,
+            .elem_size = e.elem_size,
+            .elem_name = e.elem_name,
+            .is_param = e.is_param,
+            .channels = e.channels,
+        };
+        g2.edge_count += 1;
+    }
+    return g2;
 }
 
 // ===========================================================================
@@ -1104,4 +1264,71 @@ test "more than 8 edges out of one node => error.PortCeilingExceeded" {
         break :blk gg;
     };
     try std.testing.expectError(error.PortCeilingExceeded, comptime commitComptime(g));
+}
+
+test "negotiate: a wired sample-rate mismatch AUTO-INSERTS a resampler coercion node" {
+    const RateSrc = struct {
+        const Self = @This();
+        pub fn process(self: *Self, out: []t.Sample(f32)) void {
+            _ = self;
+            _ = out;
+        }
+    };
+    const RateSink = struct {
+        const Self = @This();
+        pub fn process(self: *Self, in: []const t.Sample(f32)) void {
+            _ = self;
+            _ = in;
+        }
+    };
+    // Build source@44.1k → sink@48k (a wired sample-rate mismatch). graph.add reads
+    // the graph's current sample_rate into each node, so set it per-add.
+    var g = graph.Graph.empty;
+    g.sample_rate = 44_100;
+    const src = g.add(RateSrc);
+    g.sample_rate = 48_000;
+    const sink = g.add(RateSink);
+    g.connect(port.MapOutPort(RateSrc), src, 0, port.MapInPort(RateSink), sink, 0);
+
+    // The negotiation pass inserts a resampler so the diagram commutes: the op-list
+    // grows from 2 nodes to 3 (src → resampler → sink), and the inserted node is a
+    // coercion sitting at the consumer's rate.
+    const g2 = insertCoercions(g);
+    try std.testing.expectEqual(@as(usize, 3), g2.node_count);
+    try std.testing.expect(g2.nodes[2].is_coercion);
+    try std.testing.expectEqual(@as(u32, 48_000), g2.nodes[2].sample_rate);
+
+    const plan = try commitRuntime(g, .colored);
+    try std.testing.expectEqual(@as(usize, 3), plan.op_count); // resampler is now an op
+
+    // A same-rate graph inserts NOTHING (the diagram already commutes).
+    var g3 = graph.Graph.empty; // default 48k everywhere
+    const a = g3.add(RateSrc);
+    const b = g3.add(RateSink);
+    g3.connect(port.MapOutPort(RateSrc), a, 0, port.MapInPort(RateSink), b, 0);
+    try std.testing.expectEqual(@as(usize, 2), insertCoercions(g3).node_count);
+}
+
+test "bypass-preserves-latency: a bypassed latent block with no compensation is a commit error" {
+    const BypSrc = struct {
+        const Self = @This();
+        pub fn process(self: *Self, out: []t.Sample(f32)) void {
+            _ = self;
+            _ = out;
+        }
+    };
+    var g = graph.Graph.empty;
+    const src = g.add(BypSrc);
+    // Give the node algorithmic latency and bypass it. Until the plugin-delay-
+    // compensation pass routes the compensating delay, a bypassed latent block is
+    // uncompensated — committing it would silently shift timing, so it is rejected.
+    g.nodes[src].algorithmic_latency = 5;
+    g.markBypassed(src);
+    try std.testing.expectError(error.BypassLatencyUncompensated, commitRuntime(g, .colored));
+
+    // A bypassed block with ZERO latency is fine (nothing to compensate).
+    var g2 = graph.Graph.empty;
+    const s2 = g2.add(BypSrc);
+    g2.markBypassed(s2);
+    _ = try commitRuntime(g2, .colored);
 }

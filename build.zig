@@ -82,6 +82,8 @@ pub fn build(b: *std.Build) void {
         "tests/bc_executor_test.zig",
         "tests/gold_fixedpoint_test.zig",
         "tests/planar_conformance_test.zig",
+        "tests/control_plane_test.zig",
+        "tests/runtime_engine_test.zig",
     };
     for (harnesses) |path| {
         const h_mod = b.createModule(.{

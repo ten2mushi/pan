@@ -15,6 +15,12 @@ pub const Config = struct {
     sample_rate: u32 = 48_000,
     /// Device block size N (a hint; the device may override it at commit).
     block_size: usize = 512,
+    /// The worst-case block size the engine should pre-size its buffer pool for, so
+    /// a `reconfigure` to any N ≤ this is a LIVE RCU swap with no reallocation (the
+    /// buffer-id assignment is N-independent, so only the byte-sizes change). 0 (the
+    /// default) means "no headroom — size exactly for `block_size`," so a later
+    /// enlargement reallocates (the stopped route-switch path).
+    max_block_size: usize = 0,
     /// The pipeline's channel layout identity.
     channels: types.ChannelLayout = .stereo,
 };
