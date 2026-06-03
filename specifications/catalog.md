@@ -132,6 +132,11 @@ struct wrappers below). All multi-element forms are **planar** internally (§9.3
 | `Bounded(T, Kmax)` | `struct { items: [Kmax]T, len: u16 }` | a ragged list, fixed capacity, variable `len` | formant tracks, sparse peaks, beat hypotheses | `(Bounded(T,Kmax), 1)` |
 
 **Canonical identities and rules:**
+- **Buffer layout is PLANAR (strictly enforced — §9.3).** `Frame(Lane, L)` names an element's **layout
+  identity** for `connect` type-checking; a multi-channel stream *buffer* is stored **plane-major**
+  (`C` contiguous `N`-sample planes), never as `[]Frame` interleaved at the buffer level. AoS for
+  `C > 1` is non-conformant (§9.3 P-1); a conformance gate enforces it (§9.3 P-2). Mono is trivially
+  planar.
 - **`Sample(T) ≡ Frame(Lane, .mono)`** — a mono kernel and a `Frame(Lane,.mono)` kernel are *the same
   thing*. ⊢ (type identity). Where a law quantifies over "channel count `C`", read `C := L.count()`.
 - A **channel/layout-changing** block is exactly a morphism whose in/out `Frame` differ in `L`
@@ -165,8 +170,8 @@ struct wrappers below). All multi-element forms are **planar** internally (§9.3
       pub fn count(self: ChannelLayout) u16 { /* (order+1)^2 for ambisonic, etc. */ }
   };
   pub fn Frame(comptime Lane: type, comptime L: ChannelLayout) type {
-      return struct { ch: [L.count()]Lane };      // planar
-  }
+      return struct { ch: [L.count()]Lane };      // element layout-identity; the BUFFER is
+  }                                               // PLANAR per §9.3 (C planes), not []Frame for C>1
   ```
 - **`Bounded(T, Kmax)` liveness** is over the fixed `[Kmax]` *storage*, so coloring is unaffected by
   `len`; correctness is the consumer respecting `len`. Storage colorability ⊢; `len`-respect ▷.
@@ -1005,8 +1010,25 @@ audit A9).
 
 ### 9.3 Locked defaults (from the locking pass, 2026-06-02)
 
-- **Internal channel form: PLANAR** (LOCKED). Planar internally (SIMD-friendly `@Vector` kernels);
-  planar↔interleaved conversion happens **only at the I/O boundary**. *(Closes bridge §4.2.)*
+- **Internal channel form: PLANAR** (LOCKED — **STRICTLY ENFORCED**). Planar internally (SIMD-friendly
+  `@Vector` kernels); planar↔interleaved conversion happens **only at the I/O boundary**.
+  *(Closes bridge §4.2.)*
+  - **What planar means, precisely (the enforced law).** A multi-channel stream buffer of `N` frames on
+    layout `L` (count `C := L.count()`) is stored as **`C` contiguous channel planes of `N` samples**,
+    **plane-major** — `[ch0_0 … ch0_{N-1}][ch1_0 … ch1_{N-1}] …` — NOT as an array of interleaved
+    frames. A block reads/writes each channel as its own contiguous `[]Lane` plane (so a per-channel
+    kernel vectorizes over a whole plane). `Frame(Lane, L)` names the element's **layout identity** for
+    `connect` type-checking (count + positional tags + canonical order ride in `L`); it does **not**
+    mandate the physical buffer be an array-of-structs of it.
+  - **(P-1) Non-conformant: array-of-structs.** A buffer typed `[]Frame(Lane, L)` with
+    `Frame = struct { ch: [C]Lane }` is **interleaved** (`L,R,L,R,…`) at the buffer level for `C > 1`,
+    which **violates** this lock. (Mono `C = 1` is trivially conformant — one plane.) The element struct
+    is fine as a *single-frame value*; the **buffer/port representation for `C > 1` must be planar**.
+  - **(P-2) Conformance gate (⊢/≈).** The implementation must provide a planar buffer/port view and a
+    gate asserting multi-channel stream buffers are plane-major (a comptime/`test` check on the buffer
+    layout + the per-channel `[]Lane` access), so a regression to AoS fails loud. This is a core
+    throughput requirement (multi-channel SIMD), enforced now to prevent drift as multi-channel blocks
+    proliferate (the spatial library) — not retrofitted later.
 - **Internal precision: f32-internal default, per-block opt-in** (LOCKED). f32 everywhere internally
   (covers ~95 % of audio), with genuine per-block precision available as opt-in (`i16` decode → `f32`
   core → `i24/i32` out via monomorphized seam converters). *(Closes bridge §4.1.)*

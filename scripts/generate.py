@@ -167,11 +167,13 @@ def _fix_gain(x_codes: np.ndarray, params: dict, frac: int, dt: np.dtype) -> np.
 
 
 def _fix_pan(x_codes: np.ndarray, params: dict, frac: int, dt: np.dtype) -> np.ndarray:
-    p = float(params.get("pan", 0.0))
-    p = max(-1.0, min(1.0, p))
-    theta = (p + 1.0) * (np.pi / 4.0)
-    lq = _round_coeff(float(np.cos(theta)), frac, dt)
-    rq = _round_coeff(float(np.sin(theta)), frac, dt)
+    # Bit-exact: use the PRE-QUANTIZED integer gains from the manifest (`pan_lq`,
+    # `pan_rq`) — the same values the kernel holds via `gains_q`. `cos/sin(pan)` is
+    # transcendental and would differ by ~1 ULP between f64 here and the kernel's
+    # f32, shifting the quantized coefficient and every output sample, so it must
+    # NOT enter the bit-exact comparison.
+    lq = int(params["pan_lq"])
+    rq = int(params["pan_rq"])
     mono = x_codes[:, :1]
     left = _q_mul_store(mono, lq, frac, dt)
     right = _q_mul_store(mono, rq, frac, dt)
@@ -180,15 +182,11 @@ def _fix_pan(x_codes: np.ndarray, params: dict, frac: int, dt: np.dtype) -> np.n
 
 _FIXED_REFERENCES = {
     "Gain": _fix_gain,
-    # ConstantPowerPan fixed-point gold is deferred: the kernel derives the
-    # channel gains from `cos/sin(pan)` internally (f32), so an independent f64
-    # NumPy oracle cannot be guaranteed bit-identical (a 1-ULP trig difference
-    # shifts the quantized coefficient and every output sample). A robust pan
-    # fixed-point gold needs either pre-quantized coefficients on the kernel API
-    # or the embedded-phase pinned coefficient computation. (`_fix_pan` is kept
-    # below for when that lands.) Biquad fixed-point is likewise deferred (its
-    # q-format kernel is a compile error until the embedded-precision phase).
-    # The f32 gold covers Gain/Biquad/Pan; q15 bit-exact is proven on Gain.
+    "ConstantPowerPan": _fix_pan,  # uses the manifest's pre-quantized `pan_lq`/`pan_rq`
+    # Biquad fixed-point is deferred (its q-format kernel is a compile error until
+    # the embedded-precision phase — a naive q15 biquad can't represent |a1|>1 and
+    # would compute wrong audio). The f32 gold covers Gain/Biquad/Pan; q15 bit-exact
+    # is proven on Gain and ConstantPowerPan.
 }
 
 

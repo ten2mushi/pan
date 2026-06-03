@@ -59,9 +59,18 @@ channel **count**, **positional identity**, and **canonical channel order**; the
 **count, positional identity, *or* channel order** between wired ports becomes a comptime/commit type
 error via the typed `PortId` below (this generalises the channel-count check, not replaces it).
 `Sample(T) == Frame(Lane, .mono)` — a mono kernel and a `Frame(Lane,.mono)` kernel are the same thing
-([`catalog.md` §1.3](catalog.md)). The internal canonical form is **planar** (LOCKED PLANAR —
-[`catalog.md` §9.3](catalog.md)); planar/interleaved conversion happens
+([`catalog.md` §1.3](catalog.md)). The internal canonical form is **planar** (LOCKED PLANAR,
+**STRICTLY ENFORCED** — [`catalog.md` §9.3](catalog.md)); planar/interleaved conversion happens
 **only at the I/O boundary** ([`pan_io_realtime_and_pipeline.md` §5](pan_io_realtime_and_pipeline.md)).
+
+> **Element identity vs buffer layout (the enforced planar law — catalog §9.3 P-1/P-2).** `Frame(Lane, L)`
+> below is the element's **layout-identity** type for `connect` checking; it is **not** the physical
+> buffer layout. A multi-channel stream *buffer* of `N` frames is stored **plane-major** — `C`
+> contiguous `N`-sample channel planes — and a block accesses each channel as its own contiguous
+> `[]Lane` plane (the SIMD-friendly form). A buffer typed `[]Frame(Lane, L)` (array-of-structs of
+> `struct { ch: [C]Lane }`) is **interleaved** for `C > 1` and is **non-conformant**; the runtime
+> buffer/port representation must be a planar view. A conformance gate enforces this. (Mono `C = 1` is
+> trivially planar — one plane.)
 
 **`ChannelLayout` — layout identity in the type, geometry in the block.** `L : ChannelLayout` is a
 comptime `union(enum)` descriptor whose canonical values are `.mono`, `.stereo`, `.surround_5_1`,
@@ -87,8 +96,8 @@ pub const ChannelLayout = union(enum) {
     pub fn count(self: ChannelLayout) u16 { ... } // (order+1)^2 for ambisonic, etc.
 };
 pub fn Frame(comptime Lane: type, comptime L: ChannelLayout) type {
-    return struct { ch: [L.count()]Lane };      // named struct => has typeName(); planar
-}
+    return struct { ch: [L.count()]Lane };      // element layout-IDENTITY (has typeName());
+}                                               // the BUFFER is PLANAR (§9.3), not []Frame for C>1
 ```
 
 **Typed `PortId` (the connect-checking handle).** A `PortId` is minted per node at comptime from the

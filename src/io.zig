@@ -344,19 +344,18 @@ pub fn encodeShaped(
 // Interleaved LPCM ↔ internal frame conversion
 // ===========================================================================
 //
-// NOTE (a surfaced design tension to resolve, not silently paper over): the
-// internal element `Frame(Lane, L)` is `struct { ch: [C]Lane }`, so a buffer
-// `[]Frame` is **array-of-structs** (channels of one frame are adjacent:
-// L,R,L,R,…). That is *interleaved at the buffer level*, NOT the channel-planar
-// (L,L,…,R,R,…) layout some prose elsewhere describes as the internal form. This
-// is the channel-layout type decision made in the foundational type phase, which
-// every block built on; the boundary codec below therefore converts device
-// format + channel ORDER into that `Frame` representation, and for a stereo f32
-// device stream the `Frame` layout already equals the device's interleaved
-// layout (no transpose). A genuine planar (struct-of-arrays per buffer) internal
-// representation would change how every block strides its channels — a
-// foundational rework, out of scope here; flagged so it is decided deliberately
-// rather than assumed.
+// KNOWN NON-CONFORMANCE (tracked, scheduled — not a silent deviation): the
+// internal canonical buffer layout is mandated PLANAR (C contiguous N-sample
+// channel planes, plane-major) — the SIMD-friendly form, a core throughput
+// requirement. But `Frame(Lane, L)` is `struct { ch: [C]Lane }`, so a `[]Frame`
+// buffer is **array-of-structs / interleaved** at the buffer level for C > 1,
+// which VIOLATES the planar mandate. This codec currently deinterleaves into that
+// AoS `Frame` representation; for a stereo f32 device stream AoS happens to equal
+// the device's interleaved layout (so today there is no transpose), but that is
+// the non-conformant path. The planar-conformance phase converts the element/port
+// view + the C>1 surfaces to plane-major, after which `deinterleave` transposes
+// device-interleaved → planes here (the boundary is the only place the transpose
+// belongs). Mono (C = 1) is already planar-conformant.
 
 /// Decode interleaved device LPCM bytes into internal f32 frames, reconciling the
 /// device channel order to the layout's canonical order. `src` holds

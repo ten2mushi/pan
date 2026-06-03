@@ -38,31 +38,43 @@ pub fn ConstantPowerPan(comptime num: numeric.Numeric) type {
     const T = num.Lane;
     return struct {
         const Self = @This();
-        /// Pan position in [-1, 1]; held across the render buffer.
+        /// Pan position in [-1, 1]; held across the render buffer. Used to derive
+        /// the channel gains unless `gains_q` overrides them.
         pan: f32 = 0,
+        /// Optional PRE-QUANTIZED channel gains `[L, R]` in the lane's q-format,
+        /// used by the integer path INSTEAD of computing `cos/sin(pan)` at render
+        /// time. This is the embedded path (an MCU precomputes the pan gains — no
+        /// runtime trig) and the bit-exact-testable path: the kernel applies the
+        /// exact integer coefficients given, so an oracle holding the same integers
+        /// matches to the bit (a runtime `cos` would differ by ~1 ULP between f32
+        /// and an f64 oracle and shift every output sample). Ignored on the float
+        /// path, which derives the gains from `pan` directly.
+        gains_q: ?[2]T = null,
 
         pub const params = .{ .pan = types.Scalar(f32) };
 
         pub fn process(self: *Self, in: []const types.Sample(T), out: []types.Frame(T, .stereo)) void {
             std.debug.assert(in.len == out.len);
             const xs = scalarsConst(T, in);
-            // Constant-power gains: θ = (p+1)·π/4, L = cos θ, R = sin θ.
-            const p = std.math.clamp(self.pan, -1.0, 1.0);
-            const theta = (p + 1.0) * (std.math.pi / 4.0);
-            const gl = @cos(theta);
-            const gr = @sin(theta);
             if (comptime isFloat(T)) {
-                const lcoef: T = @floatCast(gl);
-                const rcoef: T = @floatCast(gr);
+                // Constant-power gains: θ = (p+1)·π/4, L = cos θ, R = sin θ.
+                const p = std.math.clamp(self.pan, -1.0, 1.0);
+                const theta = (p + 1.0) * (std.math.pi / 4.0);
+                const lcoef: T = @floatCast(@cos(theta));
+                const rcoef: T = @floatCast(@sin(theta));
                 for (xs, out) |x, *o| {
                     o.ch[0] = x * lcoef;
                     o.ch[1] = x * rcoef;
                 }
             } else {
                 const frac = comptime fracBits(T);
-                const scale: f32 = @floatFromInt(@as(i64, 1) << frac);
-                const lq: T = @intFromFloat(@round(gl * scale));
-                const rq: T = @intFromFloat(@round(gr * scale));
+                // Use the supplied q-format gains, else quantize cos/sin(pan).
+                const lq: T, const rq: T = if (self.gains_q) |g| .{ g[0], g[1] } else blk: {
+                    const p = std.math.clamp(self.pan, -1.0, 1.0);
+                    const theta = (p + 1.0) * (std.math.pi / 4.0);
+                    const scale: f32 = @floatFromInt(@as(i64, 1) << frac);
+                    break :blk .{ @intFromFloat(@round(@cos(theta) * scale)), @intFromFloat(@round(@sin(theta) * scale)) };
+                };
                 for (xs, out) |x, *o| {
                     o.ch[0] = simd.qMulStore(T, num.Acc, x, lq, frac);
                     o.ch[1] = simd.qMulStore(T, num.Acc, x, rq, frac);

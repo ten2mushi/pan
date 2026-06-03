@@ -458,6 +458,66 @@ channels / sustained load). Sweep precision × block size × channels; cross-che
 
 ---
 
+## Phase 4.5 — Planar (SoA) conformance (core throughput requirement; do BEFORE more blocks land)
+
+**Why now (not later).** The internal channel form is **LOCKED PLANAR and now STRICTLY ENFORCED**
+(`catalog.md` §9.3 P-1/P-2, `pan_type_and_numeric_model.md` §2.1): a multi-channel stream buffer is
+`C` contiguous `N`-sample **planes** (plane-major), not `[]Frame` interleaved. P1 implemented the
+element as `Frame = struct { ch: [C]Lane }`, so a `[]Frame` buffer is **AoS/interleaved for `C > 1`** —
+**non-conformant**. This is a **core throughput requirement** (per-channel `@Vector` kernels want a
+contiguous plane); converting it **now** (a handful of blocks) is far cheaper than after the spatial
+library lands dozens of multi-channel blocks. Mono (`C = 1`) is already conformant (one plane), so the
+real work is concentrated at `C > 1`.
+
+**What is and isn't affected (the load-bearing scoping insight).**
+- **UNAFFECTED — the commit pass, footprint, coloring, H2.** Commit deals in buffer ids + byte lengths
+  and is **layout-agnostic**: a planar stereo buffer and an interleaved one are both `C·N·sizeof(Lane)`
+  bytes, so `footprint_bytes` and the buffer-id map are unchanged. The class key already encodes `L`
+  (`elem_name`). Expect ~0 change in `src/commit.zig`.
+- **UNAFFECTED — mono.** `Sample(T) = Frame(T,.mono)` is one plane; all the mono blocks/sources/sinks
+  and the mono test surface are already planar-conformant.
+- **AFFECTED — the element/port view + the `C > 1` surfaces.** This is the work.
+
+**Work.**
+1. **A planar buffer/port view** (`src/types.zig` + `src/port.zig`): introduce the planar view a block
+   sees — `C` contiguous `[]Lane` planes over a buffer (e.g. `Planar(Lane, L)` exposing `plane(c) []Lane`;
+   mono degenerates to a single `[]Lane`). `Frame(Lane, L)` stays the **layout-identity** element for
+   `connect`/`PortId`; the **port machinery** (`portOfParam`, `MapIn/OutElem`, the classifier) learns to
+   read a `Planar` view param and recover `(Lane, L)` from it instead of `.pointer.child` of a `[]Frame`
+   slice. *(Hardest piece — re-touches the P1-frozen type/port core; the conceptual centre of the
+   rework.)*
+2. **Convert the blocks + harness** (`filters.zig`, `spatial.zig`, `tests/harness.zig` Identity/Scale/
+   Accumulator) to plane-wise access. Gain/Biquad are per-channel loops (mono unchanged); `ConstantPowerPan`
+   gets *cleaner* (write the L-plane and R-plane directly).
+3. **The executor** (`engine.zig`): build the `Planar` view from a pool buffer's planes (plane `c` at
+   offset `c·N·sizeof(Lane)`) in the `runOp` gather/scatter; the rest of the op-list replay is unchanged.
+4. **The codec** (`io.zig`): `deinterleave` device-interleaved → planar planes (a real transpose now);
+   `interleave`/`interleaveShaped` planar → interleaved. This is the one place the transpose cost lands
+   (I/O boundary only — by design).
+5. **Conformance gate (P-2):** a comptime/`test` assertion that a multi-channel stream buffer is
+   plane-major and that channel access is per-plane `[]Lane`, so an AoS regression fails loud.
+6. **Tests, gold blobs, bench:** update the `C > 1` test constructions; regenerate the **pan** gold
+   blobs (stereo `expected.bin` becomes `[L-plane][R-plane]`, not `[L,R,L,R]`); `generate.py` `_ref_pan`/
+   `_fix_pan` emit plane-major for `C > 1`; bench pan→sink handling. Mono gold (gain/biquad) unaffected.
+
+**Rework estimate (so it is scheduled, not drifted).** ~**1,000–1,500 LOC** across ~**12–18 files**,
+**1 focused session**, **MEDIUM-HIGH risk** (it re-opens the frozen P1 type/port core; the port-view
+change in item 1 is the only genuinely-hard part — the rest is mechanical). Test churn is the bulk but
+concentrated at `C > 1`; the heavily-affected Yoneda suites (dual-mux, comparator, gold-vector, spatial,
+io) likely warrant **Yoneda re-dispatch** rather than hand-editing. Re-verify the full four-mode matrix
++ smoke + cross-linux + bench. **Cost grows with every later phase that adds a multi-channel block — so
+this phase runs before Phase 5 proceeds.**
+
+**Success criteria (gate).** Multi-channel buffers are plane-major (conformance gate ⊢/≈, green);
+`ConstantPowerPan` output is two planes, not interleaved frames; the codec transposes interleaved↔planar
+only at the boundary; the four-mode matrix + smoke + cross-linux stay green; gold/B≡C/dual-mux re-pass
+under the planar layout; `footprint_bytes` is unchanged (proving the commit pass was layout-agnostic).
+
+**Yoneda dispatch.** Re-dispatch the planar-touched harnesses (dual-mux push≡pull, gold-vector, spatial,
+io codec round-trip) against the planar view; a new conformance harness asserting plane-major layout.
+
+---
+
 ## Phase 5 — Format negotiation (runtime) + lock-free control plane + ramped parameter
 
 **Goal.** **Roadmap step 2** + the parameter-port machinery: the three control verbs at exact atomic
@@ -493,11 +553,32 @@ zipper-free, with no audio-thread lock.
    Bypass-preserves-latency law (commit warning where detectable; full PDC routing in Phase 8).
 5. Device-reconfiguration protocol (re-negotiate, re-size pool backing bytes to max-N, rebuild +
    atomic-swap) — desktop (io §8); the assignment map is N-independent.
+6. **Close the runtime `Engine` render path (carried from P4 — do this cleanly, not as a shim).**
+   P4 left the runtime `Engine.{renderInto, start, stop}` as a *documented control-plane façade*: the
+   runnable Tier-A renderer is the **comptime** `Executor`/`ExecutorMode` (it monomorphizes over a
+   comptime graph + a node-id→block-type tuple, owns the pool, binds real `fn_ptr`/`self_ptr`, and
+   replays the op-list wait-free). P5 makes the **runtime** `Engine` an equally-real engine by adding
+   the **runtime commit pass** the RCU verb already needs: commit a *runtime-built* graph to a
+   **heap-allocated `Plan`** whose ops carry **bound, type-erased `fn_ptr`/`self_ptr`** (the same
+   op-list/pool-by-buffer-id shape the comptime `Executor` uses — reuse `RenderOp`/`Plan`, do not fork
+   a second IR). Then `Engine.start` drives an `io.AudioBackend` whose render callback mints the token
+   and replays the current plan; `Engine.renderInto(token, …)` is that replay over the engine-owned
+   pool; `edit→commit` (item 1's RCU swap) atomically swaps the heap `Plan` pointer at a block
+   boundary. **Elegance constraint (Rule 2/Rule 11):** the comptime and runtime paths must share the
+   `RenderOp`/`Plan`/pool model and the gather/scatter logic — the only difference is comptime-inlined
+   dispatch vs a bound `fn_ptr` indirect call; a faulting block still emits silence + raises the flag
+   (exec §7), and FTZ is still token-gated. The comptime `Executor` remains the frozen Tier-A ground
+   truth and the embedded path; the runtime `Engine` is its RCU-swappable desktop sibling. **Honest
+   note (Rule 12):** this is the piece that lets the device gate (sub-5 ms / 10-min, P4's deferred
+   on-device run) be driven through the public `Engine` API rather than a hand-wired `Executor`.
 
 **Success criteria (gate — roadmap step 2 + 6c).** A wired rate-mismatch auto-inserts a resampler; a
 parameter sweep is zipper-free and **bit-identical via `set` vs a wired parameter edge** (P3); no
 audio-thread lock (ThreadSanitizer clean); declaring both `set` and a wired edge for one slot is a
-commit error (P2); the SPSC ring + RCU swap pass under concurrent producer/consumer load (TSan).
+commit error (P2); the SPSC ring + RCU swap pass under concurrent producer/consumer load (TSan);
+**the runtime `Engine` render path is live** — a runtime-committed plan replays bit-identically to the
+comptime `Executor` over the same graph (the runtime-commit ≡ comptime-commit differential), and an
+`edit→commit` RCU swap rewires it with no glitch and no audio-thread allocation/lock.
 
 **Yoneda dispatch.** Parameter-edge ramp/hold + one-source + delay-free-param-loop (§5.7b); the SPSC
 ring and RCU swap under `-fsanitize-thread`; the `set`-rejects-`at_sample` ⊢ omission. Verify atomic

@@ -24,8 +24,10 @@ const pan = @import("pan");
 const h = @import("harness.zig");
 
 const gain_q15_json = @embedFile("vectors/gain_q15.json");
+const pan_q15_json = @embedFile("vectors/pan_q15.json");
 const num_q15 = pan.numericFor(.i16, .{});
 const SampleQ15 = pan.types.Sample(i16);
+const StereoQ15 = pan.types.Frame(i16, .stereo);
 
 /// Read a cwd-relative blob, i16-aligned; `null` on FileNotFound (the
 /// generate-on-demand skip), other I/O errors propagate.
@@ -82,6 +84,52 @@ test "GoldVector: Gain(q15) ≡ the NumPy fixed-point oracle blob, BIT-EXACT (ca
     var gain = pan.filters.Gain(num_q15){ .gain = gain_q };
     gain.process(input, out);
 
+    const got: []const i16 = @alignCast(std.mem.bytesAsSlice(i16, std.mem.sliceAsBytes(out)));
+    try h.bitExact(i16, got, expected);
+}
+
+test "GoldVector: ConstantPowerPan(q15) ≡ the NumPy fixed-point oracle blob, BIT-EXACT (catalog §1.3)" {
+    const gpa = std.testing.allocator;
+
+    // Pre-quantized constant-power gains from the committed manifest (the same
+    // integers the oracle used) — no transcendental in the comparison.
+    const lq: i16, const rq: i16 = blk: {
+        const dyn = try std.json.parseFromSlice(std.json.Value, gpa, pan_q15_json, .{});
+        defer dyn.deinit();
+        const params = dyn.value.object.get("params").?.object;
+        break :blk .{ @intCast(params.get("pan_lq").?.integer), @intCast(params.get("pan_rq").?.integer) };
+    };
+    try std.testing.expectEqual(@as(i16, 18205), lq);
+    try std.testing.expectEqual(@as(i16, 27246), rq);
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const in_bytes = (try readBlobOrNull(io, gpa, "tests/vectors/pan_q15/input.bin")) orelse {
+        std.debug.print("skip: pan_q15 blobs absent — run scripts/generate.py to materialize them\n", .{});
+        return error.SkipZigTest;
+    };
+    defer gpa.free(in_bytes);
+    const exp_bytes = (try readBlobOrNull(io, gpa, "tests/vectors/pan_q15/expected.bin")) orelse {
+        std.debug.print("skip: pan_q15 expected blob absent\n", .{});
+        return error.SkipZigTest;
+    };
+    defer gpa.free(exp_bytes);
+
+    const input: []const SampleQ15 = @alignCast(std.mem.bytesAsSlice(SampleQ15, in_bytes));
+    const expected: []const i16 = @alignCast(std.mem.bytesAsSlice(i16, exp_bytes));
+
+    const out = try gpa.alloc(StereoQ15, input.len);
+    defer gpa.free(out);
+
+    // Drive the q15 pan with the EXACT integer gains (the embedded / bit-exact
+    // path), not a runtime cos. Pan is stateless → a whole-buffer render suffices.
+    var panner = pan.spatial.ConstantPowerPan(num_q15){ .gains_q = .{ lq, rq } };
+    panner.process(input, out);
+
+    // The stereo output is AoS [L0,R0,L1,R1,…] — exactly the oracle's interleaved
+    // q15 layout.
     const got: []const i16 = @alignCast(std.mem.bytesAsSlice(i16, std.mem.sliceAsBytes(out)));
     try h.bitExact(i16, got, expected);
 }
