@@ -9,6 +9,10 @@ zig-out/
 /tests/vectors/**/*.pcm
 /tests/vectors/**/*.npy
 
+# Local audio test inputs (large binary media). Not committed — the brief's
+# disk-minimal requirement; supply your own clips under data/input/.
+/data/
+
 # Python
 __pycache__/
 *.pyc
