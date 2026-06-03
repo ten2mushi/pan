@@ -86,10 +86,19 @@ pub const Node = struct {
     /// True iff this node is BYPASSED. The bypass-preserves-latency law: a bypassed
     /// block with `algorithmic_latency > 0` must still delay its signal by exactly
     /// that latency (else bypassing shifts timing and breaks alignment on parallel
-    /// paths). Until the plugin-delay-compensation pass inserts the compensating
-    /// delay (a later phase), a bypassed latent block is uncompensated and the
-    /// commit rejects it loudly rather than silently shifting timing.
+    /// paths). The plugin-delay-compensation pass (`insertPdc`) routes a
+    /// compensating delay for it and sets `pdc_compensated`; an UNcompensated
+    /// bypassed latent block (a commit on the raw graph, before `insertPdc`) is
+    /// rejected loudly rather than silently shifting timing.
     bypassed: bool = false,
+    /// Set by the plugin-delay-compensation pass when it has routed a compensating
+    /// delay for this node's latency (a bypassed latent block, or a comp-delay
+    /// inserted on a shorter fan-in branch). Clears the bypass-uncompensated reject.
+    pdc_compensated: bool = false,
+    /// True iff this node is a PDC compensating delay synthesized by `insertPdc`
+    /// (a `DelayLine` on a shorter fan-in branch / a bypass passthrough delay). The
+    /// runtime engine binds a built-in delay kernel for it, like a coercion node.
+    is_pdc: bool = false,
 };
 
 /// A forward edge: a wiring from `(from_node, from_port)` to `(to_node, to_port)`.

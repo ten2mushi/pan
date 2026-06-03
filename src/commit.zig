@@ -172,6 +172,16 @@ pub const RenderOp = struct {
     param_input_buffer_ids: [port.max_ports_per_direction]usize = [_]usize{0} ** port.max_ports_per_direction,
     param_input_slots: [port.max_ports_per_direction]u8 = [_]u8{0} ** port.max_ports_per_direction,
     param_input_count: usize = 0,
+    /// RUNTIME-bound marker: this op is an auto-inserted RESAMPLER coercion whose
+    /// `self_ptr` is an `io.RuntimeResampler`. The runtime render reads its
+    /// phase-stateful `needed_input` to set the producer op's per-callback output
+    /// count (the dynamic count that makes a non-integer SRC drift-free). False on
+    /// the comptime path (no coercions are auto-inserted there). Carried IN the plan
+    /// (RCU-published) so the render never reads engine state racily.
+    is_resampler: bool = false,
+    /// The op index (in this plan's op-list) whose output feeds this resampler's
+    /// input — the op whose per-callback count the render overrides to `needed_input`.
+    resampler_producer_op: usize = 0,
 };
 
 /// The committed plan: a flat op-list (one op per node, forward-topo order) plus
@@ -261,13 +271,112 @@ pub const CommitError = error{
     /// A BYPASSED block with `algorithmic_latency > 0` has no compensating delay,
     /// so bypassing it would shift timing and break alignment on parallel paths
     /// (the bypass-preserves-latency law). Route the bypass through a compensating
-    /// delay (the plugin-delay-compensation pass) instead of around it.
+    /// delay (the plugin-delay-compensation pass, `insertPdc`) instead of around it.
     BypassLatencyUncompensated,
+    /// A node has two or more SAMPLE inputs that live on DIFFERENT rate domains
+    /// (different out:in scale relative to the source) with no rate adapter between
+    /// them. Mixed-rate sample fan-in is never implicitly reconciled — insert an
+    /// explicit resampler/framer; only a parameter port auto-coerces across rates.
+    MixedRateInputs,
 };
 
 /// Commit a graph at COMPTIME with the shipped colored pool. See `commitComptimeMode`.
 pub fn commitComptime(comptime g: graph.Graph) CommitError!Plan(g.node_count) {
     return commitComptimeMode(g, .colored);
+}
+
+fn gcd(a: usize, b: usize) usize {
+    var x = a;
+    var y = b;
+    while (y != 0) {
+        const r = x % y;
+        x = y;
+        y = r;
+    }
+    return if (x == 0) 1 else x;
+}
+
+/// The windowed-sinc prototype half-width an auto-inserted resampler coercion uses.
+/// Shared between this pass (its declared `algorithmic_latency`) and the runtime
+/// engine's bound `io.RuntimeResampler` kernel, so the declared latency matches the
+/// kernel's actual group delay.
+pub const resampler_half: usize = 16;
+
+/// A reduced rational `num/den`.
+const Rational = struct { num: usize, den: usize };
+
+fn reduce(num: usize, den: usize) Rational {
+    const g = gcd(num, den);
+    return .{ .num = num / g, .den = den / g };
+}
+
+/// Audio-samples-per-output-element (`apa`) for every node, by a forward sweep in
+/// topo order — the rate-domain scale relative to the source clock. A source ticks
+/// at `1`; a node with rate ratio `p:q` (p out per q in) over an input at `apa_in`
+/// produces output elements that each span `apa_in · q / p` audio samples (a
+/// `Framer` 1:HOP → `apa · HOP`; an `iStft` HOP:1 → `apa / HOP`). The latency DP
+/// (`insertPdc`) and the multi-rate fan-in check both read this to put every
+/// branch's latency in one common (audio-sample) domain before comparing. `apa` is
+/// taken from a node's FIRST sample input; mixed-rate sample fan-in (where that
+/// choice would matter) is rejected separately.
+fn computeApa(g: graph.Graph, topo: []const usize) [graph.max_nodes]Rational {
+    const EC = g.edge_count;
+    var apa: [graph.max_nodes]Rational = undefined;
+    for (0..graph.max_nodes) |i| apa[i] = .{ .num = 1, .den = 1 };
+    for (topo) |v| {
+        // Find this node's first sample (non-param) input producer.
+        var in_apa: ?Rational = null;
+        for (g.edges[0..EC]) |e| {
+            if (e.to_node != v or e.is_param) continue;
+            in_apa = apa[e.from_node];
+            break;
+        }
+        if (in_apa) |ia| {
+            const p = g.nodes[v].out_per_in_p;
+            const q = g.nodes[v].out_per_in_q;
+            apa[v] = reduce(ia.num * q, ia.den * p);
+        } else {
+            // A source re-bases the rate domain to the PIPELINE clock: apa =
+            // pipeline_rate / source_rate (sink-clock samples per source element).
+            // For an all-same-rate graph this is 1/1 (backward-compatible); for a
+            // source feeding a resampler (out_per_in = consumer:producer), the
+            // propagation above then yields apa = 1 downstream of the resampler, so
+            // a resampled stream merges cleanly with a native-pipeline stream and
+            // the PDC DP converts latency across the clock bridge automatically.
+            const sr = g.nodes[v].sample_rate;
+            apa[v] = if (sr == 0 or g.sample_rate == 0) .{ .num = 1, .den = 1 } else reduce(g.sample_rate, sr);
+        }
+    }
+    return apa;
+}
+
+/// Kahn topological sort over the forward DAG (feedback edges excluded), min-node-id
+/// tie-break — the same order the commit pass uses. `ok` is false on a surviving
+/// cycle (an undeclared loop). Comptime-evaluable (fixed arrays, no allocator).
+fn topoSort(g: graph.Graph) struct { order: [graph.max_nodes]usize, len: usize, ok: bool } {
+    const NC = g.node_count;
+    const EC = g.edge_count;
+    var indeg: [graph.max_nodes]usize = [_]usize{0} ** graph.max_nodes;
+    for (g.edges[0..EC]) |e| indeg[e.to_node] += 1;
+    var order: [graph.max_nodes]usize = undefined;
+    var len: usize = 0;
+    var placed: [graph.max_nodes]bool = [_]bool{false} ** graph.max_nodes;
+    while (len < NC) {
+        var pick: ?usize = null;
+        for (0..NC) |v| {
+            if (placed[v] or indeg[v] != 0) continue;
+            pick = v;
+            break;
+        }
+        const v = pick orelse break;
+        placed[v] = true;
+        order[len] = v;
+        len += 1;
+        for (g.edges[0..EC]) |e| {
+            if (e.from_node == v) indeg[e.to_node] -= 1;
+        }
+    }
+    return .{ .order = order, .len = len, .ok = len == NC };
 }
 
 /// The shared commit ALGORITHM — the single body both the comptime and the
@@ -358,7 +467,7 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
         // block is uncompensated and we reject it loudly rather than silently
         // mis-aligning the audio. A coercion node is never the bypass target.
         for (0..NC) |v| {
-            if (g.nodes[v].bypassed and g.nodes[v].algorithmic_latency > 0)
+            if (g.nodes[v].bypassed and g.nodes[v].algorithmic_latency > 0 and !g.nodes[v].pdc_compensated)
                 return error.BypassLatencyUncompensated;
         }
 
@@ -394,6 +503,28 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
         for (0..NC) |v| {
             if (indeg0[v] != 0) continue;
             if (!g.nodes[v].is_source) return error.UnrootedPath;
+        }
+
+        // ---- 3b. multi-input pull rule: no implicit mixed-rate sample fan-in
+        // Each input edge is satisfied independently via its producer's rate, and
+        // SAME-rate multi-input (sidechain, crossover sum, the dry/wet diamond's
+        // audio-domain Mix) is ordinary — aligned later by PDC. But a node fed by
+        // two SAMPLE inputs on DIFFERENT rate domains (different audio-samples-per-
+        // element scale) needs an explicit rate adapter; pan never reconciles it
+        // implicitly. (A parameter port is exempt — it ramp/hold-coerces across
+        // rates.) Detected by comparing the producers' `apa` rate-domain scale.
+        {
+            const apa = computeApa(g, topo[0..NC]);
+            for (0..NC) |v| {
+                var first: ?Rational = null;
+                for (g.edges[0..EC]) |e| {
+                    if (e.to_node != v or e.is_param) continue;
+                    const a = apa[e.from_node];
+                    if (first) |f| {
+                        if (f.num != a.num or f.den != a.den) return error.MixedRateInputs;
+                    } else first = a;
+                }
+            }
         }
 
         // ---- 4. delay-free-loop check — Tarjan on the FULL graph ----------
@@ -495,6 +626,37 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
             }
         }
 
+        // ---- rate demand: want[v], computed BEFORE coloring ----------------
+        // want[v] = elements v must produce this callback, so a value's pool buffer
+        // can be sized by what its producer emits (NOT uniformly by the device N) —
+        // a rate-changing producer (an STFT emitting 2 frames per callback) needs a
+        // buffer of that many elements, not N. Sinks want N; a producer wants the
+        // max over its consumers of needed_input: a consumer with ratio p:q (p out
+        // per q in) producing `want[c]` outputs consumes `ceil(want[c]·q/p)` inputs
+        // (never assuming the hop divides N — the block's ring absorbs the
+        // remainder), a varirate plans on its worst-case (min) ratio, and a source's
+        // length is the demand itself. For a rate-1:1 graph every `want[v] == N`, so
+        // the buffer sizing below is byte-identical to the pre-P8 uniform-N pools.
+        var want: [max_nodes]usize = [_]usize{N} ** max_nodes;
+        {
+            var ri = NC;
+            while (ri > 0) {
+                ri -= 1;
+                const v = topo[ri];
+                var has_consumer = false;
+                var w: usize = 0;
+                for (g.edges[0..EC]) |e| {
+                    if (e.from_node != v) continue;
+                    has_consumer = true;
+                    const cp = g.nodes[e.to_node].out_per_in_p;
+                    const cq = g.nodes[e.to_node].out_per_in_q;
+                    const demand = (want[e.to_node] * cq + cp - 1) / cp; // ceil
+                    if (demand > w) w = demand;
+                }
+                if (has_consumer) want[v] = w;
+            }
+        }
+
         // ---- 5. liveness — produced values, pool-eligible ------------------
         const Value = struct {
             from_node: usize,
@@ -503,6 +665,10 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
             end: usize,
             elem_size: usize,
             elem_name: []const u8,
+            /// Elements this value's producer emits per callback (`want[from_node]`)
+            /// — the SECOND half of the pool class key `(elem_name, want)` and the
+            /// per-buffer element count. A rate-1:1 value has `want == N`.
+            want: usize,
             color: usize = 0,
             buffer_id: usize = 0,
             /// True iff this value's output port feeds a feedback read-side. Such a
@@ -535,6 +701,7 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
                     .end = en,
                     .elem_size = e.elem_size,
                     .elem_name = e.elem_name,
+                    .want = want[e.from_node],
                 };
                 value_count += 1;
             }
@@ -611,8 +778,11 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
                     }
                 }
                 const ui = u orelse continue;
-                // Identical element type & count (same pool class & byte window).
+                // Identical element type & per-callback count (same pool class & byte
+                // window). For a rate-1:1 Map in==out count, so `want` matches; the
+                // check also guards a (degenerate) rate-changing producer.
                 if (!std.mem.eql(u8, values[ui].elem_name, values[vi].elem_name)) continue;
+                if (values[ui].want != values[vi].want) continue;
                 // u must be single-consumer: exactly one reader of its producer port
                 // across BOTH forward edges and feedback read-sides.
                 var consumers: usize = 0;
@@ -644,24 +814,34 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
         // left-edge colorer below and ASSERT the invariant here (a uniform-count
         // guard) rather than carry dead FFD bin-packing code — if a future keying
         // ever made a class non-uniform, this assert fires in Debug/ReleaseSafe.
+        // The pool class key is `(element_type name, want)`: the element type's
+        // `@typeName` (precision + layout + family + frame width all ride in it) AND
+        // the per-callback element count. For a rate-1:1 graph every value's `want`
+        // is N, so there is one class per element name exactly as before; a
+        // rate-changing seam splits same-typed values of different `want` into
+        // distinct, uniform-size classes — so each class is uniform by construction
+        // and the spec's heterogeneous-count FFD fallback stays unreachable (the
+        // assert below stands guard).
         var class_names: [max_edges][]const u8 = undefined;
         var class_elem_size: [max_edges]usize = undefined;
+        var class_want: [max_edges]usize = undefined;
         var class_M: [max_edges]usize = [_]usize{0} ** max_edges;
         var class_count: usize = 0;
         for (0..value_count) |vi| {
             var ci: ?usize = null;
             for (0..class_count) |c| {
-                if (std.mem.eql(u8, class_names[c], values[vi].elem_name)) {
+                if (std.mem.eql(u8, class_names[c], values[vi].elem_name) and class_want[c] == values[vi].want) {
                     ci = c;
                     break;
                 }
             }
             if (ci) |c| {
-                // Same class name ⇒ same element type ⇒ same size (uniform class).
+                // Same (name, want) ⇒ same element type & count ⇒ same size.
                 std.debug.assert(values[vi].elem_size == class_elem_size[c]);
             } else {
                 class_names[class_count] = values[vi].elem_name;
                 class_elem_size[class_count] = values[vi].elem_size;
+                class_want[class_count] = values[vi].want;
                 class_count += 1;
             }
         }
@@ -675,7 +855,7 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
             for (0..value_count) |vi| {
                 if (alias_root[vi] != vi) continue;
                 if (values[vi].is_persistent) continue; // pool-excluded z⁻¹ value
-                if (std.mem.eql(u8, values[vi].elem_name, class_names[c])) {
+                if (std.mem.eql(u8, values[vi].elem_name, class_names[c]) and values[vi].want == class_want[c]) {
                     order[order_len] = vi;
                     order_len += 1;
                 }
@@ -743,7 +923,7 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
         for (0..value_count) |vi| {
             if (values[vi].is_persistent) continue; // gets a persistent id below
             for (0..class_count) |c| {
-                if (std.mem.eql(u8, values[vi].elem_name, class_names[c])) {
+                if (std.mem.eql(u8, values[vi].elem_name, class_names[c]) and values[vi].want == class_want[c]) {
                     values[vi].buffer_id = class_base[c] + values[vi].color;
                     break;
                 }
@@ -758,6 +938,7 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
         var fb_buf: [max_edges]usize = undefined;
         var persist_count: usize = 0;
         var persist_elem: [graph.max_edges]usize = [_]usize{0} ** graph.max_edges;
+        var persist_want: [graph.max_edges]usize = [_]usize{0} ** graph.max_edges;
         for (0..FC) |fi| {
             const f = g.feedback[fi];
             var shared: ?usize = null;
@@ -773,6 +954,7 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
             }
             const id = total_pool + persist_count;
             persist_elem[persist_count] = f.elem_size;
+            persist_want[persist_count] = want[f.write_node];
             persist_count += 1;
             fb_buf[fi] = id;
             for (0..value_count) |vi| {
@@ -791,30 +973,10 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
             }
         }
 
-        // ---- 7. rate scheduling — demand N propagated upstream ------------
-        // want[v] = frames v must produce this callback. Sinks want N; a producer
-        // wants the max, over its consumers, of needed_input(consumer) — for a
-        // consumer with ratio p:q (p out per q in), producing `want[c]` outputs
-        // takes ceil(want[c]·q/p) inputs (never assumes the hop divides N).
-        var want: [max_nodes]usize = [_]usize{N} ** max_nodes;
-        var ri = NC;
-        while (ri > 0) {
-            ri -= 1;
-            const v = topo[ri];
-            var has_consumer = false;
-            var w: usize = 0;
-            for (g.edges[0..EC]) |e| {
-                if (e.from_node != v) continue;
-                has_consumer = true;
-                const cp = g.nodes[e.to_node].out_per_in_p;
-                const cq = g.nodes[e.to_node].out_per_in_q;
-                const demand = (want[e.to_node] * cq + cp - 1) / cp; // ceil
-                if (demand > w) w = demand;
-            }
-            // A source (no consumer here only if it is a lone source) keeps N;
-            // otherwise its output length is set by the downstream demand (SR1).
-            if (has_consumer) want[v] = w;
-        }
+        // ---- 7. rate scheduling — `want[v]` was computed before coloring ---
+        // (so a value's buffer is sized by its producer's per-callback output). The
+        // op's `n_or_pull_spec` is that `want[v]`: a Map slice length, a Source's
+        // pull-demand-set output length, or a Rate `pull`'s output demand.
 
         // ---- 8. emit — one op per node, forward-topo order ----------------
         var ops: [graph.max_nodes]RenderOp = undefined;
@@ -916,7 +1078,9 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
         var buffer_byte_len: [graph.max_buffers]usize = [_]usize{0} ** graph.max_buffers;
         var pool_bytes: usize = 0;
         for (0..class_count) |c| {
-            const stride = N * class_elem_size[c];
+            // A class's stride is its per-callback element count `want` × element
+            // size (== N × size for a rate-1:1 class — byte-identical to pre-P8).
+            const stride = class_want[c] * class_elem_size[c];
             for (0..class_M[c]) |color| {
                 const id = class_base[c] + color;
                 buffer_offset[id] = pool_bytes;
@@ -925,11 +1089,11 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
             }
         }
         // Persistent feedback z⁻¹ buffers, in the pool tail past the scratch pool —
-        // one per distinct feedback source (deduped above), each one block wide.
+        // one per distinct feedback source (deduped above), each `want` elements wide.
         var persistent_bytes: usize = 0;
         for (0..persist_count) |k| {
             const id = total_pool + k;
-            const stride = N * persist_elem[k];
+            const stride = persist_want[k] * persist_elem[k];
             buffer_offset[id] = pool_bytes + persistent_bytes;
             buffer_byte_len[id] = stride;
             persistent_bytes += stride;
@@ -1014,7 +1178,7 @@ pub fn commitGraph(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(g
 /// result with an RCU pointer swap. Reuses `RenderOp`/`Plan`/the pool-by-buffer-id
 /// layout verbatim — there is no second IR.
 pub fn commitRuntime(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph.max_nodes) {
-    return computePlan(insertCoercions(g), mode);
+    return computePlan(insertPdc(insertCoercions(g)), mode);
 }
 
 /// The negotiation insertion step (runtime path): where a wired edge crosses a
@@ -1042,6 +1206,14 @@ pub fn insertCoercions(g: graph.Graph) graph.Graph {
         const cid = g2.node_count;
         const orig_to = e.to_node;
         const orig_to_port = e.to_port;
+        // The resampler is a real `Rate` node: out_per_in = (consumer:producer)
+        // reduced (p outputs per q inputs), with the windowed-sinc group delay. The
+        // want-keyed buffer sizing + the runtime engine's dynamic per-callback count
+        // (driven by the kernel's phase-stateful `needed_input`) make it correct;
+        // `resampler_half` matches the bound kernel's prototype half-width.
+        const rr = reduce(consumer_rate, producer_rate); // p:q = out:in
+        const up = @max(rr.num, rr.den);
+        const lat = (resampler_half * up + rr.num) / rr.den;
         g2.nodes[cid] = .{
             .id = cid,
             .class = .Map,
@@ -1051,9 +1223,9 @@ pub fn insertCoercions(g: graph.Graph) graph.Graph {
             .is_source = false,
             .is_delay = false,
             .delay_len = 0,
-            .algorithmic_latency = 0,
-            .out_per_in_p = 1,
-            .out_per_in_q = 1,
+            .algorithmic_latency = lat,
+            .out_per_in_p = rr.num,
+            .out_per_in_q = rr.den,
             .aliasing_safe = false,
             .state_size = 0,
             .rate_domain = g2.nodes[orig_to].rate_domain,
@@ -1081,6 +1253,132 @@ pub fn insertCoercions(g: graph.Graph) graph.Graph {
         g2.edge_count += 1;
     }
     return g2;
+}
+
+/// The plugin-delay-compensation insertion step (runtime path) — the categorical
+/// re-alignment of a latency-mismatched fan-in. A longest-path DP over the DAG
+/// gives each node's output latency in a common (audio-sample) domain — every
+/// branch's `algorithmic_latency` converted by its rate-domain scale `apa`
+/// (per-rate-domain, audit S7: an FFT-latency spectral path and a time-domain path
+/// align in the correct domain, not naively in samples). At each fan-in, on each
+/// SHORTER sample input a compensating `DelayLine` of `(Lmax − Lᵢ)` (converted back
+/// into that input's element units) is inserted, so the signals re-align
+/// sample-accurately. A BYPASSED block with `algorithmic_latency > 0` gets a
+/// comp-delay on its output too (bypass-preserves-latency) and is marked
+/// `pdc_compensated`. The comp-delays are ordinary delay elements (counted by the
+/// footprint's delay-ring term, tagged `is_pdc` so the runtime engine binds a delay
+/// kernel). A graph with no latency-mismatched fan-in is returned unchanged.
+/// Comptime-evaluable (fixed arrays, no allocator), so `commitGraph(insertPdc(g))`
+/// runs at comptime exactly as `insertCoercions` does.
+pub fn insertPdc(g: graph.Graph) graph.Graph {
+    const ts = topoSort(g);
+    if (!ts.ok) return g; // an undeclared cycle — computePlan reports it
+    const NC = g.node_count;
+    const apa = computeApa(g, ts.order[0..ts.len]);
+
+    // Longest-path latency DP, in audio samples. A node's own latency is declared in
+    // its OUTPUT elements, so its audio-domain contribution is `alg_lat · apa[node]`.
+    var lat: [graph.max_nodes]usize = [_]usize{0} ** graph.max_nodes;
+    for (ts.order[0..ts.len]) |v| {
+        var lin: usize = 0;
+        for (g.edges[0..g.edge_count]) |e| {
+            if (e.to_node != v or e.is_param) continue;
+            if (lat[e.from_node] > lin) lin = lat[e.from_node];
+        }
+        const a = apa[v];
+        const contrib = g.nodes[v].algorithmic_latency * a.num / a.den;
+        lat[v] = lin + contrib;
+    }
+
+    var g2 = g;
+
+    // Fan-in comp-delays: on each shorter sample input of every node, insert a
+    // DelayLine of the latency deficit (converted into that input's element units).
+    const orig_edges = g.edge_count;
+    var ei: usize = 0;
+    while (ei < orig_edges) : (ei += 1) {
+        const e = g.edges[ei];
+        if (e.is_param) continue;
+        const v = e.to_node;
+        // Lmax over v's sample inputs (on the original graph).
+        var lmax: usize = 0;
+        for (g.edges[0..orig_edges]) |e2| {
+            if (e2.to_node != v or e2.is_param) continue;
+            if (lat[e2.from_node] > lmax) lmax = lat[e2.from_node];
+        }
+        const lsrc = lat[e.from_node];
+        if (lsrc >= lmax) continue; // this input is the (a) longest — no delay
+        const src_apa = apa[e.from_node];
+        // (Lmax − Lsrc) audio samples ÷ apa[src] = comp length in src's elements.
+        const comp_len = (lmax - lsrc) * src_apa.den / src_apa.num;
+        if (comp_len == 0) continue;
+        if (g2.node_count >= graph.max_nodes or g2.edge_count >= graph.max_edges) continue;
+        insertDelayOnEdge(&g2, ei, comp_len);
+    }
+
+    // Bypass-preserves-latency: a bypassed latent block keeps its delay via a
+    // comp-delay on each of its outputs, then is marked compensated.
+    for (0..NC) |v| {
+        if (!(g2.nodes[v].bypassed and g.nodes[v].algorithmic_latency > 0)) continue;
+        const comp_len = g.nodes[v].algorithmic_latency; // already in v's output elems
+        var oei: usize = 0;
+        const snapshot = g2.edge_count;
+        while (oei < snapshot) : (oei += 1) {
+            if (g2.edges[oei].from_node != v or g2.edges[oei].is_param) continue;
+            if (g2.node_count >= graph.max_nodes or g2.edge_count >= graph.max_edges) continue;
+            insertDelayOnEdge(&g2, oei, comp_len);
+        }
+        g2.nodes[v].pdc_compensated = true;
+    }
+    return g2;
+}
+
+/// Splice a PDC compensating `DelayLine` of `len` elements onto forward edge `ei`
+/// (`src → dst` becomes `src → delay → dst`). The delay carries the edge's element
+/// type, is a delay element (so it is counted in the footprint's delay-ring term),
+/// and is tagged `is_pdc` for the runtime engine's kernel binding.
+fn insertDelayOnEdge(g2: *graph.Graph, ei: usize, len: usize) void {
+    const e = g2.edges[ei];
+    const cid = g2.node_count;
+    const orig_to = e.to_node;
+    const orig_to_port = e.to_port;
+    g2.nodes[cid] = .{
+        .id = cid,
+        .class = .Map,
+        .type_name = "(pdc-delay)",
+        .out_elem_size = e.elem_size,
+        .out_elem_name = e.elem_name,
+        .is_source = false,
+        .is_delay = true,
+        .delay_len = len,
+        .algorithmic_latency = 0, // a deliberate signal delay, not algorithmic latency
+        .out_per_in_p = 1,
+        .out_per_in_q = 1,
+        .aliasing_safe = false,
+        .state_size = @sizeOf(usize), // the ring cursor
+        .rate_domain = g2.nodes[orig_to].rate_domain,
+        .sample_rate = g2.nodes[e.from_node].sample_rate,
+        .set_param_slots = 0,
+        .is_coercion = false,
+        .bypassed = false,
+        .pdc_compensated = false,
+        .is_pdc = true,
+    };
+    g2.node_count += 1;
+    g2.edges[ei].to_node = cid;
+    g2.edges[ei].to_port = 0;
+    g2.edges[g2.edge_count] = .{
+        .from_node = cid,
+        .from_port = 0,
+        .to_node = orig_to,
+        .to_port = orig_to_port,
+        .feedback = false,
+        .elem_size = e.elem_size,
+        .elem_name = e.elem_name,
+        .is_param = e.is_param,
+        .channels = e.channels,
+    };
+    g2.edge_count += 1;
 }
 
 // ===========================================================================
@@ -1468,6 +1766,71 @@ test "the empty graph and a lone source commit to degenerate plans" {
     try std.testing.expectEqual(@as(usize, 0), plan.footprint_bytes);
 }
 
+test "PDC: insertPdc compensates a latency-mismatched diamond fan-in" {
+    const Sum2 = struct {
+        const Self = @This();
+        pub fn process(self: *Self, in0: []const t.Sample(f32), in1: []const t.Sample(f32), out: []t.Sample(f32)) void {
+            _ = self;
+            for (in0, in1, out) |x, y, *o| o.ch[0] = x.ch[0] + y.ch[0];
+        }
+    };
+    const g = comptime blk: {
+        var gg = graph.Graph.empty;
+        const src = gg.add(Src);
+        const a = gg.add(Map1); // dry, latency 0
+        const b = gg.add(Map1); // wet
+        const mix = gg.add(Sum2);
+        const out = gg.add(Sink);
+        gg.connect(port.MapOutPort(Src), src, 0, port.MapInPort(Map1), a, 0);
+        gg.connect(port.MapOutPort(Src), src, 0, port.MapInPort(Map1), b, 0);
+        gg.connect(port.MapOutPort(Map1), a, 0, port.MapInPortAt(Sum2, 0), mix, 0);
+        gg.connect(port.MapOutPort(Map1), b, 0, port.MapInPortAt(Sum2, 1), mix, 1);
+        gg.connect(port.MapOutPort(Sum2), mix, 0, port.MapInPort(Sink), out, 0);
+        gg.nodes[b].algorithmic_latency = 64; // wet branch carries 64 samples of latency
+        break :blk gg;
+    };
+    const g2 = comptime insertPdc(g);
+    // Exactly one compensating delay inserted (on the shorter dry branch).
+    try std.testing.expectEqual(@as(usize, 6), g2.node_count);
+    var comp_len: usize = 0;
+    var comp_count: usize = 0;
+    for (g2.nodes[0..g2.node_count]) |n| if (n.is_pdc) {
+        comp_len = n.delay_len;
+        comp_count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), comp_count);
+    try std.testing.expectEqual(@as(usize, 64), comp_len); // = the wet latency
+    // The compensated graph commits cleanly; the comp-delay ring is footprinted.
+    const plan = comptime try commitGraph(g2, .colored);
+    try std.testing.expect(plan.footprint_bytes > 0);
+}
+
+test "PDC: a latency-equal diamond (same latency both branches) inserts no delay" {
+    const Sum2 = struct {
+        const Self = @This();
+        pub fn process(self: *Self, in0: []const t.Sample(f32), in1: []const t.Sample(f32), out: []t.Sample(f32)) void {
+            _ = self;
+            for (in0, in1, out) |x, y, *o| o.ch[0] = x.ch[0] + y.ch[0];
+        }
+    };
+    const g = comptime blk: {
+        var gg = graph.Graph.empty;
+        const src = gg.add(Src);
+        const a = gg.add(Map1);
+        const b = gg.add(Map1);
+        const mix = gg.add(Sum2);
+        const out = gg.add(Sink);
+        gg.connect(port.MapOutPort(Src), src, 0, port.MapInPort(Map1), a, 0);
+        gg.connect(port.MapOutPort(Src), src, 0, port.MapInPort(Map1), b, 0);
+        gg.connect(port.MapOutPort(Map1), a, 0, port.MapInPortAt(Sum2, 0), mix, 0);
+        gg.connect(port.MapOutPort(Map1), b, 0, port.MapInPortAt(Sum2, 1), mix, 1);
+        gg.connect(port.MapOutPort(Sum2), mix, 0, port.MapInPort(Sink), out, 0);
+        break :blk gg; // both branches latency 0
+    };
+    const g2 = comptime insertPdc(g);
+    try std.testing.expectEqual(@as(usize, 5), g2.node_count); // unchanged
+}
+
 test "a malformed edge to an out-of-range node => error.MalformedGraph" {
     const g = comptime blk: {
         var gg = graph.Graph.empty;
@@ -1561,16 +1924,21 @@ test "bypass-preserves-latency: a bypassed latent block with no compensation is 
     };
     var g = graph.Graph.empty;
     const src = g.add(BypSrc);
-    // Give the node algorithmic latency and bypass it. Until the plugin-delay-
-    // compensation pass routes the compensating delay, a bypassed latent block is
-    // uncompensated — committing it would silently shift timing, so it is rejected.
+    // Give the node algorithmic latency and bypass it. On the RAW graph (no PDC
+    // pass), a bypassed latent block is uncompensated — committing it would silently
+    // shift timing, so it is rejected loudly.
     g.nodes[src].algorithmic_latency = 5;
     g.markBypassed(src);
-    try std.testing.expectError(error.BypassLatencyUncompensated, commitRuntime(g, .colored));
+    try std.testing.expectError(error.BypassLatencyUncompensated, commitGraph(g, .colored));
 
-    // A bypassed block with ZERO latency is fine (nothing to compensate).
+    // commitRuntime runs insertPdc, which routes the bypass through a compensating
+    // delay (bypass-preserves-latency) and marks the node compensated, so the same
+    // graph now commits cleanly.
+    _ = try commitRuntime(g, .colored);
+
+    // A bypassed block with ZERO latency is fine either way (nothing to compensate).
     var g2 = graph.Graph.empty;
     const s2 = g2.add(BypSrc);
     g2.markBypassed(s2);
-    _ = try commitRuntime(g2, .colored);
+    _ = try commitGraph(g2, .colored);
 }

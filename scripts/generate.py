@@ -116,11 +116,38 @@ def _ref_pan(x: np.ndarray, params: dict) -> np.ndarray:
     return np.concatenate([mono * np.cos(theta), mono * np.sin(theta)], axis=1)
 
 
+def _ref_resampler(x: np.ndarray, params: dict) -> np.ndarray:
+    """Rational resampler reference: L:M via SciPy's polyphase `resample_poly`
+    (the named oracle for the rate-elastic seam — catalog Rule 9). When SciPy is
+    unavailable, falls back to NumPy `interp` linear resampling (a coarser but
+    still INDEPENDENT reference; the float tolerance must be widened accordingly).
+    Resamples each channel column independently. `up = L`, `down = M`."""
+    up = int(params["L"])
+    down = int(params["M"])
+    try:
+        from scipy.signal import resample_poly
+        return resample_poly(x, up, down, axis=0)
+    except ModuleNotFoundError:
+        n_out = x.shape[0] * up // down
+        idx = np.arange(n_out) * down / up
+        return np.stack([np.interp(idx, np.arange(x.shape[0]), x[:, c]) for c in range(x.shape[1])], axis=1)
+
+
+# NOTE on the STFT reference: an STFT's output is COMPLEX spectral frames, which
+# do not fit the real-sample blob format above. pan validates the STFT numerics
+# HERMETICALLY in-test against an independent naive O(N²) DFT of the Hann-windowed
+# frame (tests/spectral_gold_test.zig) — a different algorithm from pan's radix-2
+# real-FFT, so a genuine Rule-9 independent oracle with no external dependency.
+# `xcheck_rfft.py` additionally cross-validates pan's `rfftForward` against
+# `scipy.fft.rfft` directly (run on demand; not part of the hermetic `zig build test`).
+
+
 _REFERENCES = {
     "Gain": _ref_gain,
     "Biquad": _ref_biquad,
     "ConstantPowerPan": _ref_pan,
-    # Add a reference per block as it lands (framer, resampler, ...).
+    "Resampler": _ref_resampler,
+    # STFT is complex-output → validated hermetically (see note above), not here.
 }
 
 

@@ -337,12 +337,18 @@ fn ExecutorModeParanoid(comptime g: graph.Graph, comptime node_blocks: []const t
             if (render_ns > deadline_ns) self.tele.xrun_count += 1;
         }
 
-        /// Build the typed argument tuple from the op's buffer ids and invoke
-        /// `Block.process`. Inputs and outputs are pulled in declaration order
-        /// (the commit pass emits buffer ids in that order); each `[]const A`
-        /// process parameter consumes the next input buffer id, each `[]A` the
-        /// next output. After the call, finite-checks each output buffer (when
-        /// guards are live) and silences a poisoned one, raising the fault flag.
+        /// Build the typed argument tuple from the op's buffer ids and invoke the
+        /// block's kernel — `Block.process` for a `Map`, `Block.pull` for a
+        /// `Rate`/`VariRate`. Ports are pulled in declaration order (the commit pass
+        /// emits buffer ids in that order); each input port (a `[]const A` slice or
+        /// a `PlanarConst` view) consumes the next input buffer id, each output port
+        /// the next output. A `Rate`'s scalar `want: usize` param receives this op's
+        /// resolved demand `n`. An INPUT port's length is its buffer's element count
+        /// (= the producer's per-callback `want`, which differs from the output
+        /// count across a rate-changing seam); an OUTPUT port's length is `n`. For a
+        /// rate-1:1 `Map` both equal `n`, so the path is bit-identical to before.
+        /// After the call, finite-checks each output buffer (when guards are live)
+        /// and silences a poisoned one, raising the fault flag.
         fn runOp(
             comptime Block: type,
             inst: *Block,
@@ -351,25 +357,31 @@ fn ExecutorModeParanoid(comptime g: graph.Graph, comptime node_blocks: []const t
             comptime guards: bool,
             fault: *bool,
         ) void {
-            const Args = std.meta.ArgsTuple(@TypeOf(Block.process));
+            const is_rate = comptime port.classify(Block) != .Map;
+            const kernel = if (comptime is_rate) Block.pull else Block.process;
+            const Args = std.meta.ArgsTuple(@TypeOf(kernel));
             var args: Args = undefined;
             args[0] = inst;
-            const params = @typeInfo(@TypeOf(Block.process)).@"fn".params;
+            const params = @typeInfo(@TypeOf(kernel)).@"fn".params;
             const n = op.n_or_pull_spec;
             comptime var in_i: usize = 0;
             comptime var out_i: usize = 0;
             inline for (params[1..], 1..) |p, ai| {
                 const ParamT = p.type.?;
+                // A `Rate`'s `pull` interleaves a scalar `want` demand among its
+                // port slices; a non-port (integer) param receives `n`.
+                if (comptime !port.isPortParam(ParamT)) {
+                    args[ai] = n;
+                    continue;
+                }
                 // Each port param is either a planar buffer view (multi-channel
                 // plane-major form) or a plain element slice (mono / non-Frame).
-                // The view recovers `C` plane-major planes over the same region
-                // bytes; the slice reinterprets the region as contiguous elements.
                 if (comptime types.isPlanarView(ParamT)) {
                     if (comptime ParamT.is_const_view) {
                         const id = op.input_buffer_ids[in_i];
                         in_i += 1;
                         const region = pool[plan.buffer_offset[id] .. plan.buffer_offset[id] + plan.buffer_byte_len[id]];
-                        args[ai] = planarConstView(ParamT, region, n);
+                        args[ai] = planarConstView(ParamT, region, plan.buffer_byte_len[id] / @sizeOf(ParamT.Elem));
                     } else {
                         const id = op.output_buffer_ids[out_i];
                         out_i += 1;
@@ -383,7 +395,7 @@ fn ExecutorModeParanoid(comptime g: graph.Graph, comptime node_blocks: []const t
                         const id = op.input_buffer_ids[in_i];
                         in_i += 1;
                         const region = pool[plan.buffer_offset[id] .. plan.buffer_offset[id] + plan.buffer_byte_len[id]];
-                        args[ai] = sliceConst(Elem, region, n);
+                        args[ai] = sliceConst(Elem, region, plan.buffer_byte_len[id] / @sizeOf(Elem));
                     } else {
                         const id = op.output_buffer_ids[out_i];
                         out_i += 1;
@@ -393,12 +405,19 @@ fn ExecutorModeParanoid(comptime g: graph.Graph, comptime node_blocks: []const t
                 }
             }
             applyParamInputs(Block, inst, pool, &op, plan.buffer_offset[0..], plan.buffer_byte_len[0..]);
-            @call(.auto, Block.process, args);
+            // A `Rate` kernel returns the produced count; the static op-list sizes
+            // its input for `want` (via `needed_input`), so it produces exactly `n`.
+            if (comptime is_rate) {
+                _ = @call(.auto, kernel, args);
+            } else {
+                @call(.auto, kernel, args);
+            }
 
             if (guards) {
                 comptime var oi: usize = 0;
                 inline for (params[1..]) |p| {
                     const ParamT = p.type.?;
+                    if (comptime !port.isPortParam(ParamT)) continue;
                     const is_out = comptime if (types.isPlanarView(ParamT))
                         !ParamT.is_const_view
                     else
@@ -524,21 +543,27 @@ pub fn renderThunk(comptime Block: type) RenderThunk {
             fault: *bool,
         ) void {
             const inst: *Block = @ptrCast(@alignCast(self_ptr));
-            const Args = std.meta.ArgsTuple(@TypeOf(Block.process));
+            const is_rate = comptime port.classify(Block) != .Map;
+            const kernel = if (comptime is_rate) Block.pull else Block.process;
+            const Args = std.meta.ArgsTuple(@TypeOf(kernel));
             var args: Args = undefined;
             args[0] = inst;
-            const params = @typeInfo(@TypeOf(Block.process)).@"fn".params;
+            const params = @typeInfo(@TypeOf(kernel)).@"fn".params;
             const n = op.n_or_pull_spec;
             var in_i: usize = 0;
             var out_i: usize = 0;
             inline for (params[1..], 1..) |p, ai| {
                 const ParamT = p.type.?;
+                if (comptime !port.isPortParam(ParamT)) {
+                    args[ai] = n;
+                    continue;
+                }
                 if (comptime types.isPlanarView(ParamT)) {
                     if (comptime ParamT.is_const_view) {
                         const id = op.input_buffer_ids[in_i];
                         in_i += 1;
                         const region = pool[plan.buffer_offset[id] .. plan.buffer_offset[id] + plan.buffer_byte_len[id]];
-                        args[ai] = planarConstView(ParamT, region, n);
+                        args[ai] = planarConstView(ParamT, region, plan.buffer_byte_len[id] / @sizeOf(ParamT.Elem));
                     } else {
                         const id = op.output_buffer_ids[out_i];
                         out_i += 1;
@@ -552,7 +577,7 @@ pub fn renderThunk(comptime Block: type) RenderThunk {
                         const id = op.input_buffer_ids[in_i];
                         in_i += 1;
                         const region = pool[plan.buffer_offset[id] .. plan.buffer_offset[id] + plan.buffer_byte_len[id]];
-                        args[ai] = sliceConst(Elem, region, n);
+                        args[ai] = sliceConst(Elem, region, plan.buffer_byte_len[id] / @sizeOf(Elem));
                     } else {
                         const id = op.output_buffer_ids[out_i];
                         out_i += 1;
@@ -562,12 +587,17 @@ pub fn renderThunk(comptime Block: type) RenderThunk {
                 }
             }
             applyParamInputs(Block, inst, pool, op, plan.buffer_offset[0..], plan.buffer_byte_len[0..]);
-            @call(.auto, Block.process, args);
+            if (comptime is_rate) {
+                _ = @call(.auto, kernel, args);
+            } else {
+                @call(.auto, kernel, args);
+            }
 
             if (guards) {
                 var oi: usize = 0;
                 inline for (params[1..]) |p| {
                     const ParamT = p.type.?;
+                    if (comptime !port.isPortParam(ParamT)) continue;
                     const is_out = comptime if (types.isPlanarView(ParamT))
                         !ParamT.is_const_view
                     else
@@ -589,18 +619,31 @@ pub fn renderThunk(comptime Block: type) RenderThunk {
     return Gen.thunk;
 }
 
-/// A dummy instance pointer for coercion nodes (which carry no author instance).
-/// The coercion thunk ignores `self_ptr`; this just gives the op a non-null one.
-var coercion_dummy: u8 = 0;
+/// Per-plan state for an inserted node (a PDC compensating delay), owned by the
+/// engine and freed alongside the plan it belongs to (immediately when stopped,
+/// after the RCU grace period when running) — the same lifecycle as the plan and
+/// the dropped author instances.
+pub const InsertedSlot = struct {
+    ptr: *anyopaque,
+    free: *const fn (std.mem.Allocator, *anyopaque) void,
+};
 
-/// The built-in render kernel for an inserted coercion node. A resampler's
-/// NUMERICAL body (polyphase sinc) is a later phase; this is the same-rate
-/// passthrough stub — it copies the producer's buffer to the coercion's output
-/// buffer (identical element + N, hence identical byte length). The node's
-/// *presence* in the op-list is the negotiation deliverable (the diagram commutes
-/// through a coercion morphism); its arithmetic is filled in when the resampler
-/// block lands.
-fn coercionPassthroughThunk(
+/// Runtime state for a PDC compensating `DelayLine` inserted by `insertPdc`: a
+/// byte-wise circular ring of `delay_len` elements (the analysis/synthesis latency
+/// the dry branch must absorb), persisting across callbacks. Byte-generic so one
+/// kernel serves any element type (`Sample`/`Complex`/…) the comp-delay carries.
+const PdcDelayState = struct {
+    ring: []u8, // delay_len * elem_size bytes, zero-initialized (silent pre-roll)
+    elem_size: usize,
+    delay_len: usize,
+    cursor: usize = 0, // in elements
+};
+
+/// The bound render thunk for an inserted PDC delay: `out[n] = in[n − delay_len]`
+/// element-wise through the persistent ring (the runtime-Engine twin of
+/// `time.DelayLine.process`, byte-generic). The input/output pool buffers are the
+/// same byte length (rate-1:1 comp-delay); `n` elements = `byte_len / elem_size`.
+fn pdcDelayThunk(
     self_ptr: *anyopaque,
     pool: [*]u8,
     op: *const commit.RenderOp,
@@ -608,15 +651,70 @@ fn coercionPassthroughThunk(
     guards: bool,
     fault: *bool,
 ) void {
-    _ = self_ptr;
     _ = guards;
     _ = fault;
+    const st: *PdcDelayState = @ptrCast(@alignCast(self_ptr));
     const in_id = op.input_buffer_ids[0];
     const out_id = op.output_buffer_ids[0];
-    const len = plan.buffer_byte_len[out_id];
-    const src = pool[plan.buffer_offset[in_id] .. plan.buffer_offset[in_id] + len];
-    const dst = pool[plan.buffer_offset[out_id] .. plan.buffer_offset[out_id] + len];
-    @memcpy(dst, src);
+    const esz = st.elem_size;
+    const in = pool[plan.buffer_offset[in_id] .. plan.buffer_offset[in_id] + plan.buffer_byte_len[in_id]];
+    const out = pool[plan.buffer_offset[out_id] .. plan.buffer_offset[out_id] + plan.buffer_byte_len[out_id]];
+    const n = plan.buffer_byte_len[out_id] / esz;
+    var p = st.cursor;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const slot = st.ring[p * esz ..][0..esz];
+        const src = in[i * esz ..][0..esz];
+        const dst = out[i * esz ..][0..esz];
+        // out[i] = ring[p] (the element written delay_len ago); then ring[p] = in[i].
+        // `dst`, `slot`, `src` are three distinct buffers (output pool / ring /
+        // input pool — a delay is never in-place-coalesced), so no temporary is
+        // needed and the order is safe for any element size.
+        @memcpy(dst, slot);
+        @memcpy(slot, src);
+        p += 1;
+        if (p == st.delay_len) p = 0;
+    }
+    st.cursor = p;
+}
+
+fn freePdcDelayState(alloc: std.mem.Allocator, self_ptr: *anyopaque) void {
+    const st: *PdcDelayState = @ptrCast(@alignCast(self_ptr));
+    alloc.free(st.ring);
+    alloc.destroy(st);
+}
+
+/// The bound render thunk for an auto-inserted resampler coercion: resample the
+/// producer's `needed_input(N)` input samples to exactly `N` outputs through the
+/// `io.RuntimeResampler` (plane-major f32). The producer's render produced exactly
+/// `needed_input(N)` samples this callback (the dynamic count, set in `renderCurrent`).
+fn resamplerThunk(
+    self_ptr: *anyopaque,
+    pool: [*]u8,
+    op: *const commit.RenderOp,
+    plan: *const RuntimePlan,
+    guards: bool,
+    fault: *bool,
+) void {
+    _ = guards;
+    _ = fault;
+    const rs: *io.RuntimeResampler = @ptrCast(@alignCast(self_ptr));
+    const n_out = op.n_or_pull_spec;
+    const need = rs.needed_input(n_out);
+    const ch = rs.channels;
+    const in_id = op.input_buffer_ids[0];
+    const out_id = op.output_buffer_ids[0];
+    const in_bytes = pool[plan.buffer_offset[in_id] .. plan.buffer_offset[in_id] + ch * need * @sizeOf(f32)];
+    const out_bytes = pool[plan.buffer_offset[out_id] .. plan.buffer_offset[out_id] + ch * n_out * @sizeOf(f32)];
+    const in_f32: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, in_bytes));
+    const out_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, out_bytes));
+    rs.process(in_f32, need, out_f32, n_out);
+}
+
+fn freeRuntimeResampler(alloc: std.mem.Allocator, self_ptr: *anyopaque) void {
+    const rs: *io.RuntimeResampler = @ptrCast(@alignCast(self_ptr));
+    rs.deinit(alloc);
+    alloc.destroy(rs);
 }
 
 /// Build the destroy thunk for `Block`.
@@ -635,9 +733,20 @@ pub fn destroyThunk(comptime Block: type) DestroyThunk {
 /// order. Wait-free — a fixed-bound loop, no allocation, no lock.
 fn replayBound(plan: *const RuntimePlan, pool: []u8, guards: bool, fault: *bool) void {
     const base: [*]u8 = if (pool.len == 0) undefined else pool.ptr;
-    for (plan.ops[0..plan.op_count]) |*op| {
+    // Per-callback element counts: static, except a resampler's producer (overridden
+    // to the resampler's `needed_input`). For a resampler-free graph every entry is
+    // the static count, so the per-op fast path below skips the copy entirely.
+    var n_dyn: [graph.max_nodes]usize = undefined;
+    Engine.dynamicCounts(plan, n_dyn[0..plan.op_count]);
+    for (plan.ops[0..plan.op_count], 0..) |*op, i| {
         const thunk: RenderThunk = @ptrCast(@alignCast(op.fn_ptr.?));
-        thunk(op.self_ptr.?, base, op, plan, guards, fault);
+        if (n_dyn[i] == op.n_or_pull_spec) {
+            thunk(op.self_ptr.?, base, op, plan, guards, fault);
+        } else {
+            var op_copy = op.*;
+            op_copy.n_or_pull_spec = n_dyn[i];
+            thunk(op.self_ptr.?, base, &op_copy, plan, guards, fault);
+        }
     }
 }
 
@@ -837,6 +946,10 @@ pub const Engine = struct {
     /// One bound node per graph node, in node-id order — owns the heap instances
     /// (freed at `deinit`) and the per-node render/destroy/set thunks.
     bound: []BoundNode,
+    /// Per-plan state for nodes the commit pass INSERTED (PDC comp-delay rings) —
+    /// owned here, freed alongside the plan that references them (immediately when
+    /// stopped, after the RCU grace period when running).
+    inserted: []InsertedSlot,
     /// The `schedule` command ring (SPSC). Producer = control thread; consumer =
     /// the render (drained at each callback boundary).
     ring: CommandRing,
@@ -864,8 +977,13 @@ pub const Engine = struct {
         const bound_owned = try alloc.dupe(BoundNode, bound_src);
         errdefer alloc.free(bound_owned);
 
-        const plan = try buildBoundPlan(alloc, ir, bound_owned);
-        errdefer alloc.destroy(plan);
+        const built = try buildBoundPlan(alloc, ir, bound_owned);
+        const plan = built.plan;
+        errdefer {
+            alloc.destroy(plan);
+            for (built.inserted) |s| s.free(alloc, s.ptr);
+            alloc.free(built.inserted);
+        }
 
         // Pre-size the pool for the worst-case N when one is requested. The flat
         // pool is the colored scratch prefix + the persistent feedback tail; BOTH
@@ -886,6 +1004,7 @@ pub const Engine = struct {
             .pool = pool,
             .pool_cap = cap,
             .bound = bound_owned,
+            .inserted = built.inserted,
             .ring = CommandRing.empty,
             .op_count = plan.op_count,
             .footprint_bytes = plan.footprint_bytes,
@@ -900,22 +1019,83 @@ pub const Engine = struct {
     /// an author node to its captured render thunk + heap instance (from `bound`,
     /// indexed by node id), and an inserted coercion node to the built-in coercion
     /// kernel. This is the `op.fn_ptr(op.self_ptr, …)` model the replay invokes.
-    fn buildBoundPlan(alloc: std.mem.Allocator, ir: graph.Graph, bound: []const BoundNode) !*RuntimePlan {
-        const g2 = commit.insertCoercions(ir);
+    /// The bound plan plus the per-plan inserted-node state the engine must own and
+    /// free alongside it (the PDC comp-delay rings + resampler kernels — see
+    /// `InsertedSlot`). The resampler dynamic-count info rides IN the plan ops
+    /// (`is_resampler`/`resampler_producer_op`), so the render is RCU-safe.
+    const BuiltPlan = struct { plan: *RuntimePlan, inserted: []InsertedSlot };
+
+    fn buildBoundPlan(alloc: std.mem.Allocator, ir: graph.Graph, bound: []const BoundNode) !BuiltPlan {
+        // Negotiation (resampler coercions) THEN plugin-delay-compensation: the
+        // runtime path now mirrors `commitRuntime` so a latency-mismatched fan-in is
+        // compensated here too. `insertPdc` is a no-op for any graph without such a
+        // fan-in (every Engine graph to date), so this is inert for them.
+        const g2 = commit.insertPdc(commit.insertCoercions(ir));
         const full = try commit.commitGraph(g2, .colored);
         const plan = try alloc.create(RuntimePlan);
+        errdefer alloc.destroy(plan);
         plan.* = full;
-        for (plan.ops[0..plan.op_count]) |*op| {
+
+        // Count inserted nodes that own state (PDC delays + resampler coercions).
+        var n_inserted: usize = 0;
+        for (g2.nodes[0..g2.node_count]) |node| {
+            if (node.is_pdc or node.is_coercion) n_inserted += 1;
+        }
+        var inserted = try alloc.alloc(InsertedSlot, n_inserted);
+        errdefer alloc.free(inserted);
+        var slot_i: usize = 0;
+        errdefer for (inserted[0..slot_i]) |s| s.free(alloc, s.ptr);
+
+        for (plan.ops[0..plan.op_count], 0..) |*op, op_idx| {
             const nid = op.node_id;
-            if (g2.nodes[nid].is_coercion) {
-                op.fn_ptr = @ptrCast(&coercionPassthroughThunk);
-                op.self_ptr = &coercion_dummy;
+            const node = g2.nodes[nid];
+            if (node.is_pdc) {
+                // A PDC compensating delay: allocate its persistent ring + state and
+                // bind the byte-generic delay kernel. The ring is zero-init (silent
+                // pre-roll, exactly like a `DelayLine` instance).
+                const st = try alloc.create(PdcDelayState);
+                errdefer alloc.destroy(st);
+                const ring = try alloc.alloc(u8, node.delay_len * node.out_elem_size);
+                @memset(ring, 0);
+                st.* = .{ .ring = ring, .elem_size = node.out_elem_size, .delay_len = node.delay_len, .cursor = 0 };
+                op.fn_ptr = @ptrCast(&pdcDelayThunk);
+                op.self_ptr = st;
+                inserted[slot_i] = .{ .ptr = st, .free = freePdcDelayState };
+                slot_i += 1;
+            } else if (node.is_coercion) {
+                // A real sample-rate-conversion resampler coercion: a streaming
+                // polyphase `io.RuntimeResampler` at the node's out_per_in ratio. The
+                // f32-lane channel count is `out_elem_size / @sizeOf(f32)` (the
+                // internal pipeline precision; non-f32 SRC is not auto-inserted).
+                const ch = node.out_elem_size / @sizeOf(f32);
+                const rs = try alloc.create(io.RuntimeResampler);
+                errdefer alloc.destroy(rs);
+                rs.* = try io.RuntimeResampler.init(alloc, node.out_per_in_p, node.out_per_in_q, if (ch == 0) 1 else ch, commit.resampler_half);
+                op.fn_ptr = @ptrCast(&resamplerThunk);
+                op.self_ptr = rs;
+                inserted[slot_i] = .{ .ptr = rs, .free = freeRuntimeResampler };
+                slot_i += 1;
+                // Record the producer op (its output feeds the resampler's input) IN
+                // the plan, so the render overrides its per-callback output count to
+                // the resampler's `needed_input` — the drift-free dynamic count.
+                op.is_resampler = true;
+                op.resampler_producer_op = op_idx; // default self (no producer found)
+                for (plan.ops[0..plan.op_count], 0..) |*pop, pi| {
+                    var found = false;
+                    for (pop.output_buffer_ids[0..pop.output_count]) |oid| {
+                        if (oid == op.input_buffer_ids[0]) found = true;
+                    }
+                    if (found) {
+                        op.resampler_producer_op = pi;
+                        break;
+                    }
+                }
             } else {
                 op.fn_ptr = @ptrCast(bound[nid].render); // RenderThunk → ?*const anyopaque
                 op.self_ptr = bound[nid].self_ptr;
             }
         }
-        return plan;
+        return .{ .plan = plan, .inserted = inserted };
     }
 
     fn allocPool(alloc: std.mem.Allocator, bytes: usize) ![]align(64) u8 {
@@ -943,6 +1123,9 @@ pub const Engine = struct {
         // Free the block instances via their destroy thunks.
         for (self.bound) |b| b.destroy(self.alloc, b.self_ptr);
         self.alloc.free(self.bound);
+        // Free the inserted-node (PDC comp-delay) state.
+        for (self.inserted) |s| s.free(self.alloc, s.ptr);
+        self.alloc.free(self.inserted);
         freePool(self.alloc, self.pool);
         self.alloc.destroy(self.rcu.current());
     }
@@ -999,6 +1182,21 @@ pub const Engine = struct {
         self.ring.drain(self);
         const guards = std.debug.runtime_safety;
         replayBound(plan, self.pool, guards, &self.tele.fault);
+    }
+
+    /// Compute the per-op per-callback element count: the static `n_or_pull_spec`
+    /// for every op, EXCEPT a resampler's producer, whose output count is overridden
+    /// to the resampler's phase-stateful `needed_input(N)` (the drift-free dynamic
+    /// count — a static count drifts for a non-integer ratio). All info is read from
+    /// the RCU-published plan, so this is race-free. For a graph with no resampler
+    /// the result equals `n_or_pull_spec` everywhere (an inert no-op).
+    fn dynamicCounts(plan: *const RuntimePlan, n_dyn: []usize) void {
+        for (plan.ops[0..plan.op_count], 0..) |*op, i| n_dyn[i] = op.n_or_pull_spec;
+        for (plan.ops[0..plan.op_count]) |*op| {
+            if (!op.is_resampler) continue;
+            const rs: *io.RuntimeResampler = @ptrCast(@alignCast(op.self_ptr.?));
+            n_dyn[op.resampler_producer_op] = rs.needed_input(op.n_or_pull_spec);
+        }
     }
 
     /// The schedule-ring consumer hook: apply one command to its target node via
@@ -1096,8 +1294,13 @@ pub const Engine = struct {
     /// only place that allocates; the swap is one release store and the RT-side
     /// consume is one acquire load.
     fn installPlan(self: *Self, new_ir: graph.Graph, new_bound: []const BoundNode) !void {
-        const new_plan = try buildBoundPlan(self.alloc, new_ir, new_bound);
-        errdefer self.alloc.destroy(new_plan);
+        const built = try buildBoundPlan(self.alloc, new_ir, new_bound);
+        const new_plan = built.plan;
+        errdefer {
+            self.alloc.destroy(new_plan);
+            for (built.inserted) |s| s.free(self.alloc, s.ptr);
+            self.alloc.free(built.inserted);
+        }
         if (new_plan.pool_bytes + new_plan.persistent_bytes > self.pool_cap) return error.PoolCapacityExceeded;
 
         // Adopt the new owned bound set, but DON'T free instances the edit dropped
@@ -1107,6 +1310,9 @@ pub const Engine = struct {
         const old_bound = self.bound;
         self.bound = try self.alloc.dupe(BoundNode, new_bound);
         self.ir = new_ir;
+
+        const old_inserted = self.inserted;
+        self.inserted = built.inserted;
 
         const at_swap = self.rcu.epochNow();
         const old = self.rcu.publish(new_plan); // (W) release store — the swap
@@ -1118,6 +1324,10 @@ pub const Engine = struct {
         // callback boundary crossed) before freeing.
         if (self.running.load(.acquire)) self.rcu.waitGrace(at_swap);
         self.alloc.destroy(old); // safe: no callback can still hold `old`
+        // The old plan's inserted-node (PDC comp-delay) state is referenced only by
+        // the old plan's ops, so it is now safe to free too.
+        for (old_inserted) |s| s.free(self.alloc, s.ptr);
+        self.alloc.free(old_inserted);
 
         // Now no callback can hold the old plan, so instances it dropped are safe to
         // free.
@@ -1148,8 +1358,15 @@ pub const Engine = struct {
     pub fn reconfigure(self: *Self, block_size: usize) !void {
         var new_ir = self.ir;
         new_ir.block_size = block_size;
-        const new_plan = try buildBoundPlan(self.alloc, new_ir, self.bound);
-        errdefer self.alloc.destroy(new_plan);
+        const built = try buildBoundPlan(self.alloc, new_ir, self.bound);
+        const new_plan = built.plan;
+        errdefer {
+            self.alloc.destroy(new_plan);
+            for (built.inserted) |s| s.free(self.alloc, s.ptr);
+            self.alloc.free(built.inserted);
+        }
+        const old_inserted = self.inserted;
+        self.inserted = built.inserted;
 
         const new_total = new_plan.pool_bytes + new_plan.persistent_bytes;
         if (new_total <= self.pool_cap) {
@@ -1171,6 +1388,9 @@ pub const Engine = struct {
             self.pool = new_pool;
             self.pool_cap = new_total;
         }
+        // The old plan is gone; free its inserted-node (PDC comp-delay) state.
+        for (old_inserted) |s| s.free(self.alloc, s.ptr);
+        self.alloc.free(old_inserted);
         self.ir = new_ir;
         self.cfg.block_size = block_size;
         self.op_count = new_plan.op_count;

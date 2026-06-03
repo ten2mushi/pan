@@ -277,6 +277,75 @@ pub fn renderAliased(
     mux.updateOutputBuffer(0, shared.len * esz);
 }
 
+// --- Rate-block render drivers (pull(in, want, out)) -----------------------
+//
+// A `Rate` transducer changes element type and rate across the seam, so its
+// driver is generic over `(In, Out)`. It carries internal ring state, so the same
+// block instance driven in different input chunkings must yield the same total
+// output (mux-independence / sub-block invariance) — that equivalence IS the
+// dual-mux property for a stateful Rate block. Both drivers go through the byte-
+// typed SampleMux vtable (push vs pull), exactly as the Map drivers do.
+
+/// Drive `blk.pull` under PUSH semantics (`TestSampleMux`): a fresh mux per input
+/// chunk; each call produces into the output tail. Returns total produced.
+pub fn renderRatePush(
+    comptime Block: type,
+    comptime In: type,
+    comptime Out: type,
+    blk: *Block,
+    in: []const In,
+    out: []Out,
+    in_chunk: usize,
+) usize {
+    var produced: usize = 0;
+    var i: usize = 0;
+    while (i < in.len) {
+        const c = @min(in_chunk, in.len - i);
+        var tm = pan.TestSampleMux{
+            .input = bytesOfConst(In, in[i .. i + c]),
+            .output = bytesOf(Out, out[produced..]),
+        };
+        const mux = tm.sampleMux();
+        const src = samplesOfConst(In, mux.getInputBuffer(0));
+        const dst = samplesOf(Out, mux.getOutputBuffer(0));
+        produced += blk.pull(src, dst.len, dst);
+        i += c;
+    }
+    return produced;
+}
+
+/// Drive `blk.pull` under PULL semantics (`PullTestSampleMux`): one mux over the
+/// whole buffer, cursors advanced by the consumed input / produced output.
+pub fn renderRatePull(
+    comptime Block: type,
+    comptime In: type,
+    comptime Out: type,
+    blk: *Block,
+    in: []const In,
+    out: []Out,
+    in_chunk: usize,
+) usize {
+    const in_esz = @sizeOf(In);
+    const out_esz = @sizeOf(Out);
+    var pm = pan.PullTestSampleMux{
+        .input = bytesOfConst(In, in),
+        .output = bytesOf(Out, out),
+    };
+    const mux = pm.sampleMux();
+    var produced: usize = 0;
+    while (mux.getInputAvailable(0) / in_esz > 0) {
+        const avail = mux.getInputAvailable(0) / in_esz;
+        const c = @min(in_chunk, avail);
+        const src = samplesOfConst(In, mux.getInputBuffer(0))[0..c];
+        const dst = samplesOf(Out, mux.getOutputBuffer(0));
+        const made = blk.pull(src, dst.len, dst);
+        produced += made;
+        mux.updateInputBuffer(0, c * in_esz);
+        mux.updateOutputBuffer(0, made * out_esz);
+    }
+    return produced;
+}
+
 // --- deterministic synthetic test signals ---------------------------------
 
 /// A reproducible white-ish signal in [-1, 1). Mirrors the generator's intent

@@ -211,9 +211,11 @@ pub fn isSource(comptime Block: type) bool {
         return switch (classify(Block)) {
             .Map => mapPortCounts(Block).inputs == 0,
             // A stream/sample source is a Rate whose `pull` reads a backing
-            // store rather than an upstream edge; its zero-input-ness is a
-            // graph-shape property checked at commit, not a signature property.
-            .Rate, .VariRate => false,
+            // store rather than an upstream edge — its signature has ZERO sample
+            // input ports (`pull(self, want, out)`), exactly as a generator Map
+            // has zero input slices. A mid-graph transducer (`pull(self, in,
+            // want, out)`) has one input port and is NOT a source.
+            .Rate, .VariRate => rateInputCount(Block) == 0,
         };
     }
 }
@@ -286,11 +288,71 @@ pub fn MapInPortAt(comptime Block: type, comptime i: usize) type {
     return PortId(Block, .in, MapInElemAt(Block, i));
 }
 
-/// The element on a `Rate`/`VariRate` block's output port — `pull(self, want,
-/// out)`, param index 2. The `out` port may be a planar view or a plain slice.
+/// Is `ParamT` a SAMPLE PORT param (a slice or a planar view), as opposed to a
+/// scalar like the `want: usize` demand? A `Rate`'s `pull` interleaves the demand
+/// scalar among its port slices, so port scanning must skip the non-port params.
+/// Exposed so the executor's kernel-arg builder classifies `pull`/`process` params
+/// the same way the port machinery does.
+pub fn isPortParam(comptime ParamT: type) bool {
+    if (types.isPlanarView(ParamT)) return true;
+    const info = @typeInfo(ParamT);
+    return info == .pointer and info.pointer.size == .slice;
+}
+
+/// The element on a `Rate`/`VariRate` block's OUTPUT port — the first MUTABLE
+/// port (a `[]Out` slice or a `Planar` view) among `pull`'s params after `self`.
+/// Scanning for the output port (rather than a fixed index) accepts BOTH the
+/// zero-input source shape `pull(self, want, out)` and the mid-graph transducer
+/// shape `pull(self, in, want, out)` — the `want: usize` demand is skipped as a
+/// non-port param, and a const input slice is skipped as an input port.
 pub fn RateOutElem(comptime Block: type) type {
     const f = @typeInfo(@TypeOf(Block.pull)).@"fn";
-    return portOfParam(f.params[2].type.?).Elem;
+    inline for (f.params[1..]) |p| {
+        const ParamT = p.type.?;
+        if (comptime !isPortParam(ParamT)) continue;
+        const pinfo = portOfParam(ParamT);
+        if (pinfo.dir == .out) return pinfo.Elem;
+    }
+    @compileError("pan: " ++ @typeName(Block) ++ " has no Rate output port in pull()");
+}
+
+/// The element on a mid-graph `Rate`/`VariRate` block's (first) sample INPUT port
+/// — the first CONST port (`[]const In` slice or `PlanarConst` view) among
+/// `pull`'s params. A zero-input Rate SOURCE (`pull(self, want, out)`) has none,
+/// which is a compile error here (callers gate on `mapInputCount`-style counts).
+pub fn RateInElem(comptime Block: type) type {
+    const f = @typeInfo(@TypeOf(Block.pull)).@"fn";
+    inline for (f.params[1..]) |p| {
+        const ParamT = p.type.?;
+        if (comptime !isPortParam(ParamT)) continue;
+        const pinfo = portOfParam(ParamT);
+        if (pinfo.dir == .in) return pinfo.Elem;
+    }
+    @compileError("pan: " ++ @typeName(Block) ++ " has no Rate sample input port (is it a Source?)");
+}
+
+/// How many sample INPUT ports a `Rate` block's `pull` declares (0 for a source).
+pub fn rateInputCount(comptime Block: type) comptime_int {
+    const f = @typeInfo(@TypeOf(Block.pull)).@"fn";
+    comptime var n: comptime_int = 0;
+    inline for (f.params[1..]) |p| {
+        const ParamT = p.type.?;
+        if (comptime !isPortParam(ParamT)) continue;
+        if (portOfParam(ParamT).dir == .in) n += 1;
+    }
+    return n;
+}
+
+/// Mint the input `PortId` for a mid-graph `Rate` block (`node.in`).
+pub fn RateInPort(comptime Block: type) type {
+    checkPortCeiling(1, .in);
+    return PortId(Block, .in, RateInElem(Block));
+}
+
+/// Mint the output `PortId` for a `Rate`/`VariRate` block (`node.out`).
+pub fn RateOutPort(comptime Block: type) type {
+    checkPortCeiling(1, .out);
+    return PortId(Block, .out, RateOutElem(Block));
 }
 
 // --- named-input (Concat / fan-in by name) minting ------------------------
@@ -393,6 +455,44 @@ test "classify: a complete Rate is Rate; a VariRate is VariRate" {
     };
     try std.testing.expect(classify(Asrc) == .VariRate);
     try std.testing.expect(RateOutElem(Asrc) == types.Sample(f32));
+}
+
+test "Rate ports: source pull(want,out) vs mid-graph pull(in,want,out)" {
+    // A zero-input Rate SOURCE: out read despite no input; classified a Source.
+    const StreamSrc = struct {
+        const Self = @This();
+        pub const out_per_in = .{ 1, 1 };
+        pub const algorithmic_latency: usize = 0;
+        pub fn pull(self: *Self, want: usize, out: []types.Sample(f32)) usize {
+            _ = self;
+            _ = out;
+            return want;
+        }
+    };
+    try std.testing.expect(classify(StreamSrc) == .Rate);
+    try std.testing.expect(comptime isSource(StreamSrc));
+    try std.testing.expectEqual(@as(comptime_int, 0), rateInputCount(StreamSrc));
+    try std.testing.expect(RateOutElem(StreamSrc) == types.Sample(f32));
+
+    // A mid-graph Rate transducer: one const input port + the want demand + out.
+    const Resamp = struct {
+        const Self = @This();
+        pub const out_per_in = .{ 2, 1 };
+        pub const algorithmic_latency: usize = 4;
+        pub fn pull(self: *Self, in: []const types.Sample(f32), want: usize, out: []types.Sample(f32)) usize {
+            _ = self;
+            _ = in;
+            _ = out;
+            return want;
+        }
+    };
+    try std.testing.expect(classify(Resamp) == .Rate);
+    try std.testing.expect(!comptime isSource(Resamp));
+    try std.testing.expectEqual(@as(comptime_int, 1), rateInputCount(Resamp));
+    try std.testing.expect(RateInElem(Resamp) == types.Sample(f32));
+    try std.testing.expect(RateOutElem(Resamp) == types.Sample(f32));
+    try std.testing.expect(RateInPort(Resamp).direction == .in);
+    try std.testing.expect(RateOutPort(Resamp).direction == .out);
 }
 
 test "isSource: a zero-sample-input generator Map is a Source" {

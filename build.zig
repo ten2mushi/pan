@@ -94,6 +94,11 @@ pub fn build(b: *std.Build) void {
         "tests/schroeder_reverb_test.zig",
         "tests/paranoid_poison_test.zig",
         "tests/example_a_coloring_test.zig",
+        "tests/spectral_test.zig",
+        "tests/pdc_test.zig",
+        "tests/spectral_yoneda_test.zig",
+        "tests/pdc_yoneda_test.zig",
+        "tests/spectral_gold_test.zig",
     };
     for (harnesses) |path| {
         const h_mod = b.createModule(.{
@@ -106,6 +111,23 @@ pub fn build(b: *std.Build) void {
         const h_test = b.addTest(.{ .root_module = h_mod });
         test_step.dependOn(&b.addRunArtifact(h_test).step);
     }
+
+    // ---- Negative-compile gate: the P8 "missing Rate declaration" build error
+    // The gate criterion "a Rate missing a declaration is a build error" is enforced
+    // by `port.classify`'s `@compileError`; this turns it from a by-inspection
+    // disabled stub into an ACTIVE check by compiling a fixture that MUST fail and
+    // asserting a non-zero `zig build-obj` exit. If the fixture ever compiles, the
+    // gate regressed and this step fails (expected exit 1, got 0).
+    const neg = b.addSystemCommand(&.{
+        b.graph.zig_exe,      "build-obj", "-fno-emit-bin",
+        "--dep",              "pan",       "-Mroot=tests/negative/missing_latency.zig",
+        "-Mpan=src/root.zig",
+    });
+    neg.expectExitCode(1);
+    neg.has_side_effects = true; // always re-run (it produces no cacheable output)
+    const neg_step = b.step("neg-compile", "Assert the missing-Rate-declaration build error fires (P8 gate)");
+    neg_step.dependOn(&neg.step);
+    test_step.dependOn(&neg.step);
 
     // ---- Freestanding ReleaseSmall smoke object ------------------------
     // Proves the commit pass evaluates at comptime against a no-std target —
@@ -168,6 +190,7 @@ pub fn build(b: *std.Build) void {
         "bench/dsp_chain.zig",
         "bench/feedback_bench.zig",
         "bench/coloring_bench.zig",
+        "bench/spectral_bench.zig",
     };
     for (benches) |path| {
         const bench_mod = b.createModule(.{

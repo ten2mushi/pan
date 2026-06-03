@@ -171,9 +171,11 @@ test "classifier: rate_bounds dominates pull/out_per_in (VariRate is checked fir
 
 // ===========================================================================
 // SOURCE DETECTION (catalog §2.7, ⊢)
-//   Map with ZERO sample-input ports ⇒ isSource == true
-//   ordinary in→out Map              ⇒ isSource == false
-//   Rate / VariRate                  ⇒ isSource == false (always, per src)
+//   Map  with ZERO sample-input ports ⇒ isSource == true
+//   ordinary in→out Map               ⇒ isSource == false
+//   Rate with ZERO sample-input ports ⇒ isSource == true  (a stream source, SR2:
+//        `pull(self, want, out)` reads a backing store, not an upstream edge)
+//   Rate with a sample-input port     ⇒ isSource == false (a mid-graph transducer)
 // ===========================================================================
 
 test "source: zero-sample-input generator Map is a Source (catalog §2.7, ⊢)" {
@@ -185,12 +187,28 @@ test "source: an ordinary in→out Map is not a Source (catalog §2.7, ⊢)" {
     try expect(!comptime port.isSource(MapFft));
 }
 
-test "source: Rate and VariRate are never Sources by signature (catalog §2.7, ⊢)" {
-    // Zero-input-ness for a Rate is a graph-shape property checked at commit,
-    // not a signature property — so isSource is unconditionally false here.
-    try expect(!comptime port.isSource(RateDecim));
-    try expect(!comptime port.isSource(VariResample));
-    try expect(!comptime port.isSource(RateFeature));
+test "source: a zero-input Rate is a stream Source; a Rate with an input port is not (SR2, ⊢)" {
+    // SR2: a stream/sample source IS a Rate whose `pull(self, want, out)` has zero
+    // sample-input ports (it reads a backing store) — structurally a source, just
+    // as a generator Map with zero input slices is. These abstract blocks declare
+    // exactly that shape.
+    try expect(comptime port.isSource(RateDecim));
+    try expect(comptime port.isSource(VariResample));
+    try expect(comptime port.isSource(RateFeature));
+    // A mid-graph Rate transducer (`pull(self, in, want, out)`) has an input port,
+    // so it is NOT a source.
+    const RateThru = struct {
+        const Self = @This();
+        pub const out_per_in = .{ 1, 2 };
+        pub const algorithmic_latency: usize = 0;
+        pub fn pull(self: *Self, in: []const types.Sample(f32), want: usize, out: []types.Sample(f32)) usize {
+            _ = self;
+            _ = in;
+            _ = out;
+            return want;
+        }
+    };
+    try expect(!comptime port.isSource(RateThru));
 }
 
 test "source: MapOutElem still reads the output of a source despite no input (⊢)" {

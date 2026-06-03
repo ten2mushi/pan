@@ -77,6 +77,11 @@ pub const commitComptimeMode = commit.commitComptimeMode;
 pub const commitRuntime = commit.commitRuntime;
 pub const commitGraph = commit.commitGraph;
 pub const insertCoercions = commit.insertCoercions;
+/// The plugin-delay-compensation pass: per-rate-domain longest-path DP that inserts
+/// compensating `DelayLine`s on the shorter inputs of a latency-mismatched fan-in
+/// (and routes a bypassed latent block's delay), so parallel branches re-align
+/// sample-accurately. Run by `commitRuntime`; usable directly for a comptime commit.
+pub const insertPdc = commit.insertPdc;
 
 /// The developer-facing graph builder — `pan.Graph.init / add / connect /
 /// commit`. Wraps the IR and the commit pass.
@@ -156,10 +161,22 @@ pub const KarplusStrong = fx.KarplusStrong;
 pub const Ladder = fx.Ladder;
 pub const FdnMatrix = fx.FdnMatrix;
 
+/// The rate-elastic seam — `Rate` blocks where output-per-input ≠ the algorithmic
+/// latency: the `Framer`/`Stft`/`iStft` analysis-synthesis pair (radix-2 FFT, Hann
+/// COLA reconstruction), the type-changing `PowerSpectrum` `Map`, and a windowed-
+/// sinc rational `Resampler`. The blocks the per-rate-domain PDC pass compensates.
+pub const spectral = @import("spectral.zig");
+pub const Spectrum = spectral.Spectrum;
+pub const TimeFrame = spectral.TimeFrame;
+pub const Framer = spectral.Framer;
+pub const Stft = spectral.Stft;
+pub const iStft = spectral.iStft;
+pub const PowerSpectrum = spectral.PowerSpectrum;
+pub const Resampler = spectral.Resampler;
+
 // Layered-library roots filled by later phases.
 pub const gen = struct {};
 pub const env = struct {};
-pub const spectral = struct {};
 pub const feat = struct {};
 pub const mix = struct {};
 pub const synth = struct {};
