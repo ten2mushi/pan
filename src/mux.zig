@@ -7,6 +7,14 @@
 //! Implemented as the type-erased `ptr + vtable` idiom. The element type is
 //! erased to `[]u8` byte-slices at the seam; the block's typed wrapper recovers
 //! `[]A`.
+//!
+//! These realisations are single-port-per-direction: the `port` index is part of
+//! the fixed seam signature, and it is HONOURED, not silently ignored — every
+//! method asserts `port == 0`, so wiring a multi-port block through one of these
+//! before a real multi-port transport exists fails loud (in safe builds) rather
+//! than quietly returning port-0's buffer. Per-port demultiplexing arrives with
+//! the demand-tracking executor and the first multi-port block; until then the
+//! one-port contract is explicit and checked.
 
 const std = @import("std");
 
@@ -98,47 +106,47 @@ pub const TestSampleMux = struct {
 
     fn waitInputAvailable(ptr: *anyopaque, port: usize, n: usize) void {
         _ = ptr;
-        _ = port;
+        std.debug.assert(port == 0);
         _ = n;
     }
     fn getInputAvailable(ptr: *anyopaque, port: usize) usize {
-        _ = port;
+        std.debug.assert(port == 0);
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.input.len;
     }
     fn getOutputAvailable(ptr: *anyopaque, port: usize) usize {
-        _ = port;
+        std.debug.assert(port == 0);
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.output.len;
     }
     fn getInputBuffer(ptr: *anyopaque, port: usize) []const u8 {
-        _ = port;
+        std.debug.assert(port == 0);
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.input;
     }
     fn getOutputBuffer(ptr: *anyopaque, port: usize) []u8 {
-        _ = port;
+        std.debug.assert(port == 0);
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.output;
     }
     fn updateInputBuffer(ptr: *anyopaque, port: usize, n: usize) void {
         _ = ptr;
-        _ = port;
+        std.debug.assert(port == 0);
         _ = n;
     }
     fn updateOutputBuffer(ptr: *anyopaque, port: usize, n: usize) void {
         _ = ptr;
-        _ = port;
+        std.debug.assert(port == 0);
         _ = n;
     }
     fn waitOutputAvailable(ptr: *anyopaque, port: usize, n: usize) void {
         _ = ptr;
-        _ = port;
+        std.debug.assert(port == 0);
         _ = n;
     }
     fn getNumReadersForOutput(ptr: *anyopaque, port: usize) usize {
         _ = ptr;
-        _ = port;
+        std.debug.assert(port == 0);
         return 1;
     }
     fn setEOS(ptr: *anyopaque) void {
@@ -178,47 +186,47 @@ pub const PullSampleMux = struct {
     // Pull semantics: wait* return immediately, update* are no-ops.
     fn waitInputAvailable(ptr: *anyopaque, port: usize, n: usize) void {
         _ = ptr;
-        _ = port;
+        std.debug.assert(port == 0);
         _ = n;
     }
     fn waitOutputAvailable(ptr: *anyopaque, port: usize, n: usize) void {
         _ = ptr;
-        _ = port;
+        std.debug.assert(port == 0);
         _ = n;
     }
     fn getInputAvailable(ptr: *anyopaque, port: usize) usize {
-        _ = port;
+        std.debug.assert(port == 0);
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.in_buf.len;
     }
     fn getOutputAvailable(ptr: *anyopaque, port: usize) usize {
-        _ = port;
+        std.debug.assert(port == 0);
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.out_buf.len;
     }
     fn getInputBuffer(ptr: *anyopaque, port: usize) []const u8 {
-        _ = port;
+        std.debug.assert(port == 0);
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.in_buf;
     }
     fn getOutputBuffer(ptr: *anyopaque, port: usize) []u8 {
-        _ = port;
+        std.debug.assert(port == 0);
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.out_buf;
     }
     fn updateInputBuffer(ptr: *anyopaque, port: usize, n: usize) void {
         _ = ptr;
-        _ = port;
+        std.debug.assert(port == 0);
         _ = n;
     }
     fn updateOutputBuffer(ptr: *anyopaque, port: usize, n: usize) void {
         _ = ptr;
-        _ = port;
+        std.debug.assert(port == 0);
         _ = n;
     }
     fn getNumReadersForOutput(ptr: *anyopaque, port: usize) usize {
         _ = ptr;
-        _ = port;
+        std.debug.assert(port == 0);
         return 1;
     }
     fn setEOS(ptr: *anyopaque) void {
@@ -260,47 +268,47 @@ pub const PullTestSampleMux = struct {
 
     fn waitInputAvailable(ptr: *anyopaque, port: usize, n: usize) void {
         _ = ptr;
-        _ = port;
+        std.debug.assert(port == 0);
         _ = n;
     }
     fn waitOutputAvailable(ptr: *anyopaque, port: usize, n: usize) void {
         _ = ptr;
-        _ = port;
+        std.debug.assert(port == 0);
         _ = n;
     }
     fn getInputAvailable(ptr: *anyopaque, port: usize) usize {
-        _ = port;
+        std.debug.assert(port == 0);
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.input.len - self.in_cursor;
     }
     fn getOutputAvailable(ptr: *anyopaque, port: usize) usize {
-        _ = port;
+        std.debug.assert(port == 0);
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.output.len - self.out_cursor;
     }
     fn getInputBuffer(ptr: *anyopaque, port: usize) []const u8 {
-        _ = port;
+        std.debug.assert(port == 0);
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.input[self.in_cursor..];
     }
     fn getOutputBuffer(ptr: *anyopaque, port: usize) []u8 {
-        _ = port;
+        std.debug.assert(port == 0);
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.output[self.out_cursor..];
     }
     fn updateInputBuffer(ptr: *anyopaque, port: usize, n: usize) void {
-        _ = port;
+        std.debug.assert(port == 0);
         const self: *Self = @ptrCast(@alignCast(ptr));
         self.in_cursor += n;
     }
     fn updateOutputBuffer(ptr: *anyopaque, port: usize, n: usize) void {
-        _ = port;
+        std.debug.assert(port == 0);
         const self: *Self = @ptrCast(@alignCast(ptr));
         self.out_cursor += n;
     }
     fn getNumReadersForOutput(ptr: *anyopaque, port: usize) usize {
         _ = ptr;
-        _ = port;
+        std.debug.assert(port == 0);
         return 1;
     }
     fn setEOS(ptr: *anyopaque) void {
@@ -342,47 +350,47 @@ pub const RingSampleMux = struct {
 
     fn waitInputAvailable(ptr: *anyopaque, port: usize, n: usize) void {
         _ = ptr;
-        _ = port;
+        std.debug.assert(port == 0);
         _ = n;
     }
     fn waitOutputAvailable(ptr: *anyopaque, port: usize, n: usize) void {
         _ = ptr;
-        _ = port;
+        std.debug.assert(port == 0);
         _ = n;
     }
     fn getInputAvailable(ptr: *anyopaque, port: usize) usize {
-        _ = port;
+        std.debug.assert(port == 0);
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.in_buf.len - self.in_cursor;
     }
     fn getOutputAvailable(ptr: *anyopaque, port: usize) usize {
-        _ = port;
+        std.debug.assert(port == 0);
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.out_buf.len - self.out_cursor;
     }
     fn getInputBuffer(ptr: *anyopaque, port: usize) []const u8 {
-        _ = port;
+        std.debug.assert(port == 0);
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.in_buf[self.in_cursor..];
     }
     fn getOutputBuffer(ptr: *anyopaque, port: usize) []u8 {
-        _ = port;
+        std.debug.assert(port == 0);
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.out_buf[self.out_cursor..];
     }
     fn updateInputBuffer(ptr: *anyopaque, port: usize, n: usize) void {
-        _ = port;
+        std.debug.assert(port == 0);
         const self: *Self = @ptrCast(@alignCast(ptr));
         self.in_cursor += n;
     }
     fn updateOutputBuffer(ptr: *anyopaque, port: usize, n: usize) void {
-        _ = port;
+        std.debug.assert(port == 0);
         const self: *Self = @ptrCast(@alignCast(ptr));
         self.out_cursor += n;
     }
     fn getNumReadersForOutput(ptr: *anyopaque, port: usize) usize {
         _ = ptr;
-        _ = port;
+        std.debug.assert(port == 0);
         return 1;
     }
     fn setEOS(ptr: *anyopaque) void {

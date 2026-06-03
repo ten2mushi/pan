@@ -55,6 +55,15 @@ pub fn build(b: *std.Build) void {
     const harnesses = [_][]const u8{
         "tests/type_machinery_test.zig",
         "tests/port_machinery_test.zig",
+        "tests/mux_machinery_test.zig",
+        "tests/gold_vector_test.zig",
+        "tests/dual_mux_test.zig",
+        "tests/comparator_test.zig",
+        "tests/bc_differential_test.zig",
+        "tests/aliasing_test.zig",
+        "tests/aliasing_message_test.zig",
+        "tests/latency_contract_test.zig",
+        "tests/state_granularity_test.zig",
     };
     for (harnesses) |path| {
         const h_mod = b.createModule(.{

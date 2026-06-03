@@ -122,6 +122,47 @@ Flocq (`catalog.md` §13), automatic loop-fusion (`catalog.md` T2 / `pan_memory_
 block-size-1 subgraph combinator (`catalog.md` §5.4), and the concrete-MCU target
 (`catalog.md` §9.3 locks "target-generic / freestanding stub").
 
+### 0.9 The benchmark surface (measurement, not correctness — stood up from Phase 4)
+
+Alongside the `tests/` correctness backbone, a **`bench/`** surface quantifies the brief's four core
+requirements — **maximize throughput, minimize latency, minimize memory, minimize disk** — against real
+committed plans. A benchmark **measures**; it never asserts an oracle match (correctness stays in
+`tests/` under the ⊢/≈/▷ tiers; the zero-hot-path-allocation and footprint-is-comptime-constant
+*assertions* live there, Yoneda-dispatched — a bench only reports numbers, never asserts inside timed
+code where `assert` is a ReleaseFast no-op). It **stands up at Phase 4** — the first runnable DSP path,
+the way the test backbone stood up at Phase 2: deferred until there is something to measure, then never
+retrofitted. `bench/harness.zig` is the measurement kit (the bench analogue of `tests/harness.zig`; no
+`test {}` blocks; self-contained docs per §0.2): the `std.Io.Clock` timer (`std.time.Timer` is removed
+in 0.16.0), a result-consuming sink (defeat dead-code elimination), an instrumented counting allocator,
+and a byte-traffic counter.
+
+**Metrics.** *Throughput* — frames/s, samples/s/core, MB/s, × realtime (per-block and per-`renderInto`),
+measured across varied contexts **including a stress / heavy-usage mode** (large graphs, max channel
+counts, deep chains, high fan-out/fan-in, sustained load, worst-case topologies) so the library is
+thoroughly stress-tested, not just measured on a happy-path slice. *Latency* — algorithmic (from the
+commit pass) and wall-clock per-callback render time / deadline headroom (the sub-5 ms / zero-xrun
+targets become tracked numbers). *Memory / byte displacement* — **both** quantities, reported
+distinctly: (i) the static H2 **`Plan.footprint_bytes`** (catalog §7.8 formula; comptime constant for a
+comptime graph), and (ii) **byte-displacement-per-render** (Σ over the op-list of bytes read + written)
+— the dynamic cache-traffic that Mode-C coloring and loop-fusion reduce. (i) bounds the `.bss`/pool
+budget; (ii) is what the optimizations move.
+
+**Discipline (skill ch.04 §12).** Benchmark only in the shipped release modes (ReleaseFast primary;
+ReleaseSafe to *price* the safety checks — both via LLVM, never Debug/self-hosted); warm up, many
+iterations, report ns/iter + variance, consume every result; sweep the config axes pan is driven by —
+precision × block size × channels. Each bench reads `engine.telemetry()` and reports `xrun_count`,
+`deadline_headroom`, `per_block_cpu`, `spin_time`, `guards_compiled_out` next to its own wall-clock so
+bench and engine self-telemetry cross-validate.
+
+**Disk-minimal (requirement #4).** Results are printed/streamed, never committed; inputs are generated
+deterministically (no committed blobs); only tiny scalar `bench/baselines/*.json` are committed.
+
+**Cadence & gating.** `bench` is a top-level step building each `bench/*.zig` as a ReleaseFast executable
+importing `pan` (`.paths += "bench"`). It runs **on-demand / nightly, not as the per-commit gate**
+(timing on shared runners is noisy — the §0.6 four-mode correctness matrix stays the commit gate). An
+opt-in `-Dbench-gate` compares against the committed baselines: **footprint regressions fail hard**
+(deterministic), **throughput regressions fail outside a noise band**.
+
 ---
 
 ## Phase 0 — Build system, public API surface, conventions
@@ -407,6 +448,14 @@ I/O-HAL seam** (`-Dtarget=x86_64-linux-gnu`), proving the abstraction holds for 
 requirement (won't compile without it, ⊢); the LPCM codec channel-order round-trip (bit-exact
 permutation). Oracle = SciPy.
 
+**Benchmark (surface stand-up — §0.9).** Replace the placeholder `bench` step and add `bench/` +
+`bench/harness.zig` (ReleaseFast default, `.paths += "bench"`, opt-in `-Dbench-gate`). First numbers:
+per-block ns/iter → frames/s + MB/s for gain/biquad/pan; the 3-block chain per-`renderInto` time vs the
+N/Fs deadline (sub-5 ms headroom on M3); the static `footprint_bytes` baseline (covering the P3 commit
+output) **and** byte-displacement-per-render; a **stress-mode** throughput run (deep chains / max
+channels / sustained load). Sweep precision × block size × channels; cross-check
+`telemetry().deadline_headroom`.
+
 ---
 
 ## Phase 5 — Format negotiation (runtime) + lock-free control plane + ramped parameter
@@ -494,6 +543,10 @@ fused-kernel `z⁻¹` is sample-accurate; `UnitDelay` works across all four elem
 **Yoneda dispatch.** Feedback-SCC validator (assert the error), state-update-granularity (history once
 per hop), reverb-tail stability, FTZ/denormal behaviour (≈). Oracle = SciPy for the LTI tails.
 
+**Benchmark.** Persistent/feedback footprint term (delay-line bytes); fused tight-feedback kernel
+throughput vs the graph-level idiom; the FTZ denormal CPU-spike avoidance measured on a decaying tail
+(with/without FTZ).
+
 ---
 
 ## Phase 7 — Liveness + per-class left-edge coloring (Mode C) + in-place coalescing + B≡C
@@ -532,6 +585,9 @@ quote-back message.
 
 **Yoneda dispatch.** B≡C differential (the *primary* colorer correctness check, ≈) + paranoid mode;
 aliasing (in-place vs non-aliased) with the quote-back contract. Bit-exact (pan-vs-pan).
+
+**Benchmark.** Flagship memory bench: Mode-B per-edge vs Mode-C pool **footprint** reduction % and the
+**byte-displacement-per-render** reduction, behind the same `getBuffer(edge)` interface.
 
 ---
 
@@ -581,6 +637,9 @@ a build error; `error.UndeclaredCycle` vs `error.DelayFreeLoop` distinguished.
 PDC arithmetic across the dry/wet diamond (≈ B6), `needed_input` monotonicity. Oracle = SciPy STFT/
 resampler.
 
+**Benchmark.** STFT/Framer throughput; the PDC comp-delay footprint term; measured impulse group-delay
+as the latency number.
+
 ---
 
 ## Phase 9 — Analysis pull root, typed feature ports, Concat, FeatureCollectorSink, feature chains
@@ -622,6 +681,9 @@ compile error); `FeatureCollectorSink` on an RT root is a commit error; the matr
 **Yoneda dispatch.** Gold-vector for each feature block vs SciPy/librosa-equivalent oracle; `Concat`
 named-wiring type-checks; `FeatureCollectorSink`-on-RT-root commit rejection (⊢ A8). Oracle = SciPy/
 NumPy.
+
+**Benchmark.** Isolation bench: feature collection on the analysis root has **zero effect** on a
+concurrent audio root's `deadline_headroom` (a throughput-isolation measurement, not raw speed).
 
 ---
 
@@ -671,6 +733,9 @@ render fully inlines (no vtable on the hot path).
 **Yoneda dispatch.** The comptime-commit smoke gate (compiling = ⊢ for the smoke graph); q15 bit-exact
 gold vectors; the no-op-token-on-fixed-point API-shape invariance. Compile against a freestanding 0.16.0
 target.
+
+**Benchmark.** q15 footprint in `.bss` (ReleaseSmall freestanding, `footprint_bytes` comptime);
+q15-vs-f32 throughput; instruction-count (real on-device cycles deferred to Phase 19).
 
 ---
 
@@ -783,6 +848,9 @@ a band-limited (PolyBLEP) oracle within tolerance; footprint is a `Vmax`-comptim
 **Yoneda dispatch.** Source generators + anti-aliasing vs band-limited oracle (§5.7g); typed events +
 PolyVoice alloc/stealing/MPE-routing + sample-accurate onset (§5.7h, dual-mux). Oracle = SciPy/PolyBLEP.
 
+**Benchmark.** `Vmax`-bounded polyphony throughput under a **stress** voice load; voice-pool footprint as
+a `Vmax`-comptime constant; zero-xrun-over-10-min as a tracked number.
+
 ---
 
 ## Phase 14 — OfflineBatch (Tier C): pipeline parallelism + data-parallel chunking
@@ -820,6 +888,10 @@ is a commit error; throughput ≥ bottleneck-stage bound. An Instrument timeline
 
 **Yoneda dispatch.** Offline differential (`K=1`≡`K=ncores`; exact vs allclose; no-warmup commit error,
 §5.7d); pipeline bit-reproducibility. Bit-exact pan-vs-pan + SciPy where numeric.
+
+**Benchmark.** Flagship throughput-scaling bench: file→file MB/s and near-linear speedup vs cores
+(chunking + pipeline parallelism), including a **stress** workload; the O2 pre-sized footprint (rings +
+per-chunk pools).
 
 ---
 
@@ -869,6 +941,10 @@ on a wide→narrow→wide graph; auto-demote triggers under induced overload; ze
 **Yoneda dispatch.** Parallel≡sequential (§5.7c, bit-exact + paranoid); cost-model gate decision (⊢
 assert); workgroup bounded-spin under load (B12 telemetry). Compile atomics against 0.16.0.
 
+**Benchmark.** Throughput/headroom scaling vs worker count P (incl. a **stress** graph); per-worker
+`spin_time`; the Tier-B concurrent footprint addendum (`+Σ_worker scratch`); the
+ReleaseSafe-vs-ReleaseFast delta as the priced safety-check cost.
+
 ---
 
 ## Phase 16 — DSP & spatial library buildout + layout negotiation
@@ -911,6 +987,9 @@ block passes gold-vector + dual-mux.
 **Yoneda dispatch.** Layout negotiation (§5.7e: registered matrix allclose + codec round-trip bit-exact
 + unregistered-pair ⊢ rejection); per-block gold vectors + dual-mux for the whole taxonomy. Oracle =
 SciPy.
+
+**Benchmark.** Per-block throughput across the full taxonomy (the standing regression surface, under
+varied / stress inputs); the layout up/down-mix matrix cost.
 
 ---
 
@@ -987,6 +1066,9 @@ is present (catalog §15 entry).
 **Yoneda dispatch.** Fused≡unfused differential (bit-exact); subgraph-combinator≡fused-kernel
 equivalence. Bit-exact pan-vs-pan.
 
+**Benchmark.** The **byte-displacement-per-render** reduction from loop-fusion (the single-pass
+min-traffic win) — fusion's primary performance evidence alongside the B≡C correctness check.
+
 ---
 
 ## Phase 19 — Concrete embedded MCU target + machine-checked & property-based verification  ⚠️ beyond-spec
@@ -1034,6 +1116,9 @@ amendments are present.
 **Yoneda dispatch.** Property-based harness authoring (the three attach points). The TLA+/Lean/Flocq
 artifacts are authored directly (not Zig); pair them with the existing ≈ tests as a cross-check.
 
+**Benchmark.** On-device cycle counts + SRAM-budget footprint — the real-hardware measurement the
+freestanding stub couldn't give at Phase 10.
+
 ---
 
 ## Specification coverage matrix
@@ -1075,6 +1160,7 @@ to a phase (no simplification; spec-deferred items in Phases 18–19 per the 202
 | Ledger ≈ B1–B18 | catalog §12.2 | the per-phase Yoneda gates |
 | Ledger ▷ C1–C18 | catalog §12.3 | authoring obligations surfaced per phase |
 | All harnesses §5.1–§5.7h | testing spec | 2 (backbone), then per gate |
+| Benchmark surface (throughput incl. stress / latency / footprint + byte-displacement) | §0.9; brief 4–8; catalog §7.8; io §10 | 4 (stand-up + first), 6,7,8,9,10,13,14,15,16,18,19 |
 | Block taxonomy (full library + combinators) | bridge §2 | 4,6,8,9,11,12,13,16 |
 | Roadmap steps 1–6,6b,6c,6d | bridge §5 | 4,5,6,7,8,9,10,11,13 |
 | Roadmap steps 8–12 | parallel §6 | 14, 15 |

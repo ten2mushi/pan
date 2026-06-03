@@ -11,13 +11,26 @@ input signal from the manifest seed, computes the SciPy/NumPy *reference*
 (the independent external oracle — catalog.md §0.1, Rule 9), and writes both
 as native-endian raw sample bytes next to the manifest.
 
+On-disk layout: raw native-endian samples, no header, frame-major
+(interleaved: frame 0 all channels, frame 1 all channels, ...). The manifest
+carries shape/precision so the reader needs no in-band metadata. pan stores
+planar internally; the interleave↔planar conversion is an I/O-boundary concern,
+not part of the vector format.
+
 The float oracle is compared by the test harness with numpy.allclose
 (|pan - ref| <= atol + rtol*|ref|); integer/fixed-point is compared bit-exact
-(contract §1). This script must be DETERMINISTIC given (manifest, seed).
+(contract §1). This script MUST be DETERMINISTIC given (manifest, seed): the
+same NumPy RNG seed, dtype, and byte order must reproduce byte-identical blobs
+across machines, or the float tolerance goalposts would silently move. Run
+`generate.py <manifest> --check` to assert that determinism in-process.
+
+Quantization convention (fixed-point, bit-exact target): round-half-to-even
+(np.rint) then saturate to the lane range. The Zig fixed-point kernels must
+match this exactly when they land.
 
 STATUS: starting point (Rule 2 — minimum that solves the problem). Only the
-`Gain` reference is stubbed; add a reference per block as blocks land. Do not
-add speculative machinery here.
+`Gain` reference is stubbed; add a reference per block as blocks land (a biquad
+reference will need SciPy's lfilter). Do not add speculative machinery here.
 """
 
 from __future__ import annotations
@@ -84,8 +97,10 @@ def _quantize(y: np.ndarray, precision: str) -> np.ndarray:
     return np.clip(np.rint(y), info.min, info.max).astype(dt)
 
 
-def generate(manifest_path: pathlib.Path) -> None:
-    manifest = json.loads(manifest_path.read_text())
+def _compute_blobs(manifest: dict, manifest_path: pathlib.Path) -> tuple[bytes, bytes]:
+    """Deterministically compute (input_bytes, expected_bytes) from a manifest.
+    Pure function of (manifest, seed) — the determinism contract lives here, so
+    `--check` can call it twice and assert byte-equality."""
     fmt = manifest["format"]
     precision = fmt["precision"]
     if precision not in _DTYPE:
@@ -96,22 +111,46 @@ def generate(manifest_path: pathlib.Path) -> None:
 
     x = _input_signal(manifest["n_frames"], fmt["channels"], precision, manifest["seed"])
     y = _REFERENCES[block](x, manifest.get("params", {}))
+    # Frame-major (interleaved) native-endian bytes; .tobytes() flattens C-order.
+    return _quantize(x, precision).tobytes(), _quantize(y, precision).tobytes()
+
+
+def generate(manifest_path: pathlib.Path) -> None:
+    manifest = json.loads(manifest_path.read_text())
+    input_bytes, expected_bytes = _compute_blobs(manifest, manifest_path)
 
     out_dir = manifest_path.with_suffix("")  # tests/vectors/<name>/
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Native-endian raw bytes, no header — shape/precision come from the manifest.
-    _quantize(x, precision).tofile(out_dir / "input.bin")
-    _quantize(y, precision).tofile(out_dir / "expected.bin")
+    (out_dir / "input.bin").write_bytes(input_bytes)
+    (out_dir / "expected.bin").write_bytes(expected_bytes)
     print(f"wrote {out_dir}/input.bin and expected.bin "
-          f"({manifest['n_frames']} frames x {fmt['channels']} ch, {precision})")
+          f"({manifest['n_frames']} frames x {manifest['format']['channels']} ch, "
+          f"{manifest['format']['precision']})")
+
+
+def check(manifest_path: pathlib.Path) -> None:
+    """Assert the generator is byte-reproducible: compute the blobs twice and
+    fail loud on any drift (Rule 12 — the determinism contract is executable)."""
+    manifest = json.loads(manifest_path.read_text())
+    a = _compute_blobs(manifest, manifest_path)
+    b = _compute_blobs(manifest, manifest_path)
+    if a != b:
+        sys.exit(f"DETERMINISM VIOLATION: {manifest_path} produced differing blobs across two runs")
+    print(f"ok: {manifest_path.name} is byte-reproducible "
+          f"(input {len(a[0])} B, expected {len(a[1])} B)")
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="pan gold-vector generator (skeleton).")
+    ap = argparse.ArgumentParser(description="pan gold-vector generator.")
     ap.add_argument("manifest", type=pathlib.Path,
                     help="path to a vector manifest JSON (e.g. tests/vectors/gain_f32.json)")
-    generate(ap.parse_args().manifest)
+    ap.add_argument("--check", action="store_true",
+                    help="assert byte-reproducibility across two runs instead of writing blobs")
+    args = ap.parse_args()
+    if args.check:
+        check(args.manifest)
+    else:
+        generate(args.manifest)
 
 
 if __name__ == "__main__":
