@@ -1,0 +1,11 @@
+{
+  "name": "adsr_f32",
+  "block": "Adsr",
+  "format": { "sample_rate": 48000, "precision": "f32", "channels": 1, "block_size": 8 },
+  "out_per_in": "1:1",
+  "algorithmic_latency": 0,
+  "seed": 2,
+  "n_frames": 256,
+  "params": { "block_size": 8, "attack_inc": 0.03125, "decay_inc": 0.015625, "sustain": 0.5, "release_inc": 0.0078125, "gate_on_blocks": 20 },
+  "tolerance": { "atol": 1e-5, "rtol": 1e-5 }
+}

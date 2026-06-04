@@ -1,0 +1,11 @@
+{
+  "name": "lfo_f32",
+  "block": "Lfo",
+  "format": { "sample_rate": 48000, "precision": "f32", "channels": 1, "block_size": 16 },
+  "out_per_in": "1:1",
+  "algorithmic_latency": 0,
+  "seed": 1,
+  "n_frames": 256,
+  "params": { "block_size": 16, "increment": 0.013, "amplitude": 0.4, "offset": 0.5, "waveform": "sine" },
+  "tolerance": { "atol": 1e-6, "rtol": 1e-5 }
+}

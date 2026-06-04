@@ -142,11 +142,98 @@ def _ref_resampler(x: np.ndarray, params: dict) -> np.ndarray:
 # `scipy.fft.rfft` directly (run on demand; not part of the hermetic `zig build test`).
 
 
+def _lfo_wave(wf: str, p: float) -> float:
+    """The unit LFO waveform at normalized phase p in [0, 1), range [-1, 1]."""
+    if wf == "sine":
+        return float(np.sin(2.0 * np.pi * p))
+    if wf == "triangle":
+        return (4.0 * p - 1.0) if p < 0.5 else (3.0 - 4.0 * p)
+    if wf == "saw":
+        return 2.0 * p - 1.0
+    if wf == "square":
+        return 1.0 if p < 0.5 else -1.0
+    sys.exit(f"unknown LFO waveform {wf!r}")
+
+
+def _ref_lfo(x: np.ndarray, params: dict) -> np.ndarray:
+    """Control-rate LFO reference (a SOURCE — the input x is ignored, only its
+    n_frames shape is used). The block emits ONE value per render call (the wave at
+    the block-start phase) broadcast across the whole block, then advances the phase
+    by block_size*increment, wrapping into [0, 1). This mirrors that recurrence in
+    f64; the f32-vs-f64 sin gap is forgiven by the manifest's allclose tolerance
+    (Rule 9 — the oracle stays an independent external truth)."""
+    n = x.shape[0]
+    blk = int(params["block_size"])
+    inc = float(params["increment"])
+    amp = float(params["amplitude"])
+    off = float(params["offset"])
+    wf = params.get("waveform", "sine")
+    y = np.zeros((n, 1), dtype=np.float64)
+    phase = 0.0
+    k = 0
+    while (k + 1) * blk <= n:
+        y[k * blk:(k + 1) * blk, 0] = off + amp * _lfo_wave(wf, phase)
+        phase += blk * inc
+        phase -= np.floor(phase)
+        k += 1
+    return y
+
+
+def _ref_adsr(x: np.ndarray, params: dict) -> np.ndarray:
+    """Control-rate ADSR reference (a SOURCE; x ignored but for its n_frames). Emits
+    the block-start envelope level (broadcast), then integrates the per-sample
+    attack/decay/sustain/release state machine block_size samples so a mid-block
+    segment crossover lands correctly. The gate is held ON for the first
+    `gate_on_blocks` blocks, then released. The increments are chosen exact in f32
+    (powers of two) so the f64 oracle and the f32 kernel agree within allclose."""
+    n = x.shape[0]
+    blk = int(params["block_size"])
+    a_inc = float(params["attack_inc"])
+    d_inc = float(params["decay_inc"])
+    sus = float(params["sustain"])
+    r_inc = float(params["release_inc"])
+    n_blocks = n // blk
+    gate_on = int(params.get("gate_on_blocks", n_blocks))
+    y = np.zeros((n, 1), dtype=np.float64)
+    level = 0.0
+    stage = "idle"
+    for k in range(n_blocks):
+        held = k < gate_on
+        if held:
+            if stage in ("idle", "release"):
+                stage = "attack"
+        else:
+            if stage != "idle":
+                stage = "release"
+        y[k * blk:(k + 1) * blk, 0] = level
+        for _ in range(blk):
+            if stage == "attack":
+                level += a_inc
+                if level >= 1.0:
+                    level = 1.0
+                    stage = "decay"
+            elif stage == "decay":
+                level -= d_inc
+                if level <= sus:
+                    level = sus
+                    stage = "sustain"
+            elif stage == "sustain":
+                level = sus
+            elif stage == "release":
+                level -= r_inc
+                if level <= 0.0:
+                    level = 0.0
+                    stage = "idle"
+    return y
+
+
 _REFERENCES = {
     "Gain": _ref_gain,
     "Biquad": _ref_biquad,
     "ConstantPowerPan": _ref_pan,
     "Resampler": _ref_resampler,
+    "Lfo": _ref_lfo,
+    "Adsr": _ref_adsr,
     # STFT is complex-output → validated hermetically (see note above), not here.
 }
 

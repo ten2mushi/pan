@@ -63,3 +63,9 @@ the `zig-0-16` skill too — state this explicitly in the subagent's prompt.
 
 ## Rule 14 - Dispatch yoneda test writers at each implementation gate
 Whenever you finished implementing a feature, dispatch yoneda test wirters (they should load the zig 0.16 skill) and provide them with instructions on where to create the test (for coherence accross the codebase), buit don't provide them with the specific tests to implement: instead provide them with the code sections / files to test : the agents are autonomous in deciding which tests to create.
+
+## Rule 15 - In-code documentation
+In-code documentation must be self-contained. Code comments and doc-comments MUST NOT reference the `specifications/*.md` nor the `pan_implementation_plan.md` (no "see catalog §7.2", no `[mem §6.1]`, no "Phase X.Y"). Instead, restate inline the law, invariant, rationale, ordering, or formula that the code realises, in plain prose, so the source is understandable without the spec open.
+
+## Learnings:
+- Saved a feedback memory verify-exit-codes-not-test-counts: trust the exit code; a compile-failed target silently drops its tests while "X/X passed" still prints; never assume a "failed step" is cosmetic.

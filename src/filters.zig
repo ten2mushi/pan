@@ -21,6 +21,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const numeric = @import("numeric.zig");
 const simd = @import("simd.zig");
+const control = @import("control.zig");
 
 /// Is this lane a floating-point type? Selects the float vs fixed-point kernel.
 fn isFloat(comptime T: type) bool {
@@ -70,6 +71,70 @@ pub fn Gain(comptime num: numeric.Numeric) type {
                 const frac = comptime fracBits(T);
                 for (xs, ys) |x, *y| y.* = simd.qMulStore(T, num.Acc, x, self.gain, frac);
             }
+        }
+    };
+}
+
+/// `OnePole(num)` — a one-pole low-pass whose **cutoff is a parameter port**
+/// (`onepole.param.cutoff`): the canonical filter swept by an LFO or an envelope.
+/// `cutoff` is the per-sample smoothing coefficient `a` in `[0, 1)` in the lane's
+/// own domain — the author maps a cutoff frequency to it (e.g. `a = 1 −
+/// exp(−2π·fc/Fs)`), the same "coefficients are block data, not the stream type"
+/// convention `Gain` and `Biquad` follow. The recurrence is a leaky integrator
+///
+///     y[n] = y[n−1] + a·(x[n] − y[n−1]),
+///
+/// so `a → 1` passes the input and `a → 0` freezes the state (a lower cutoff). The
+/// coefficient is **held between updates and per-block ramped** toward its target
+/// (the anti-zipper "ramp, never step" policy): the latest target is snapped at
+/// block end so a multi-block sweep stays continuous. Because a wired parameter edge
+/// and an external `set` both deliver the target through `setParam` and drive the
+/// SAME held-and-ramped coefficient, a wired LFO→cutoff sweep is **bit-identical** to
+/// the same target sequence pushed via `set` (one ramp policy, two sources). It is
+/// NOT `aliasing_safe`: the recurrence carries `z⁻¹` state, so the colorer must not
+/// run it in place.
+///
+/// Float lanes only for now: a ramped fixed-point coefficient needs the wider
+/// coefficient q-format and wide accumulator the fixed-point `Biquad` uses, which
+/// has not been ported here, so the integer path fails loud (a compile error, never
+/// silently-wrong audio).
+pub fn OnePole(comptime num: numeric.Numeric) type {
+    const T = num.Lane;
+    if (!isFloat(T))
+        @compileError("pan: OnePole is float-only for now — a ramped fixed-point" ++
+            " cutoff coefficient needs the q-format + wide-accumulator treatment the" ++
+            " fixed-point Biquad uses, not yet ported here. Use f32/f64.");
+    return struct {
+        const Self = @This();
+
+        /// The cutoff parameter port (control element `Scalar(f32)`). Slot 0.
+        pub const params = .{ .cutoff = types.Scalar(f32) };
+
+        /// Latest published target coefficient (atomic; set by the control thread OR
+        /// by a wired parameter edge). Read once per block on the RT thread.
+        cutoff: control.Param = control.Param.init(1.0),
+        /// The live, audibly-applied coefficient, ramped across blocks (persistent).
+        a: control.Ramp = control.Ramp.init(1.0),
+        /// The one-pole `z⁻¹` state.
+        y1: T = 0,
+
+        pub fn setParam(self: *Self, slot: u8, value: f32) void {
+            if (slot == 0) self.cutoff.set(value);
+        }
+
+        pub fn process(self: *Self, in: []const types.Sample(T), out: []types.Sample(T)) void {
+            const xs = scalarsConst(T, in);
+            const ys = scalars(T, out);
+            const tgt = self.cutoff.read();
+            const inc = self.a.begin(tgt, xs.len);
+            var y1 = self.y1;
+            for (xs, ys, 0..) |x, *y, i| {
+                const a: T = @floatCast(self.a.value + @as(f32, @floatFromInt(i + 1)) * inc);
+                y1 = y1 + a * (x - y1);
+                y.* = y1;
+            }
+            self.y1 = y1;
+            self.a.finish(tgt); // snap to the exact target; next block ramps from it
         }
     };
 }
@@ -233,6 +298,41 @@ fn BiquadFixed(comptime num: numeric.Numeric) type {
 
 const testing = std.testing;
 const f32num = numeric.numericFor(.f32, .{});
+
+test "OnePole(f32) classifies as a Map with a cutoff param; a=1 passes the signal" {
+    const port = @import("port.zig");
+    const OP = OnePole(f32num);
+    try testing.expect(port.classify(OP) == .Map);
+    try testing.expect(port.ParamPort(OP, "cutoff").Elem == types.Scalar(f32));
+    try testing.expect(!@hasDecl(OP, "aliasing_safe")); // stateful recurrence
+
+    // cutoff coefficient a = 1 (the default) → y[n] = y[n-1] + 1·(x - y[n-1]) = x.
+    var op = OP{};
+    var in: [4]types.Sample(f32) = .{ .{ .ch = .{1} }, .{ .ch = .{-2} }, .{ .ch = .{3} }, .{ .ch = .{0.5} } };
+    var out: [4]types.Sample(f32) = undefined;
+    op.process(&in, &out);
+    for (in, out) |x, y| try testing.expectApproxEqAbs(x.ch[0], y.ch[0], 1e-6);
+}
+
+test "OnePole(f32) a=0.5 step response matches the hand-rolled leaky integrator" {
+    const OP = OnePole(f32num);
+    var op = OP{};
+    op.setParam(0, 0.5); // target coefficient 0.5
+    // A unit step; with the per-block ramp a glides 1.0 → 0.5 across the block, so
+    // re-derive the SAME ramped recurrence independently and compare bit-for-bit.
+    const N = 6;
+    var in: [N]types.Sample(f32) = @splat(.{ .ch = .{1} });
+    var out: [N]types.Sample(f32) = undefined;
+    op.process(&in, &out);
+
+    var ry1: f32 = 0;
+    const inc: f32 = (0.5 - 1.0) / @as(f32, N);
+    for (out, 0..) |y, i| {
+        const a: f32 = 1.0 + @as(f32, @floatFromInt(i + 1)) * inc;
+        ry1 = ry1 + a * (1.0 - ry1);
+        try testing.expectEqual(ry1, y.ch[0]); // bit-exact vs the independent recurrence
+    }
+}
 
 test "Gain(f32) scales by its linear coefficient (and defaults to unity)" {
     var unity = Gain(f32num){};

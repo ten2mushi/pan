@@ -109,6 +109,11 @@ pub fn build(b: *std.Build) void {
         "tests/embedded_chain_test.zig",
         "tests/biquad_fixedpoint_yoneda_test.zig",
         "tests/embedded_hal_yoneda_test.zig",
+        "tests/modulation_test.zig",
+        "tests/modulation_yoneda_test.zig",
+        "tests/dynamics_yoneda_test.zig",
+        "tests/modulation_gold_test.zig",
+        "tests/adaptive_yoneda_test.zig",
     };
     for (harnesses) |path| {
         const h_mod = b.createModule(.{

@@ -139,8 +139,11 @@ pub const simd = @import("simd.zig");
 /// `pan.io.I2sDmaSource`/`I2sDmaSink`) whose half-/transfer-complete IRQ is the
 /// render callback on an MCU.
 pub const io = @import("io.zig");
-/// First DSP filters — `Gain` (aliasing-safe) and `Biquad` (per-sample Mealy).
+/// First DSP filters — `Gain` (aliasing-safe), `Biquad` (per-sample Mealy), and
+/// `OnePole` (a low-pass whose cutoff is a parameter port — the canonical filter an
+/// LFO/envelope sweeps).
 pub const filters = @import("filters.zig");
+pub const OnePole = filters.OnePole;
 /// Spatial blocks — `ConstantPowerPan` (mono → stereo, layout-changing).
 pub const spatial = @import("spatial.zig");
 /// The realtime-thread entry: `pan.realtime.enterRealtimeThread()` sets FTZ/DAZ.
@@ -168,6 +171,23 @@ pub const Allpass = fx.Allpass;
 pub const KarplusStrong = fx.KarplusStrong;
 pub const Ladder = fx.Ladder;
 pub const FdnMatrix = fx.FdnMatrix;
+/// Modulation appliers & adaptive dynamics — the parameter-port *consumers* and
+/// audio→control producers: `Vca` (gain via `param.gain`, the bit-exact-to-`set`
+/// modulation target), `Agc` (fused adaptive gain), `AgcController` (its decoupled
+/// controller emitting a gain `Scalar`), and `PowerGate` (a data-gating VAD/noise
+/// gate whose `Scalar` gate the consumer multiplies — the schedule stays static).
+pub const Vca = fx.Vca;
+pub const Agc = fx.Agc;
+pub const AgcController = fx.AgcController;
+pub const PowerGate = fx.PowerGate;
+/// Adaptive dynamics & adaptive-filter processors: `Compressor` (fused dynamics) and
+/// `CompressorController` (its decoupled gain → a `Vca`), plus the NLMS adaptive
+/// filters `Aec` (echo canceller, mic + reference → error) and `HowlSuppressor`
+/// (leaky-NLMS acoustic-feedback canceller).
+pub const Compressor = fx.Compressor;
+pub const CompressorController = fx.CompressorController;
+pub const Aec = fx.Aec;
+pub const HowlSuppressor = fx.HowlSuppressor;
 
 /// The rate-elastic seam — `Rate` blocks where output-per-input ≠ the algorithmic
 /// latency: the `Framer`/`Stft`/`iStft` analysis-synthesis pair (radix-2 FFT, Hann
@@ -182,9 +202,18 @@ pub const iStft = spectral.iStft;
 pub const PowerSpectrum = spectral.PowerSpectrum;
 pub const Resampler = spectral.Resampler;
 
+/// Control-side generators — the modulation *producers* that drive parameter ports.
+/// `Lfo` is a control-rate low-frequency oscillator: a zero-sample-input `Map`
+/// source emitting `Scalar(f32)` (`connect(lfo, x.param.cutoff)`).
+pub const gen = @import("gen.zig");
+pub const Lfo = gen.Lfo;
+/// Envelope generators & feature→parameter maps. `Adsr` is a gate→amplitude control
+/// source (gate via a parameter port); `FeatureMap` is the affine `Scalar → Scalar`
+/// rescale at the body of a feature→param modulation chain.
+pub const env = @import("env.zig");
+pub const Adsr = env.Adsr;
+pub const FeatureMap = env.FeatureMap;
 // Layered-library roots filled by later phases.
-pub const gen = struct {};
-pub const env = struct {};
 pub const mix = struct {};
 pub const synth = struct {};
 
