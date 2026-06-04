@@ -121,6 +121,10 @@ pub fn build(b: *std.Build) void {
         "tests/sampleplayer_yoneda_test.zig",
         "tests/timestretch_yoneda_test.zig",
         "tests/pitchshift_yoneda_test.zig",
+        "tests/instrument_engine_test.zig",
+        "tests/generator_gold_vector_test.zig",
+        "tests/polyvoice_behaviour_test.zig",
+        "tests/channelmap_functoriality_test.zig",
     };
     for (harnesses) |path| {
         const h_mod = b.createModule(.{

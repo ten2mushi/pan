@@ -31,6 +31,7 @@ const types = @import("types.zig");
 const control = @import("control.zig");
 const config = @import("config.zig");
 const io = @import("io.zig");
+const synth = @import("synth.zig");
 
 // ===========================================================================
 // Floating-point environment — flush-to-zero / denormals-are-zero
@@ -368,6 +369,15 @@ fn ExecutorModeParanoid(comptime g: graph.Graph, comptime node_blocks: []const t
             comptime var out_i: usize = 0;
             inline for (params[1..], 1..) |p, ai| {
                 const ParamT = p.type.?;
+                // The comptime/embedded executor has no runtime event ring, so an
+                // event-lane consumer receives an EMPTY lane here (its events arrive
+                // through the runtime engine's `sendEvent` path, not the frozen
+                // ground-truth executor). This keeps an event-driven block placeable
+                // in a comptime graph without breaking the static op-list.
+                if (comptime port.isEventLaneParam(ParamT)) {
+                    args[ai] = ParamT{};
+                    continue;
+                }
                 // A `Rate`'s `pull` interleaves a scalar `want` demand among its
                 // port slices; a non-port (integer) param receives `n`.
                 if (comptime !port.isPortParam(ParamT)) {
@@ -479,6 +489,7 @@ pub const RenderThunk = *const fn (
     pool: [*]u8,
     op: *const commit.RenderOp,
     plan: *const RuntimePlan,
+    events: *const EventDispatch,
     guards: bool,
     fault: *bool,
 ) void;
@@ -548,6 +559,30 @@ fn applyParamInputs(
     }
 }
 
+/// Build an `EventLane(E)` for one event-consuming op from the engine's per-block
+/// event store. Events targeting this `node_id` are filtered (keeping their sorted
+/// order), clamped to the block length `n`, and copied into the caller's `buf`; the
+/// returned lane views `buf[0..k]`. The engine ships only the blessed `NoteEvent`
+/// lane — a block declaring a different `Event` type gets an empty lane here (its
+/// events arrive at the block level / offline, not through the engine ring).
+fn buildEventLane(
+    comptime LaneT: type,
+    node_id: usize,
+    events: *const EventDispatch,
+    n: usize,
+    buf: *[synth.max_events_per_block]synth.Timed(synth.NoteEvent),
+) LaneT {
+    if (comptime LaneT.Event != synth.NoteEvent) return LaneT{};
+    var k: usize = 0;
+    for (events.items) |cmd| {
+        if (cmd.node != node_id) continue;
+        if (k >= buf.len) break;
+        buf[k] = .{ .sample_offset = @intCast(@min(cmd.at_sample, n)), .event = cmd.event };
+        k += 1;
+    }
+    return LaneT{ .items = buf[0..k] };
+}
+
 /// Build the monomorphized render thunk for `Block` — the bound-dispatch twin of
 /// `Executor.runOp`. The param loop is comptime-unrolled over `Block.process`'s
 /// signature (types are known here), but the buffer ids and pool offsets are read
@@ -560,6 +595,7 @@ pub fn renderThunk(comptime Block: type) RenderThunk {
             pool: [*]u8,
             op: *const commit.RenderOp,
             plan: *const RuntimePlan,
+            events: *const EventDispatch,
             guards: bool,
             fault: *bool,
         ) void {
@@ -573,8 +609,19 @@ pub fn renderThunk(comptime Block: type) RenderThunk {
             const n = op.n_or_pull_spec;
             var in_i: usize = 0;
             var out_i: usize = 0;
+            // Backing storage for an event-lane param, built once below from the
+            // engine's per-block event store filtered to THIS node. Lives until the
+            // kernel call (the lane only views it during `process`).
+            var event_buf: [synth.max_events_per_block]synth.Timed(synth.NoteEvent) = undefined;
             inline for (params[1..], 1..) |p, ai| {
                 const ParamT = p.type.?;
+                // An event-lane param is delivered out-of-band (not a pooled buffer):
+                // build the block's `EventLane`, filtering the drained block events to
+                // this node's id and re-stamping the within-block offset.
+                if (comptime port.isEventLaneParam(ParamT)) {
+                    args[ai] = buildEventLane(ParamT, op.node_id, events, n, &event_buf);
+                    continue;
+                }
                 if (comptime !port.isPortParam(ParamT)) {
                     args[ai] = n;
                     continue;
@@ -756,7 +803,7 @@ pub fn destroyThunk(comptime Block: type) DestroyThunk {
 /// Replay a bound runtime plan over the engine pool. The shared core of the
 /// device callback and `renderInto`: one indirect call per op in forward-topo
 /// order. Wait-free — a fixed-bound loop, no allocation, no lock.
-fn replayBound(plan: *const RuntimePlan, pool: []u8, guards: bool, fault: *bool) void {
+fn replayBound(plan: *const RuntimePlan, pool: []u8, events: *const EventDispatch, guards: bool, fault: *bool) void {
     const base: [*]u8 = if (pool.len == 0) undefined else pool.ptr;
     // Per-callback element counts: static, except a resampler's producer (overridden
     // to the resampler's `needed_input`). For a resampler-free graph every entry is
@@ -766,11 +813,11 @@ fn replayBound(plan: *const RuntimePlan, pool: []u8, guards: bool, fault: *bool)
     for (plan.ops[0..plan.op_count], 0..) |*op, i| {
         const thunk: RenderThunk = @ptrCast(@alignCast(op.fn_ptr.?));
         if (n_dyn[i] == op.n_or_pull_spec) {
-            thunk(op.self_ptr.?, base, op, plan, guards, fault);
+            thunk(op.self_ptr.?, base, op, plan, events, guards, fault);
         } else {
             var op_copy = op.*;
             op_copy.n_or_pull_spec = n_dyn[i];
-            thunk(op.self_ptr.?, base, &op_copy, plan, guards, fault);
+            thunk(op.self_ptr.?, base, &op_copy, plan, events, guards, fault);
         }
     }
 }
@@ -867,6 +914,82 @@ pub const command_ring_capacity = 256;
 
 const CommandRing = control.CommandRing(control.Command, command_ring_capacity);
 const PlanRcu = control.Rcu(*RuntimePlan);
+
+/// A scheduled, sample-accurate **note event** targeted at one event-consuming node
+/// (the instrument analogue of `control.Command`, which targets a scalar parameter
+/// slot). `at_sample` is the within-block offset at which the event applies, so the
+/// consuming block can render it sub-block-accurately. The event payload is the
+/// blessed `NoteEvent` — the engine's event lane ships this one type; the
+/// `EventLane(Event)` *mechanism* is fully event-generic (any `Event` dual-muxes at
+/// the block level), but engine delivery is specialised to `NoteEvent` (the
+/// instrument use). Other event types are block-level / offline-driven.
+pub const EventCommand = struct {
+    node: usize = 0,
+    at_sample: usize = 0,
+    event: synth.NoteEvent = .{ .program = 0 },
+};
+
+/// A note-event ring (SPSC). The engine keeps TWO of these: a **live** ring whose
+/// `at_sample` is a within-block offset (the `sendEvent` "place it at offset k in the
+/// next block" path), and a **timeline** ring whose `at_sample` is an ABSOLUTE
+/// transport sample (the `scheduleEventAt` "place it at transport position S" path —
+/// the deterministic timeline of §9). Producer = control / MIDI-ingestion thread;
+/// consumer = the render, draining at each callback boundary.
+const EventRing = control.CommandRing(EventCommand, command_ring_capacity);
+
+/// The current block's drained, merged, and **offset-sorted** event commands, handed
+/// to the render so each event-consuming op can build its own `EventLane` filtered to
+/// its node. A thin view; the backing storage is the engine's per-block event scratch.
+pub const EventDispatch = struct {
+    items: []const EventCommand = &.{},
+
+    /// An empty dispatch — no events this block (the comptime/embedded executor and
+    /// any non-event render pass use this).
+    pub const none: EventDispatch = .{ .items = &.{} };
+};
+
+/// Order a drained block's events by within-block offset (stable companion of the
+/// per-block sort). Stable sorting keeps two events at the same offset in their
+/// enqueue order, so the render is deterministic (offline-reproducible).
+fn lessByOffset(_: void, a: EventCommand, b: EventCommand) bool {
+    return a.at_sample < b.at_sample;
+}
+
+/// The drain consumer that collects queued `EventCommand`s into the engine's
+/// per-block scratch (bounded by `max_events_per_block`; surplus is dropped, which
+/// the producer's backpressure on a full ring already bounds). Two modes:
+///   - **live** (default): `cmd.at_sample` is already a within-block offset, stored
+///     as-is.
+///   - **timeline**: `cmd.at_sample` is an ABSOLUTE transport sample; it is converted
+///     to a block-relative offset against `block_start`, clamped into `[0, n]`.
+/// After both rings are drained the merged scratch is **stably sorted by offset**
+/// (`lessByOffset`), so the two sources may interleave and the producer need not
+/// enqueue the live ring in order — the sub-block split sees a correctly time-ordered
+/// lane regardless. (The timeline ring's window drain still relies on non-decreasing
+/// absolute order, the SPSC scheduling convention.)
+const EvtCollector = struct {
+    buf: []EventCommand,
+    count: usize = 0,
+    /// When true, `at_sample` is an absolute transport sample to convert.
+    timeline: bool = false,
+    /// The absolute transport sample at the start of the block being rendered.
+    block_start: u64 = 0,
+    /// The block length (window size / offset clamp).
+    n: usize = 0,
+    pub fn apply(self: *EvtCollector, cmd: EventCommand) void {
+        if (self.count >= self.buf.len) return;
+        var c = cmd;
+        if (self.timeline) {
+            const abs: u64 = cmd.at_sample;
+            c.at_sample = if (abs > self.block_start)
+                @intCast(@min(abs - self.block_start, @as(u64, self.n)))
+            else
+                0; // an event already in the past applies at the block start
+        }
+        self.buf[self.count] = c;
+        self.count += 1;
+    }
+};
 
 /// An in-progress topology edit (the `edit → commit` control verb): mutations are
 /// built off the audio thread into a working copy of the graph, then the rebuilt
@@ -1002,6 +1125,22 @@ pub const Engine = struct {
     /// The `schedule` command ring (SPSC). Producer = control thread; consumer =
     /// the render (drained at each callback boundary).
     ring: CommandRing,
+    /// The LIVE note-event ring (SPSC) — `at_sample` is a within-block offset.
+    /// Producer = control / MIDI-ingestion thread (`sendEvent`); consumer = the
+    /// render, drained per block into `event_scratch` and handed to each consuming op.
+    event_ring: EventRing = EventRing.empty,
+    /// The TIMELINE note-event ring (SPSC) — `at_sample` is an ABSOLUTE transport
+    /// sample (`scheduleEventAt`). Each block, the events whose absolute position
+    /// falls in the block window `[transport.position, +block_size)` are delivered,
+    /// converted to a block-relative offset — the §9 timeline driving the event lane.
+    timeline_ring: EventRing = EventRing.empty,
+    /// Per-block event scratch: the drained, merged, offset-sorted events for the
+    /// current callback. Bounded → no audio-thread allocation. Overwritten every render.
+    event_scratch: [synth.max_events_per_block]EventCommand = undefined,
+    /// The musical transport (sample-accurate position, loop, tempo). Advances by the
+    /// block length each render; the offline timeline is a pure function of it, and the
+    /// timeline ring's per-block window is taken against its position.
+    transport: io.Transport = .{},
     op_count: usize,
     footprint_bytes: usize,
     tele: Telemetry,
@@ -1234,12 +1373,39 @@ pub const Engine = struct {
     fn renderCurrent(self: *Self, token: RealtimeToken) void {
         _ = token; // witness that FTZ is set on this thread
         const plan = self.rcu.enter(); // (E) epoch bump + (R) one acquire-load
-        // Drain scheduled events at the block boundary (sample-accurate placement
-        // within the block is the sub-block scheduler's job, a later refinement;
-        // here every queued event is applied at the boundary).
+        // Drain scalar parameter commands at the block boundary (sample-accurate
+        // placement within the block is the sub-block scheduler's job for params).
         self.ring.drain(self);
+        // Drain note events; each event-consuming op applies them sub-block-accurately
+        // (the onset split is internal to the consuming block, e.g. PolyVoice).
+        const dispatch = self.drainEvents();
         const guards = std.debug.runtime_safety;
-        replayBound(plan, self.pool, guards, &self.tele.fault);
+        replayBound(plan, self.pool, &dispatch, guards, &self.tele.fault);
+        self.transport.advance(self.cfg.block_size);
+    }
+
+    /// Drain BOTH note-event rings into the per-block scratch and return the dispatch
+    /// the render hands each event-consuming op. (1) the live ring (within-block
+    /// offsets, as-is); (2) the timeline ring, for events whose absolute transport
+    /// position falls in this block's window `[position, position+block_size)`,
+    /// converted to a block-relative offset. The merged scratch is then stably sorted
+    /// by offset so the sub-block split sees a correctly time-ordered lane regardless
+    /// of source interleaving. Wait-free: a bounded copy + a bounded in-place sort, no
+    /// allocation.
+    fn drainEvents(self: *Self) EventDispatch {
+        var collector = EvtCollector{ .buf = &self.event_scratch };
+        self.event_ring.drain(&collector); // (1) live, within-block offsets
+
+        const pos = self.transport.position;
+        const n = self.cfg.block_size;
+        collector.timeline = true; // (2) timeline, absolute → block-relative
+        collector.block_start = pos;
+        collector.n = n;
+        self.timeline_ring.drainUntil(@intCast(pos + @as(u64, n)), &collector);
+
+        const items = self.event_scratch[0..collector.count];
+        std.sort.insertion(EventCommand, items, {}, lessByOffset);
+        return .{ .items = items };
     }
 
     /// Compute the per-op per-callback element count: the static `n_or_pull_spec`
@@ -1283,8 +1449,25 @@ pub const Engine = struct {
         return self.ring.enqueue(cmd);
     }
 
-    pub fn sendEvent(self: *Self, event: control.Command) bool {
-        return self.schedule(event);
+    /// The instrument event verb — enqueue a sample-accurate `NoteEvent` for the
+    /// event-consuming node `node` into the note-event ring (drained at the next
+    /// callback boundary). `at_sample` is the within-block offset the consuming block
+    /// honours via its internal sub-block split. Returns false if the ring is full
+    /// (the producer may retry; the RT thread is never stalled). Control thread only.
+    pub fn sendEvent(self: *Self, node: usize, at_sample: usize, event: synth.NoteEvent) bool {
+        return self.event_ring.enqueue(.{ .node = node, .at_sample = at_sample, .event = event });
+    }
+
+    /// The instrument TIMELINE verb — schedule a `NoteEvent` for node `node` at an
+    /// **absolute transport sample** `abs_sample`. It is delivered in the render block
+    /// whose window `[transport.position, +block_size)` contains it, at the correct
+    /// block-relative offset — so the transport timeline drives the event lane (§9) and
+    /// an offline render of an absolutely-timed score is a pure function of the
+    /// transport (deterministic). The producer must enqueue in non-decreasing
+    /// `abs_sample` order (the SPSC scheduling convention the window drain relies on).
+    /// Wait-free; returns false if the ring is full. Control thread only.
+    pub fn scheduleEventAt(self: *Self, node: usize, abs_sample: usize, event: synth.NoteEvent) bool {
+        return self.timeline_ring.enqueue(.{ .node = node, .at_sample = abs_sample, .event = event });
     }
 
     // ---- The per-block transition policy: "ramp, never step" ----------------
@@ -1489,7 +1672,9 @@ pub const Engine = struct {
         var blocks: usize = 0;
         while (blocks < opts.max_blocks) : (blocks += 1) {
             self.ring.drain(self);
-            replayBound(plan, self.pool, guards, &self.tele.fault);
+            const dispatch = self.drainEvents();
+            replayBound(plan, self.pool, &dispatch, guards, &self.tele.fault);
+            self.transport.advance(self.cfg.block_size);
             if (exhaustion) {
                 var all_done = true;
                 for (self.bound) |b| {

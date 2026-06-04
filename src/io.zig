@@ -30,6 +30,7 @@ const types = @import("types.zig");
 const numeric = @import("numeric.zig");
 const engine = @import("engine.zig");
 const control = @import("control.zig");
+const synth = @import("synth.zig");
 
 // ===========================================================================
 // LPCM sample formats
@@ -482,6 +483,72 @@ pub fn LpcmSource(comptime num: numeric.Numeric) type {
         /// reports exhausted (it streams forever).
         pub fn exhausted(self: *Self) bool {
             return self.done;
+        }
+    };
+}
+
+// ===========================================================================
+// PrefetchSource — the off-thread-prefetch streaming file/network source
+// ===========================================================================
+
+/// `PrefetchSource(num, cap)` — a streaming `Sample(T)` Source over an **off-thread
+/// prefetch FIFO**, the live-file/network analogue of the in-memory `LpcmSource`.
+/// A background **prefetch thread** decodes from disk/network at its own pace and
+/// `push`es samples into a bounded lock-free SPSC ring; the **audio thread** `pop`s
+/// from the ring at the pull demand — **wait-free, with no disk I/O on the render
+/// path** (the whole point: the deadline never waits on storage). It is a
+/// zero-sample-input `Map` Source (its `out.len` is the pull demand `N`), so it roots
+/// its path exactly like `LpcmSource`.
+///
+/// Underrun (the prefetch thread fell behind and the FIFO is momentarily dry) is a
+/// **glitch-free hold of the last sample** plus an `underruns` telemetry count — a
+/// brief artefact rather than a tear, the same honesty class as the device clock
+/// FIFOs. `signalEos` (called by the prefetch thread at end-of-stream) plus a drained
+/// ring makes `exhausted()` true, so a non-RT input-exhaustion root terminates the
+/// run cleanly. The ring is caller-owned and shared with the prefetch thread (passed
+/// by pointer at `add`, like the cross-root taps and the drift-`Asrc` bridge).
+pub fn PrefetchSource(comptime num: numeric.Numeric, comptime cap: usize) type {
+    const T = num.Lane;
+    comptime std.debug.assert(std.math.isPowerOfTwo(cap));
+    return struct {
+        const Self = @This();
+        /// The bridging FIFO: producer = the prefetch thread, consumer = the render.
+        pub const Ring = control.SpscRing(types.Sample(T), cap);
+
+        /// The shared prefetch FIFO (caller-owned; set at `add`).
+        ring: *Ring = undefined,
+        /// Held last sample for the glitch-free underrun fallback.
+        last: types.Sample(T) = std.mem.zeroes(types.Sample(T)),
+        /// Output samples produced from the held fallback because the FIFO was dry —
+        /// a health/telemetry counter, zero over a well-fed run.
+        underruns: usize = 0,
+        /// End-of-stream flag, set by the prefetch thread (release) and read by the
+        /// render (acquire) — the producer→consumer ordering the SPSC ring also uses.
+        eos: std.atomic.Value(bool) = .init(false),
+
+        /// out.len == pull N: pop the next `N` samples from the FIFO. On a momentary
+        /// underrun, hold the last sample (no tear) and count it.
+        pub fn process(self: *Self, out: []types.Sample(T)) void {
+            for (out) |*o| {
+                if (self.ring.pop()) |s| {
+                    self.last = s;
+                    o.* = s;
+                } else {
+                    o.* = self.last; // glitch-free hold
+                    self.underruns += 1;
+                }
+            }
+        }
+
+        /// The prefetch thread calls this when it reaches end of file/stream.
+        pub fn signalEos(self: *Self) void {
+            self.eos.store(true, .release);
+        }
+
+        /// Input-exhaustion probe: true once the producer flagged EOS AND the FIFO is
+        /// fully drained — a non-RT analysis root polls this to end the run.
+        pub fn exhausted(self: *Self) bool {
+            return self.eos.load(.acquire) and self.ring.len() == 0;
         }
     };
 }
@@ -1713,4 +1780,161 @@ test "I2sDmaSource/Sink are a Source/Sink that bridge the active DMA half" {
     src.process(&mid); // RX half → graph
     sink.process(&mid); // graph → TX half
     for (tx.activeHalf(), 0..) |s, i| try testing.expectEqual(@as(i16, @intCast(i + 1)), s.ch[0]);
+}
+
+// ===========================================================================
+// Transport / timeline + MIDI event ingestion (the Instrument front-end)
+// ===========================================================================
+
+/// `Transport` — the musical timeline: a sample-accurate play position the event
+/// lane timestamps against, plus tempo and loop points. The engine advances it by
+/// the block length each render, so an offline bounce is a **pure function of the
+/// transport** (bit-reproducible regardless of wall-clock). Seekable and loopable;
+/// external sync (MIDI clock / Ableton Link) would sit here (not implemented).
+pub const Transport = struct {
+    /// Sample-accurate play position (samples since transport start or last seek).
+    position: u64 = 0,
+    /// The render sample rate, for the seconds / PPQ conversions.
+    sample_rate: f64 = 48_000,
+    /// Tempo in quarter notes per minute (BPM).
+    tempo_bpm: f64 = 120,
+    /// Whether the transport is rolling (a stopped transport holds its position).
+    playing: bool = true,
+    /// Loop region: when enabled and `position` reaches `loop_end`, it wraps back to
+    /// `loop_start` (sample-accurate, the loop length preserved across the wrap).
+    loop_enabled: bool = false,
+    loop_start: u64 = 0,
+    loop_end: u64 = 0,
+
+    /// Advance by `n` samples (one render block). A no-op while stopped. Wraps inside
+    /// an active loop region so a looped bounce repeats deterministically.
+    pub fn advance(self: *Transport, n: usize) void {
+        if (!self.playing) return;
+        self.position += n;
+        if (self.loop_enabled and self.loop_end > self.loop_start and self.position >= self.loop_end) {
+            const span = self.loop_end - self.loop_start;
+            self.position = self.loop_start + (self.position - self.loop_start) % span;
+        }
+    }
+    /// Jump to an absolute sample position (sample-accurate seek).
+    pub fn seek(self: *Transport, pos: u64) void {
+        self.position = pos;
+    }
+    pub fn setTempo(self: *Transport, bpm: f64) void {
+        self.tempo_bpm = bpm;
+    }
+    /// Enable a loop region `[start, end)`; `end ≤ start` disables looping.
+    pub fn setLoop(self: *Transport, start: u64, end: u64) void {
+        self.loop_start = start;
+        self.loop_end = end;
+        self.loop_enabled = end > start;
+    }
+    /// Elapsed seconds at the current position.
+    pub fn seconds(self: Transport) f64 {
+        return @as(f64, @floatFromInt(self.position)) / self.sample_rate;
+    }
+    /// Musical position in quarter notes (PPQ) = seconds · tempo / 60.
+    pub fn ppq(self: Transport) f64 {
+        return self.seconds() * self.tempo_bpm / 60.0;
+    }
+};
+
+/// `MidiEventSource(Event)` — the MIDI-ingestion adapter that bridges a live device
+/// (or a parsed MIDI file / offline timeline) into the engine's out-of-band event
+/// delivery. It is a fixed-capacity FIFO of `Timed(Event)` you `push` into from a
+/// device callback or a file parser; `forward` drains them into an engine's event
+/// ring for the consuming node (e.g. a `PolyVoice`), and `lane` exposes them as an
+/// `EventLane` for block-level / offline rendering.
+///
+/// Events are delivered to the consuming node **out of band** (via the engine's
+/// event ring), not as a pooled graph edge — the event lane is not a colored buffer,
+/// which keeps the static unconditional op-list pure. So this source is an
+/// *ingestion adapter*, not a mid-graph node: you `forward` its events to the
+/// instrument's `PolyVoice` node rather than wiring a pooled event edge.
+pub fn MidiEventSource(comptime Event: type) type {
+    return struct {
+        const Self = @This();
+        /// Headroom for several render blocks of buffered events.
+        pub const capacity = synth.max_events_per_block * 8;
+
+        items: [capacity]synth.Timed(Event) = undefined,
+        len: usize = 0,
+
+        /// Buffer one timed event (from a device callback or a file). Returns false
+        /// if the buffer is full.
+        pub fn push(self: *Self, sample_offset: u32, event: Event) bool {
+            if (self.len >= capacity) return false;
+            self.items[self.len] = .{ .sample_offset = sample_offset, .event = event };
+            self.len += 1;
+            return true;
+        }
+
+        /// Forward every buffered event to `eng`'s event ring for the consuming
+        /// `node`, then clear. The ingestion → engine bridge (`engine.sendEvent`).
+        pub fn forward(self: *Self, eng: *engine.Engine, node: usize) void {
+            for (self.items[0..self.len]) |te| {
+                _ = eng.sendEvent(node, te.sample_offset, te.event);
+            }
+            self.len = 0;
+        }
+
+        /// A read-only lane over the buffered events (block-level / offline use).
+        pub fn lane(self: *const Self) synth.EventLane(Event) {
+            return synth.EventLane(Event).fromSorted(self.items[0..self.len]);
+        }
+
+        /// Clear the buffer without forwarding.
+        pub fn clear(self: *Self) void {
+            self.len = 0;
+        }
+    };
+}
+
+test "Transport: advances, seeks, and loops sample-accurately" {
+    var t: Transport = .{ .sample_rate = 48_000, .tempo_bpm = 120 };
+    t.advance(48_000);
+    try testing.expectEqual(@as(u64, 48_000), t.position);
+    try testing.expectApproxEqAbs(@as(f64, 1.0), t.seconds(), 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 2.0), t.ppq(), 1e-9); // 1s @ 120bpm = 2 quarter notes
+    t.seek(0);
+    t.setLoop(0, 100);
+    t.advance(150); // 150 into a [0,100) loop ⇒ wraps to 50
+    try testing.expectEqual(@as(u64, 50), t.position);
+}
+
+test "MidiEventSource: buffers and exposes a lane of NoteEvents" {
+    var src: MidiEventSource(synth.NoteEvent) = .{};
+    try testing.expect(src.push(0, .{ .note_on = .{ .note_id = 1, .pitch_hz = 440, .velocity = 1 } }));
+    try testing.expect(src.push(64, .{ .note_off = .{ .note_id = 1, .velocity = 0 } }));
+    const l = src.lane();
+    try testing.expectEqual(@as(usize, 2), l.len());
+    try testing.expectEqual(@as(u32, 64), l.items[1].sample_offset);
+}
+
+test "PrefetchSource: pops FIFO, holds last on underrun, exhausts on EOS+drain" {
+    const pport = @import("port.zig");
+    const num = numeric.numericFor(.f32, .{});
+    const Src = PrefetchSource(num, 8);
+    // Zero-sample-input Map Source (roots its path like LpcmSource).
+    try testing.expect(pport.classify(Src) == .Map);
+    try testing.expect(comptime pport.isSource(Src));
+
+    var ring: Src.Ring = .empty;
+    var src: Src = .{ .ring = &ring };
+    // The "prefetch thread" pushes three samples.
+    try testing.expect(ring.push(.{ .ch = .{1} }));
+    try testing.expect(ring.push(.{ .ch = .{2} }));
+    try testing.expect(ring.push(.{ .ch = .{3} }));
+
+    var out: [4]types.Sample(f32) = undefined;
+    src.process(&out); // demand 4, only 3 available
+    try testing.expectEqual(@as(f32, 1), out[0].ch[0]);
+    try testing.expectEqual(@as(f32, 2), out[1].ch[0]);
+    try testing.expectEqual(@as(f32, 3), out[2].ch[0]);
+    try testing.expectEqual(@as(f32, 3), out[3].ch[0]); // underrun ⇒ glitch-free hold of last
+    try testing.expectEqual(@as(usize, 1), src.underruns);
+
+    try testing.expect(!src.exhausted()); // producer has not signalled EOS yet
+    src.signalEos();
+    try testing.expect(src.exhausted()); // EOS + drained FIFO ⇒ exhausted
 }

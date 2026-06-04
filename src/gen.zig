@@ -1,5 +1,23 @@
-//! Control-side generators — the modulation *producers* that drive parameter
-//! ports. The first is `Lfo`.
+//! Generators — the source blocks that originate a stream with no sample input.
+//! Two families live here:
+//!
+//!   * **Control-side generators** (`Lfo`) — the modulation *producers* that drive
+//!     parameter ports, emitting one `Scalar(f32)` per call (see the header notes
+//!     below on the broadcast-storage / one-value-per-call model).
+//!   * **Audio-rate Source generators** (`Sine`, `PolyBlepSaw`, `PolyBlepSquare`,
+//!     `Noise`, `Constant`, `Wavetable`) — zero-sample-input `Map` sources emitting
+//!     `Sample(f32)`. A source has no input slice, so it classifies as a path head
+//!     (a Source); its output length is the **pull demand `N`** (it learns `N` from
+//!     `out.len`), and its phase / RNG / table cursor is ordinary per-sample Mealy
+//!     state advanced by `N`. Each audio oscillator exposes a per-sample `tick()`
+//!     core (so a `Voice` can drive it sample-by-sample inside a fused loop) on top
+//!     of which `process(out)` is a thin block loop. Saw/square use **PolyBLEP**
+//!     band-limiting so a swept tone does not alias (the naive ramp/square is the
+//!     failure mode a band-limited oracle rejects); `Sine` is band-limited by
+//!     construction. Frequency arrives in **Hz** through a `freq` parameter port
+//!     (the block converts to a per-sample phase increment with its `sample_rate`),
+//!     mirroring how a `NoteEvent.note_on.pitch_hz` lands directly in a voice's
+//!     pitch parameter — the lane never assumes 12-TET.
 //!
 //! A **parameter port** carries a *control element* (`Scalar(f32)`) — a node's
 //! coefficient, one value per render call — as opposed to a sample port, which
@@ -127,4 +145,256 @@ test "Lfo: square and saw stay in range, phase wraps in [0,1)" {
         try std.testing.expect(out[0].value == 1 or out[0].value == -1);
         try std.testing.expect(sq.phase >= 0 and sq.phase < 1);
     }
+}
+
+// ===========================================================================
+// Audio-rate Source generators — zero-sample-input `Map` sources, `Sample(f32)`.
+// ===========================================================================
+
+const tau = 2.0 * std.math.pi;
+
+/// PolyBLEP residual at normalized phase `t ∈ [0, 1)` for a per-sample phase step
+/// `dt`. It is the correction a band-limited step needs at a waveform
+/// discontinuity: a naive saw/square jumps by a full amplitude in one sample, which
+/// injects energy above Nyquist (aliasing); PolyBLEP smears that jump across the two
+/// samples straddling it with a 2nd-order polynomial so the step is band-limited.
+/// Zero away from a discontinuity, so it is free except at the ~`dt`-wide edges.
+fn polyBlep(t: f32, dt: f32) f32 {
+    if (dt <= 0) return 0; // DC / silence: no discontinuity to correct
+    if (t < dt) {
+        const x = t / dt;
+        return x + x - x * x - 1.0; // rising side of the step
+    } else if (t > 1.0 - dt) {
+        const x = (t - 1.0) / dt;
+        return x * x + x + x + 1.0; // falling side of the step
+    }
+    return 0;
+}
+
+/// `Sine` — a band-limited (by construction) sinusoid Source. Frequency in Hz via
+/// the `freq` parameter port; phase is per-sample Mealy state advanced by `out.len`.
+pub const Sine = struct {
+    const Self = @This();
+    /// Phase in cycles, kept in `[0, 1)`. Persistent across calls.
+    phase: f32 = 0,
+    /// Phase step per sample, in cycles (`freq / sample_rate`).
+    increment: f32 = 0,
+    /// The render sample rate, used to convert a Hz `freq` to a phase increment.
+    sample_rate: f32 = 48_000,
+
+    pub const params = .{ .freq = types.Scalar(f32) };
+
+    /// Slot 0 is `freq` (declaration order). The control plane (a wired edge or an
+    /// external `set`/`schedule`) delivers Hz here; we convert to a phase step.
+    pub fn setParam(self: *Self, slot: u8, value: f32) void {
+        if (slot == 0) self.setFrequency(value);
+    }
+    /// Set the oscillator frequency directly in Hz (the voice-internal path).
+    pub fn setFrequency(self: *Self, hz: f32) void {
+        self.increment = hz / self.sample_rate;
+    }
+
+    /// One sample, advancing the phase. The per-sample core a `Voice` drives.
+    pub fn tick(self: *Self) f32 {
+        const v = @sin(tau * self.phase);
+        self.phase = self.phase + self.increment - @floor(self.phase + self.increment);
+        return v;
+    }
+    /// out.len == pull N (the source's length comes from the demand, SR1).
+    pub fn process(self: *Self, out: []types.Sample(f32)) void {
+        for (out) |*o| o.ch[0] = self.tick();
+    }
+};
+
+/// `PolyBlepSaw` — a band-limited sawtooth Source (PolyBLEP-corrected). The naive
+/// ramp `2·phase − 1` aliases on every period reset; subtracting the PolyBLEP
+/// residual at the wrap band-limits the discontinuity.
+pub const PolyBlepSaw = struct {
+    const Self = @This();
+    phase: f32 = 0,
+    increment: f32 = 0,
+    sample_rate: f32 = 48_000,
+
+    pub const params = .{ .freq = types.Scalar(f32) };
+
+    pub fn setParam(self: *Self, slot: u8, value: f32) void {
+        if (slot == 0) self.setFrequency(value);
+    }
+    pub fn setFrequency(self: *Self, hz: f32) void {
+        self.increment = hz / self.sample_rate;
+    }
+
+    pub fn tick(self: *Self) f32 {
+        const naive = 2.0 * self.phase - 1.0;
+        const v = naive - polyBlep(self.phase, self.increment);
+        self.phase = self.phase + self.increment - @floor(self.phase + self.increment);
+        return v;
+    }
+    pub fn process(self: *Self, out: []types.Sample(f32)) void {
+        for (out) |*o| o.ch[0] = self.tick();
+    }
+};
+
+/// `PolyBlepSquare` — a band-limited square Source. The square has two
+/// discontinuities per period (the rising edge at phase 0 and the falling edge at
+/// phase 0.5), so it adds a PolyBLEP residual at the rising edge and subtracts one
+/// at the half-phase-shifted falling edge.
+pub const PolyBlepSquare = struct {
+    const Self = @This();
+    phase: f32 = 0,
+    increment: f32 = 0,
+    sample_rate: f32 = 48_000,
+
+    pub const params = .{ .freq = types.Scalar(f32) };
+
+    pub fn setParam(self: *Self, slot: u8, value: f32) void {
+        if (slot == 0) self.setFrequency(value);
+    }
+    pub fn setFrequency(self: *Self, hz: f32) void {
+        self.increment = hz / self.sample_rate;
+    }
+
+    pub fn tick(self: *Self) f32 {
+        var v: f32 = if (self.phase < 0.5) 1.0 else -1.0;
+        v += polyBlep(self.phase, self.increment); // rising edge at phase 0
+        // falling edge sits at phase 0.5 — correct it at the half-shifted phase.
+        var t2 = self.phase + 0.5;
+        t2 -= @floor(t2);
+        v -= polyBlep(t2, self.increment);
+        self.phase = self.phase + self.increment - @floor(self.phase + self.increment);
+        return v;
+    }
+    pub fn process(self: *Self, out: []types.Sample(f32)) void {
+        for (out) |*o| o.ch[0] = self.tick();
+    }
+};
+
+/// `Noise` — a white-noise Source over a deterministic, dependency-free,
+/// freestanding-safe 64-bit LCG (so the ReleaseSmall freestanding smoke target and
+/// the offline-reproducible timeline are both satisfied — the stream is a pure
+/// function of `state`). Output is uniform in `[−1, 1)`.
+pub const Noise = struct {
+    const Self = @This();
+    /// The LCG state — persistent Mealy state. Seed it for a reproducible stream.
+    state: u64 = 0x2545F4914F6CDD1D,
+
+    /// Advance the LCG and return the next 32-bit word. Wrapping multiply/add (the
+    /// classic 64-bit constants) so no overflow check fires and the recurrence is
+    /// the same in every build mode.
+    fn nextWord(self: *Self) u32 {
+        self.state = self.state *% 6364136223846793005 +% 1442695040888963407;
+        return @truncate(self.state >> 32);
+    }
+    pub fn tick(self: *Self) f32 {
+        const u = self.nextWord();
+        return @as(f32, @floatFromInt(u)) * (2.0 / 4294967296.0) - 1.0;
+    }
+    pub fn process(self: *Self, out: []types.Sample(f32)) void {
+        for (out) |*o| o.ch[0] = self.tick();
+    }
+};
+
+/// `Constant` — a DC Source emitting a fixed `level` every sample. The trivial
+/// generator; useful as a test/bias source and the SR1 length-from-pull witness.
+pub const Constant = struct {
+    const Self = @This();
+    level: f32 = 0,
+
+    pub const params = .{ .level = types.Scalar(f32) };
+
+    pub fn setParam(self: *Self, slot: u8, value: f32) void {
+        if (slot == 0) self.level = value;
+    }
+    pub fn tick(self: *Self) f32 {
+        return self.level;
+    }
+    pub fn process(self: *Self, out: []types.Sample(f32)) void {
+        for (out) |*o| o.ch[0] = self.level;
+    }
+};
+
+/// `Wavetable` — a single-cycle wavetable Source read with linear interpolation at
+/// a Hz `freq`. The table is a borrowed single-period slice (an asset loaded at
+/// `initialize`, persistent state); the read cursor is the per-sample phase. Linear
+/// interpolation between adjacent table entries is the cheap, low-alias-for-smooth-
+/// tables tier (a band-limited multi-table mip is the quality upgrade, not shipped).
+pub const Wavetable = struct {
+    const Self = @This();
+    /// One period of the waveform, length ≥ 2. Borrowed (not owned).
+    table: []const f32 = &.{ 0, 0 },
+    phase: f32 = 0,
+    increment: f32 = 0,
+    sample_rate: f32 = 48_000,
+
+    pub const params = .{ .freq = types.Scalar(f32) };
+
+    pub fn setParam(self: *Self, slot: u8, value: f32) void {
+        if (slot == 0) self.setFrequency(value);
+    }
+    pub fn setFrequency(self: *Self, hz: f32) void {
+        self.increment = hz / self.sample_rate;
+    }
+
+    pub fn tick(self: *Self) f32 {
+        const len = self.table.len;
+        const pos = self.phase * @as(f32, @floatFromInt(len));
+        const idx: usize = @intFromFloat(pos);
+        const frac = pos - @floor(pos);
+        const a = self.table[idx % len];
+        const b = self.table[(idx + 1) % len];
+        const v = a + (b - a) * frac;
+        self.phase = self.phase + self.increment - @floor(self.phase + self.increment);
+        return v;
+    }
+    pub fn process(self: *Self, out: []types.Sample(f32)) void {
+        for (out) |*o| o.ch[0] = self.tick();
+    }
+};
+
+test "audio sources: classify as zero-input Sample(f32) sources" {
+    const port = @import("port.zig");
+    inline for (.{ Sine, PolyBlepSaw, PolyBlepSquare, Noise, Constant, Wavetable }) |Osc| {
+        try std.testing.expect(port.classify(Osc) == .Map);
+        try std.testing.expect(comptime port.isSource(Osc));
+        try std.testing.expect(port.MapOutPort(Osc).Elem == types.Sample(f32));
+    }
+}
+
+test "Sine: out.len drives length; phase advances by out.len" {
+    var s: Sine = .{ .sample_rate = 4 };
+    s.setFrequency(1.0); // increment = 0.25 cycles/sample
+    var out: [4]types.Sample(f32) = undefined;
+    s.process(&out);
+    // sin(2π·0)=0, sin(2π·.25)=1, sin(2π·.5)=0, sin(2π·.75)=-1
+    try std.testing.expectApproxEqAbs(@as(f32, 0), out[0].ch[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), out[1].ch[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), out[2].ch[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -1), out[3].ch[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), s.phase, 1e-6); // wrapped back to 0
+}
+
+test "PolyBlepSaw: stays in range and band-limits the wrap" {
+    var saw: PolyBlepSaw = .{ .sample_rate = 48_000 };
+    saw.setFrequency(440.0);
+    var out: [256]types.Sample(f32) = undefined;
+    saw.process(&out);
+    for (out) |o| try std.testing.expect(o.ch[0] >= -2.0 and o.ch[0] <= 2.0);
+}
+
+test "Noise: deterministic, reproducible, in [-1,1)" {
+    var a: Noise = .{ .state = 12345 };
+    var b: Noise = .{ .state = 12345 };
+    var k: usize = 0;
+    while (k < 100) : (k += 1) {
+        const x = a.tick();
+        try std.testing.expectEqual(x, b.tick()); // same seed ⇒ same stream
+        try std.testing.expect(x >= -1.0 and x < 1.0);
+    }
+}
+
+test "Constant: emits its level for every sample of the pull" {
+    var c: Constant = .{ .level = 0.5 };
+    var out: [5]types.Sample(f32) = undefined;
+    c.process(&out);
+    for (out) |o| try std.testing.expectEqual(@as(f32, 0.5), o.ch[0]);
 }

@@ -90,6 +90,38 @@ pub fn isParamPort(comptime T: type) bool {
     }
 }
 
+/// Is `ParamT` an EVENT LANE param — an `EventLane(Event)` value a block consumes
+/// in its `process`/`pull` signature alongside (or instead of) its sample ports?
+/// An event lane is neither a sample port (no pooled buffer) nor a parameter port
+/// (no ramp/hold scalar): it is delivered out-of-band by the executor from the
+/// engine's per-node event store, exactly as `set` values arrive out-of-band — so
+/// the port scanners SKIP it (it adds no sample input/output), which keeps an
+/// event-driven generator (e.g. a polyphonic voice block) a zero-sample-input
+/// Source that roots its path. The marker is the `is_event_lane` decl on the
+/// `EventLane(Event)` type.
+pub fn isEventLaneParam(comptime ParamT: type) bool {
+    comptime {
+        return @typeInfo(ParamT) == .@"struct" and @hasDecl(ParamT, "is_event_lane") and ParamT.is_event_lane;
+    }
+}
+
+/// The `Event` element type a block's event-lane param carries (its
+/// `EventLane(Event).Event`). Used by the executor to build the lane it hands the
+/// block. `void` if the block declares no event-lane param (not event-driven).
+pub fn EventOf(comptime Block: type) type {
+    const decl = if (@hasDecl(Block, "process")) "process" else if (@hasDecl(Block, "pull")) "pull" else return void;
+    const f = @typeInfo(@TypeOf(@field(Block, decl))).@"fn";
+    inline for (f.params[1..]) |p| {
+        if (comptime isEventLaneParam(p.type.?)) return p.type.?.Event;
+    }
+    return void;
+}
+
+/// Does `Block` consume an event lane (declare an `EventLane(Event)` param)?
+pub fn isEventConsumer(comptime Block: type) bool {
+    return EventOf(Block) != void;
+}
+
 /// Read one port param's element type and direction. Two shapes are accepted:
 ///
 ///   - A **planar buffer view** `Planar(Lane, L)` / `PlanarConst(Lane, L)` — the
@@ -196,6 +228,7 @@ fn mapPortCounts(comptime Block: type) struct { inputs: comptime_int, outputs: c
     var inputs: comptime_int = 0;
     var outputs: comptime_int = 0;
     inline for (f.params[1..]) |p| {
+        if (comptime isEventLaneParam(p.type.?)) continue; // event lane: not a sample port
         const port = portOfParam(p.type.?);
         if (port.dir == .in) inputs += 1 else outputs += 1;
     }
@@ -224,6 +257,7 @@ pub fn isSource(comptime Block: type) bool {
 pub fn MapInElem(comptime Block: type) type {
     const f = @typeInfo(@TypeOf(Block.process)).@"fn";
     inline for (f.params[1..]) |p| {
+        if (comptime isEventLaneParam(p.type.?)) continue;
         const port = portOfParam(p.type.?);
         if (port.dir == .in) return port.Elem;
     }
@@ -234,6 +268,7 @@ pub fn MapInElem(comptime Block: type) type {
 pub fn MapOutElem(comptime Block: type) type {
     const f = @typeInfo(@TypeOf(Block.process)).@"fn";
     inline for (f.params[1..]) |p| {
+        if (comptime isEventLaneParam(p.type.?)) continue;
         const port = portOfParam(p.type.?);
         if (port.dir == .out) return port.Elem;
     }
@@ -269,6 +304,7 @@ pub fn MapInElemAt(comptime Block: type, comptime i: usize) type {
     const f = @typeInfo(@TypeOf(Block.process)).@"fn";
     comptime var seen: usize = 0;
     inline for (f.params[1..]) |p| {
+        if (comptime isEventLaneParam(p.type.?)) continue;
         const pinfo = portOfParam(p.type.?);
         if (pinfo.dir == .in) {
             if (seen == i) return pinfo.Elem;

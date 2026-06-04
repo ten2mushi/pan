@@ -225,7 +225,33 @@ pub const Adsr = env.Adsr;
 pub const FeatureMap = env.FeatureMap;
 // Layered-library roots filled by later phases.
 pub const mix = struct {};
-pub const synth = struct {};
+
+/// The synthesis library — the Instrument graph shape. The typed event lane
+/// (`EventLane(Event)`) and the blessed `NoteEvent` union; a worked `SawVoice`
+/// (PolyBLEP osc → ADSR → VCA); and fixed-capacity intra-block polyphony as one
+/// static op: `PolyVoice(Voice, Vmax)` (fused, internal-skip) / `VoiceMap` (replicated).
+pub const synth = @import("synth.zig");
+/// The blessed instrument event union (pitch in Hz; note_on/off, pressure, MPE
+/// expression, control, bend, program). The event lane is event-generic; this is
+/// the library type instruments consume.
+pub const NoteEvent = synth.NoteEvent;
+/// The event-type-generic lane a block consumes (a time-sorted `(sample_offset,
+/// event)` view), delivered to its node out-of-band by the engine.
+pub const EventLane = synth.EventLane;
+/// One time-stamped event (`{ sample_offset, event }`).
+pub const Timed = synth.Timed;
+/// An MPE per-note expression axis (timbre / bend / slide).
+pub const ExprAxis = synth.ExprAxis;
+/// A worked single voice: PolyBLEP saw → per-sample ADSR → velocity VCA.
+pub const SawVoice = synth.SawVoice;
+/// Fixed-capacity intra-block polyphony as one static op (fused internal-skip).
+pub const PolyVoice = synth.PolyVoice;
+/// The replicated polyphony realisation (all `Vmax` voices run every callback).
+pub const VoiceMap = synth.VoiceMap;
+/// The musical transport (sample-accurate position, tempo, loop).
+pub const Transport = io.Transport;
+/// The MIDI-ingestion adapter feeding `NoteEvent`s into the engine's event ring.
+pub const MidiEventSource = io.MidiEventSource;
 
 /// Feature-extraction blocks — the analysis side. Each is a rate-1:1 `Map` over a
 /// per-hop power spectrum (`FeatureFrame(bins)`): `Mfcc` (→ `FeatureFrame(K)`),
@@ -257,6 +283,10 @@ pub const Asrc = io.Asrc;
 /// `VariRate` SOURCE over an owned sample asset, `param.pitch` the held-per-call read
 /// step (parameter-driven, reproducible).
 pub const SamplePlayer = io.SamplePlayer;
+/// `PrefetchSource` — the off-thread-prefetch streaming file/network source: a
+/// `Sample(T)` Map Source over a lock-free SPSC FIFO filled by a background prefetch
+/// thread, so the audio thread pops wait-free with no disk I/O on the render path.
+pub const PrefetchSource = io.PrefetchSource;
 pub const writeFeatureMatrix = io.writeFeatureMatrix;
 pub const encodeFeatureMatrix = io.encodeFeatureMatrix;
 pub const featureMatrixColumns = io.featureMatrixColumns;
