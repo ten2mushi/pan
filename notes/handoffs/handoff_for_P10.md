@@ -7,6 +7,38 @@
 
 ---
 
+## 0. Update (post-Session-8) — P9 feature buildout + doc scrub landed, still green
+
+Two follow-on passes shipped ON TOP of the P9 gate below (everything in §1–§5 still holds; this section
+records what changed). Full detail: `notes/handoffs/handoff_for_P9_feature_buildout_followup.md`. Memory:
+`pan-p9-feature-buildout`.
+
+- **Feature-extraction buildout (first wave).** 14 new `src/feat.zig` blocks, all rate-1:1 `Map`s, each
+  with its exact formula in the doc-comment (the oracle spec): the spectral shape descriptors
+  (`SpectralRolloff`/`Flatness`/`Entropy`/`Spread`/`Skewness`/`Kurtosis`/`Crest`, `Hfc`), `Chroma`→
+  `FeatureFrame(12)`, `SpectralContrast`→`FeatureFrame(n_bands)`, the flicker-free `DominantBandHysteresis`
+  (stateful COLOR descriptor), and the time-domain `Zcr`/`TeoMean`/`BallisticEnvelope` (over
+  `spectral.TimeFrame` from `Framer`; `BallisticEnvelope` is the smoothed [0,1] AMPLITUDE descriptor).
+- **Open P9 boundary §4.1 CLOSED.** `tests/negative/concat_type_mismatch.zig` + a second `neg-compile`
+  build step (`build.zig` `neg_concat`) make the Concat wrong-element-type `@compileError`
+  (`src/graph.zig:340`) an ACTIVE must-fail fixture.
+- **Worked graph.** `tests/analysis_buildout_test.zig` (3 tests): `LpcmSource → Stft → PowerSpectrum →
+  {extractors} → Concat → FeatureCollectorSink → encoded matrix`, proving the column-major `f32` layout end
+  to end + the flicker-free color and ballistic amplitude descriptors.
+- **Yoneda dispatch (Rule 14).** 3 autonomous writers, **94 tests, all green, ZERO bugs**:
+  `tests/feat_spectral_shape_yoneda_test.zig` (42), `tests/feat_chroma_contrast_yoneda_test.zig` (23),
+  `tests/feat_timedomain_yoneda_test.zig` (29). All 4 new harnesses registered in `build.zig`.
+- **§0.2 code-documentation pass.** All `src/` doc-comments are now self-contained: spec-`.md` citations
+  (`catalog §x`, `*.md §y`, "the spec's …") and project-grounding ("viz", `notes/1.md`, "the Python side",
+  "60 fps", `examples/`) were removed/rephrased into agnostic prose; conceptual content preserved. Spec
+  citations remain only in test names (§0.4-sanctioned).
+- **Deferred (rationale in the followup handoff §4):** BS.1770/EBU-R128 gated loudness (wants a `Rate`
+  decimator with per-sample K-weighting, not a per-frame `Map`); the combined time+spectral single-matrix
+  fan-out (multi-Rate same-source fan-out, unverified under commit/PDC); Tier C/D (LPC/formants/pitch/PNCC/
+  onset/VAD → likely `src/detect.zig`); GFCC. None gate P10.
+
+---
+
 ## 1. Ownership statement (honest, Rule 12)
 
 The P9 gate (`pan_implementation_plan.md` §9 success criteria) is **met and green across the four-mode
@@ -75,7 +107,7 @@ zig build test -Doptimize=ReleaseFast
 zig build smoke                         # freestanding ReleaseSmall comptime-commit
 zig build cross-linux                   # x86_64-linux-gnu ALSA seam
 zig build fmt-check
-zig build neg-compile                   # the "missing Rate decl is a build error" gate
+zig build neg-compile                   # two must-fail fixtures: missing-Rate-decl + Concat-type-mismatch
 zig build bench -Dbench-gate            # footprint baseline 8192 B held
 ```
 Carried cosmetic noise (unchanged): aliasing_message_test / comparator_test drive reject paths with

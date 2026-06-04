@@ -280,7 +280,7 @@ pub fn Framer(comptime num: numeric.Numeric, comptime FRAME: usize, comptime HOP
         cursor: usize = 0,
         /// Samples consumed since the last frame emission (0..HOP). Carries the
         /// sub-`HOP` remainder of a chunk across `pull` calls, so the ring absorbs
-        /// `HOP ∤ chunk` misalignment — no input is ever dropped (catalog §9.3 T4).
+        /// `HOP ∤ chunk` misalignment — no input is ever dropped.
         phase: usize = 0,
 
         /// How many input samples `want` output frames consume: one hop each.

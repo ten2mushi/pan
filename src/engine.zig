@@ -521,7 +521,7 @@ pub fn exhaustThunkFor(comptime Block: type) ?ExhaustThunk {
 }
 
 /// Apply this op's wired PARAMETER-edge inputs to the block's parameter slots,
-/// just before `process` — the in-graph analogue of `set` (catalog §2.4 P3). A
+/// just before `process` — the in-graph analogue of `set`. A
 /// parameter port is a control-rate side input that does NOT appear in `process`,
 /// so the value is delivered through the block's `setParam(slot, value)`: the
 /// block then holds/ramps it across the buffer exactly as it ramps a `set` target,
@@ -811,7 +811,7 @@ pub const EngineOptions = struct {
     /// always-correct single-thread synchronous pull in the callback. `>1`
     /// requests the (phased) Tier-B multicore overlay, which auto-demotes to
     /// Tier A under the cost gate. `.threads`/`.cores` are two views of the same
-    /// budget; `.cores` is the spec's spelling for the Tier selection.
+    /// budget; `.cores` is the conventional spelling for the Tier selection.
     cores: usize = 1,
     /// Pre-size the buffer pool for this worst-case block size so a `reconfigure`
     /// to any N ≤ this is a live RCU swap (no reallocation). 0 ⇒ size exactly for
@@ -1829,7 +1829,7 @@ test "transition policy: mute and solo RAMP (never step) via the set + ramp path
 
 // A gain whose coefficient is a parameter PORT (`node.param.gain`, slot 0) — so it
 // can be driven EITHER by `set` (atomic) OR by a wired control-rate edge, the two
-// being two sources of the same per-block-ramped coefficient (catalog §2.4). It
+// being two sources of the same per-block-ramped coefficient. It
 // holds + ramps exactly like RampGain, so set vs a wired edge are bit-identical.
 const ParamGain = struct {
     const Self = @This();

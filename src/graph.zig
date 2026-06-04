@@ -370,8 +370,8 @@ pub const Graph = struct {
 };
 
 /// The committed graph the commit pass consumes is exactly this IR — a finite
-/// diagram of nodes, forward edges, and the declared feedback (z⁻¹) edges. The
-/// spec names it `CommittedGraph`; here it is the same value.
+/// diagram of nodes, forward edges, and the declared feedback (z⁻¹) edges. This
+/// committed form is conventionally called a `CommittedGraph`; here it is the same value.
 pub const CommittedGraph = Graph;
 
 test "connect type-checks matching PortIds; graph records the edge" {

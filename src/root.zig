@@ -188,7 +188,7 @@ pub const synth = struct {};
 /// Feature-extraction blocks — the analysis side. Each is a rate-1:1 `Map` over a
 /// per-hop power spectrum (`FeatureFrame(bins)`): `Mfcc` (→ `FeatureFrame(K)`),
 /// `SpectralCentroid`/`SpectralFlux`/`Rms` (→ `Scalar(f32)`), and `DominantBand`
-/// (→ `Scalar(u16)`, the viz's color/frequency channel). Tested against an external
+/// (→ `Scalar(u16)`, a dominant-band (color/frequency-index) descriptor). Tested against an external
 /// NumPy/librosa-equivalent oracle, not proven.
 pub const feat = @import("feat.zig");
 
@@ -204,7 +204,7 @@ pub const combinators = @import("combinators.zig");
 /// the growable, non-RT-only time-series sink (law A8 — rejected on a realtime
 /// root); `runToCompletion`/`ClockSource` drive an analysis root by input
 /// exhaustion; `writeFeatureMatrix`/`encodeFeatureMatrix` flatten the collected
-/// rows to the column-major `f32` matrix the `notes/1.md` viz consumes.
+/// rows to the column-major `f32` matrix a downstream consumer reads.
 pub const FeatureCollectorSink = io.FeatureCollectorSink;
 pub const writeFeatureMatrix = io.writeFeatureMatrix;
 pub const encodeFeatureMatrix = io.encodeFeatureMatrix;

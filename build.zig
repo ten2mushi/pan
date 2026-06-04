@@ -102,6 +102,10 @@ pub fn build(b: *std.Build) void {
         "tests/analysis_root_test.zig",
         "tests/feat_yoneda_test.zig",
         "tests/analysis_yoneda_test.zig",
+        "tests/analysis_buildout_test.zig",
+        "tests/feat_spectral_shape_yoneda_test.zig",
+        "tests/feat_chroma_contrast_yoneda_test.zig",
+        "tests/feat_timedomain_yoneda_test.zig",
     };
     for (harnesses) |path| {
         const h_mod = b.createModule(.{
@@ -128,9 +132,24 @@ pub fn build(b: *std.Build) void {
     });
     neg.expectExitCode(1);
     neg.has_side_effects = true; // always re-run (it produces no cacheable output)
-    const neg_step = b.step("neg-compile", "Assert the missing-Rate-declaration build error fires (P8 gate)");
+    const neg_step = b.step("neg-compile", "Assert the missing-Rate-declaration + Concat-type-mismatch build errors fire");
     neg_step.dependOn(&neg.step);
     test_step.dependOn(&neg.step);
+
+    // The P9 companion: a wrong element type on a named `Concat` column is a
+    // `@compileError` (the connect type-check, `src/graph.zig:340`). This fixture
+    // wires a `Scalar(f32)` producer into a `FeatureFrame(13)` column and MUST fail
+    // to compile — turning the "wrong element type = compile error" guarantee from
+    // ⊢-by-inspection into an active must-fail build check.
+    const neg_concat = b.addSystemCommand(&.{
+        b.graph.zig_exe,      "build-obj", "-fno-emit-bin",
+        "--dep",              "pan",       "-Mroot=tests/negative/concat_type_mismatch.zig",
+        "-Mpan=src/root.zig",
+    });
+    neg_concat.expectExitCode(1);
+    neg_concat.has_side_effects = true;
+    neg_step.dependOn(&neg_concat.step);
+    test_step.dependOn(&neg_concat.step);
 
     // ---- Freestanding ReleaseSmall smoke object ------------------------
     // Proves the commit pass evaluates at comptime against a no-std target —

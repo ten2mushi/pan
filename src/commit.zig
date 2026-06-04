@@ -161,7 +161,7 @@ pub const RenderOp = struct {
     /// resolved for this node through the upstream rate ratios.
     n_or_pull_spec: usize,
     /// PARAMETER-edge inputs, kept SEPARATE from sample inputs. A parameter port
-    /// is a control-rate side input (catalog §2.4 P1): it does not appear in the
+    /// is a control-rate side input: it does not appear in the
     /// block's `process` signature (M1 ranges over sample slices only), so the
     /// executor must NOT consume it as a `process` argument. Instead, before
     /// invoking `process`, the executor reads the latest control value from each
@@ -814,9 +814,9 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
         // identity — a `Frame`'s channel count rides in its layout name, a
         // `FeatureFrame(K)`'s K and a `Complex` bin width ride in their names — so
         // two values sharing an `elem_name` necessarily share `@sizeOf` (their type
-        // is the same), and a class is UNIFORM-SIZE by construction. The spec's
+        // is the same), and a class is UNIFORM-SIZE by construction. The
         // first-fit-decreasing fallback for "heterogeneous element_count within one
-        // class" (§4) is therefore UNREACHABLE under this keying: a differing count
+        // class" is therefore UNREACHABLE under this keying: a differing count
         // is a differing name is a differing class. We keep the pure linear
         // left-edge colorer below and ASSERT the invariant here (a uniform-count
         // guard) rather than carry dead FFD bin-packing code — if a future keying
@@ -827,7 +827,7 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
         // is N, so there is one class per element name exactly as before; a
         // rate-changing seam splits same-typed values of different `want` into
         // distinct, uniform-size classes — so each class is uniform by construction
-        // and the spec's heterogeneous-count FFD fallback stays unreachable (the
+        // and the heterogeneous-count FFD fallback stays unreachable (the
         // assert below stands guard).
         var class_names: [max_edges][]const u8 = undefined;
         var class_elem_size: [max_edges]usize = undefined;
@@ -1207,7 +1207,7 @@ pub fn commitRuntime(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan
 /// The negotiation insertion step (runtime path): where a wired edge crosses a
 /// sample-rate boundary, insert a **resampler** coercion node so the producer →
 /// consumer square commutes — the categorical "make the diagram commute" made
-/// concrete (catalog §6). `producer → consumer` becomes `producer → resampler →
+/// concrete. `producer → consumer` becomes `producer → resampler →
 /// consumer`; the resampler's output sits at the consumer's rate. The resampler's
 /// numerical body (polyphase sinc) is a later phase; the node is tagged
 /// `is_coercion` and the runtime engine binds a built-in kernel for it. Only

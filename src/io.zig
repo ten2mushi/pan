@@ -491,7 +491,7 @@ pub fn LpcmSource(comptime num: numeric.Numeric) type {
 // ===========================================================================
 
 /// `FeatureCollectorSink(Row)` — drain per-hop feature rows into a growable
-/// time-series for the analysis/visualization pipeline. `Row` is typically the
+/// time-series for the analysis pipeline. `Row` is typically the
 /// output struct of a `Concat` (one column per named feature).
 ///
 /// This is the one blessed place a `realloc` may happen: `capacity_hint`
@@ -588,7 +588,7 @@ pub fn TapSource(comptime Elem: type, comptime cap: usize) type {
 }
 
 // ===========================================================================
-// Feature-matrix flattening — the column layout the viz consumes
+// Feature-matrix flattening — the column layout a downstream consumer reads
 // ===========================================================================
 
 /// The number of `f32` columns a `Row` flattens to: each `FeatureFrame(K)` field
@@ -618,7 +618,7 @@ fn scalarToF32(comptime T: type, x: T) f32 {
 
 /// Flatten one `Row` into the writer slice `out` (length == `featureMatrixColumns`),
 /// returning the number of columns written. Integer scalars (e.g. a `DominantBand`
-/// bin index, `Scalar(u16)`) widen to `f32`; the viz reads them back per column.
+/// bin index, `Scalar(u16)`) widen to `f32`; a downstream consumer reads them back per column.
 fn flattenRow(comptime Row: type, row: Row, out: []f32) usize {
     comptime var col: usize = 0;
     inline for (@typeInfo(Row).@"struct".fields) |f| {
@@ -638,8 +638,9 @@ fn flattenRow(comptime Row: type, row: Row, out: []f32) usize {
 /// Encode a collected feature matrix (`[]const Row`) into a row-major `[]f32`:
 /// `rows · featureMatrixColumns(Row)` values, row `r`'s columns contiguous. The
 /// caller owns the returned slice and frees it with `alloc`. This is the exact
-/// buffer the Python viz maps to its "Data for every point" schema (dominant →
-/// color, rms → amplitude, row index → emission time).
+/// column-major buffer a downstream consumer reads: each row is one hop's feature
+/// set, columns are the named features in declaration order, and the row index is
+/// emission order in time.
 pub fn encodeFeatureMatrix(alloc: std.mem.Allocator, matrix: anytype) ![]f32 {
     const Row = @typeInfo(@TypeOf(matrix)).pointer.child;
     const cols = comptime featureMatrixColumns(Row);
@@ -652,10 +653,10 @@ pub fn encodeFeatureMatrix(alloc: std.mem.Allocator, matrix: anytype) ![]f32 {
     return buf;
 }
 
-/// Write a collected feature matrix to `path` as native-endian row-major `f32`
-/// (the `features.f32.bin` the Python 60 fps viz reads). A convenience over
-/// `encodeFeatureMatrix` for the `examples/` use case; it owns its own `Io` and
-/// scratch allocation. Disk-light by design: the matrix is the only artifact.
+/// Write a collected feature matrix to `path` as native-endian row-major `f32`.
+/// A convenience over `encodeFeatureMatrix` that writes the encoded matrix to a
+/// file; it owns its own `Io` and scratch allocation. Disk-light by design: the
+/// matrix is the only artifact.
 pub fn writeFeatureMatrix(path: []const u8, matrix: anytype) !void {
     const gpa = std.heap.page_allocator;
     const floats = try encodeFeatureMatrix(gpa, matrix);
@@ -671,8 +672,8 @@ pub fn writeFeatureMatrix(path: []const u8, matrix: anytype) !void {
 
 /// `RuntimeResampler` — a streaming rational `p:q` (out:in) windowed-sinc polyphase
 /// resampler with a RUNTIME ratio (the rates come from the negotiation pass, not a
-/// comptime monomorph like `spectral.Resampler`), the SRC "boundary citizen" of
-/// `pan_io_realtime_and_pipeline.md §2/§5`.
+/// comptime monomorph like `spectral.Resampler`), the sample-rate-conversion
+/// citizen at the I/O boundary where the device rate meets the pipeline rate.
 ///
 /// It is **drift-free by construction**: `needed_input(want)` is **phase-stateful**
 /// — `(acc + want·q) / p` against the live phase accumulator — so it reports the
@@ -868,7 +869,7 @@ pub const Unsupported = struct {
 const darwin = struct {
     // The CoreAudio / AudioUnit C surface needed to open the default output unit
     // and install a render callback. Declared here as the `extern`/`callconv(.c)`
-    // interop boundary (catalog: the I/O HAL is target-specific C interop). These
+    // interop boundary (the I/O HAL is target-specific C interop). These
     // symbols resolve against the AudioToolbox framework, linked on macOS builds.
     const OSStatus = i32;
     const AudioUnit = ?*anyopaque;
