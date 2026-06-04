@@ -792,6 +792,261 @@ fn buildProto(proto: []f32, taps: usize, half: usize, up: usize, gain: usize) vo
 }
 
 // ===========================================================================
+// Asrc — the device-boundary adaptive (asynchronous) sample-rate converter
+// ===========================================================================
+
+/// `Asrc(num, cap)` — the drift-correcting asynchronous resampler that sits at the
+/// device boundary when capture and playback run on **independent crystals**. Two
+/// nominally-equal clocks (48000.01 Hz vs 47999.98 Hz) drift apart over minutes and
+/// would eventually drain or overflow any fixed bridging buffer — the classic
+/// "works in the demo, fails after 20 minutes" xrun. The fix: bridge the two clocks
+/// with a lock-free FIFO and continuously resample the slave stream by a ratio
+/// nudged in real time so the FIFO fill stays centred.
+///
+/// It is a `VariRate` **source** (zero sample-input): it owns a read cursor over the
+/// bridging FIFO (a caller-owned `SpscRing` the capture side pushes into) and
+/// `pull(want, out)` produces from it. The out:in ratio lives in a **tight bounded
+/// interval around nominal** (`rate_bounds`) and is driven by an **internal PI
+/// controller** on the FIFO fill, not by an external parameter — so a slightly-fast
+/// capture clock (FIFO filling) nudges the ratio down (consume more per output,
+/// drain), and a slightly-slow one nudges it up (consume fewer, refill).
+///
+/// **Determinism — the honest split.** Because the ratio tracks a wall-clock fill
+/// level, this render is **NOT bit-reproducible**: it is the *same class as the
+/// clock drift it compensates*, correctly so — drift compensation cannot be made
+/// deterministic. (A varispeed whose ratio is a deterministic parameter, by
+/// contrast, IS reproducible; that block lives elsewhere.) Bypass this entirely when
+/// capture and playback share one clock (a single full-duplex device): there is no
+/// drift to correct, so resampling would only add error and latency.
+///
+/// Linear (2-point) interpolation, mono. A wide-fixed-point ratio + adaptive
+/// polyphase FIR (the >130 dB-SNR tier) is the quality upgrade and is not
+/// implemented here; the contract — bounded ratio, centred FIFO, no xrun over a long
+/// run — is what this realises.
+pub fn Asrc(comptime num: numeric.Numeric, comptime cap: usize) type {
+    const T = num.Lane;
+    if (@typeInfo(T) != .float)
+        @compileError("pan: Asrc needs a float lane (the ratio/interp are f64/f32); use f32/f64");
+    comptime std.debug.assert(std.math.isPowerOfTwo(cap));
+    return struct {
+        const Self = @This();
+        pub const Ring = control.SpscRing(types.Sample(T), cap);
+
+        // A tight interval around nominal 1:1 (≈ ±3%): enough control range to track
+        // a few-percent clock mismatch, narrow enough that the worst-case planning
+        // (sizing on `min`, PDC on `max_latency`) stays close to nominal. The `min`
+        // endpoint (slowest, the most input per output) is the worst-case planner.
+        pub const rate_bounds = .{ .min = .{ 31, 32 }, .nominal = .{ 1, 1 }, .max = .{ 33, 32 } };
+        const min_ratio: f32 = 31.0 / 32.0;
+        const max_ratio: f32 = 33.0 / 32.0;
+        /// Worst-case delay over the interval, for latency compensation. The bridge
+        /// is centred at `cap/2` samples of FIFO fill (the elastic buffer that
+        /// absorbs the drift) plus one interpolation sample of lookback.
+        pub const max_latency: usize = cap / 2 + 1;
+        /// The ratio is a wall-clock-driven controller output — the non-reproducible
+        /// determinism class (the same class as the clock drift it compensates).
+        pub const ratio_source: enum { parameter, internal_controller } = .internal_controller;
+
+        /// The bridging FIFO (caller-owned, shared with the capture side; passed by
+        /// pointer at `add`, like the cross-root taps). The capture thread `push`es
+        /// at its clock; this block `pop`s at the playback clock's demand.
+        ring: *Ring = undefined,
+        /// PI-controller setpoint: keep the FIFO half-full so it has equal room to
+        /// absorb drift in either direction.
+        target_fill: f32 = @as(f32, @floatFromInt(cap)) / 2.0,
+        /// Proportional / integral gains. Deliberately small and slow — the loop
+        /// corrects ppm-scale drift over many blocks, never per-sample jitter. Chosen
+        /// so the per-block fill correction is well inside the rate interval (the
+        /// proportional term reaches the interval edge only for a fill error of a
+        /// large fraction of the buffer, so the loop is over-damped, never bang-bang).
+        kp: f32 = 2.0e-4,
+        ki: f32 = 2.0e-6,
+        /// The integrated fill error (anti-windup-clamped). Persistent loop state.
+        integ: f32 = 0,
+        /// Linear-interpolation brackets: `prev` (last consumed) and `cur` (the held
+        /// FIFO front, peeked until the cursor crosses it). `frac ∈ [0,1)` is the
+        /// read position between them. All persist across calls (continuous stream).
+        prev: T = 0,
+        cur: T = 0,
+        frac: f64 = 0,
+        primed: bool = false,
+        /// Count of output samples produced under FIFO underrun (the held-sample
+        /// fallback fired). Zero over a well-controlled run — a telemetry/health flag.
+        xruns: usize = 0,
+
+        /// Sample the FIFO fill once per call and update the PI loop, returning the
+        /// held out:in ratio for this call (clamped into `rate_bounds`). Negative
+        /// feedback: more fill ⇒ lower ratio ⇒ more input consumed per output ⇒ drain.
+        fn updateRatio(self: *Self) f32 {
+            const fill: f32 = @floatFromInt(self.ring.len());
+            const err = fill - self.target_fill;
+            self.integ += err;
+            // Anti-windup: bound the integral CONTRIBUTION to half the rate interval,
+            // so a long starvation/flood can never wind the integrator into an
+            // un-recoverable bias that pins the ratio at a bound (bang-bang).
+            const integ_limit = ((max_ratio - min_ratio) / 2.0) / @max(self.ki, 1e-12);
+            self.integ = @min(@max(self.integ, -integ_limit), integ_limit);
+            const r = 1.0 - self.kp * err - self.ki * self.integ;
+            return @min(@max(r, min_ratio), max_ratio);
+        }
+
+        pub fn pull(self: *Self, want: usize, out: []types.Sample(T)) usize {
+            const r = self.updateRatio(); // ratio sampled ONCE, held across the call
+            const step = 1.0 / @as(f64, r);
+            if (!self.primed) {
+                // Prime the two interpolation brackets from the FIFO front.
+                self.prev = if (self.ring.pop()) |s| s.ch[0] else 0;
+                self.cur = if (self.ring.pop()) |s| s.ch[0] else self.prev;
+                self.primed = true;
+            }
+            var produced: usize = 0;
+            while (produced < want) {
+                if (self.frac >= 1.0) {
+                    // Cursor crossed an input boundary: advance the bracket, pulling a
+                    // fresh sample from the FIFO. On underrun, hold the last sample
+                    // (graceful, click-bounded) and flag it.
+                    self.prev = self.cur;
+                    if (self.ring.pop()) |s| {
+                        self.cur = s.ch[0];
+                    } else {
+                        self.xruns += 1; // FIFO starved — hold `cur`
+                    }
+                    self.frac -= 1.0;
+                    continue;
+                }
+                const f: T = @floatCast(self.frac);
+                out[produced].ch[0] = self.prev + f * (self.cur - self.prev);
+                produced += 1;
+                self.frac += step;
+            }
+            return produced;
+        }
+    };
+}
+
+// ===========================================================================
+// SamplePlayer — varispeed / scrub sample playback at arbitrary pitch (VariRate)
+// ===========================================================================
+
+/// `SamplePlayer(num)` — plays back a loaded sample asset at an arbitrary, live
+/// **playback pitch**: the varispeed / scrub source. It is a `VariRate` SOURCE (zero
+/// sample-input — it owns its asset, a read cursor over it, and `pull(want, out)`s
+/// from it), discriminated at comptime by a bounded `rate_bounds` interval plus
+/// `max_latency`, exactly like any `VariRate`.
+///
+/// `param.pitch` is the **read step**: input asset samples advanced per output
+/// sample. `pitch = 1` is normal speed; `pitch = 2` plays back twice as fast (an
+/// octave up, half the duration); `pitch = 0.5` half speed (an octave down). The
+/// out:in ratio is therefore `1/pitch`, so the bounded pitch interval `[1/2, 2]`
+/// gives the `rate_bounds` interval `[1/2, 2]` (symmetric); the `min` ratio endpoint
+/// (slowest out:in = the most input per output = fastest pitch) is what the static
+/// plan sizes the worst-case input demand on. The pitch is sampled ONCE per render
+/// call and held across the buffer (no zipper), arriving through `setParam` — a wired
+/// pitch source and an external `set` are the same held value.
+///
+/// Driven by a deterministic parameter, the render is a pure function of the asset
+/// and the pitch schedule — reproducible (the parameter-driven determinism class).
+/// Linear (2-point) interpolation, mono; a windowed-sinc kernel is the quality tier.
+pub fn SamplePlayer(comptime num: numeric.Numeric) type {
+    const T = num.Lane;
+    if (@typeInfo(T) != .float)
+        @compileError("pan: SamplePlayer needs a float lane (fractional cursor / interp); use f32/f64");
+    return struct {
+        const Self = @This();
+
+        // Pitch (read step) interval [1/2, 2] ⇒ out:in interval [1/2, 2]. The `min`
+        // out:in endpoint (= fastest pitch, the most input per output) is the
+        // worst-case planning endpoint.
+        pub const rate_bounds = .{ .min = .{ 1, 2 }, .nominal = .{ 1, 1 }, .max = .{ 2, 1 } };
+        const min_pitch: f32 = 0.5;
+        const max_pitch: f32 = 2.0;
+        /// One input sample of interpolation lookback, in output samples; at the
+        /// fastest pitch one input sample is half an output sample, so 1 is a safe
+        /// worst-case bound.
+        pub const max_latency: usize = 1;
+        /// Deterministic parameter ⇒ reproducible (the parameter-driven class).
+        pub const ratio_source: enum { parameter, internal_controller } = .parameter;
+        /// The playback pitch (read step), a control-rate parameter port (slot 0).
+        pub const params = .{ .pitch = types.Scalar(f32) };
+
+        /// The loaded mono sample asset (set at `add` via params; empty default so the
+        /// block is default-constructible). Borrowed — the caller owns the storage.
+        data: []const types.Sample(T) = &.{},
+        /// Fractional read position into `data`. Persists across calls (continuous
+        /// playback); the implicit pre-roll before sample 0 is silence.
+        cursor: f64 = 0,
+        /// Wrap at the end (loop forever) vs. drain once and zero-pad / signal done.
+        loop: bool = true,
+        /// Set once a non-looping asset has been fully played out.
+        done: bool = false,
+        /// Latest published pitch target (atomic; control thread OR wired edge). Read
+        /// once per call (held-per-call).
+        pitch: control.Param = control.Param.init(1.0),
+
+        pub fn setParam(self: *Self, slot: u8, value: f32) void {
+            if (slot == 0) self.pitch.set(value);
+        }
+
+        /// Worst-case input demand: at the fastest pitch (2×) each output reads two
+        /// asset samples, so `want` outputs need at most `2·want`. (A source has no
+        /// input edge, so this is documentation parity with the `VariRate` contract.)
+        pub fn needed_input(_: *Self, want: usize) usize {
+            return want * 2;
+        }
+
+        fn readAsset(self: *const Self, idx: usize) T {
+            if (idx >= self.data.len) return 0;
+            return self.data[idx].ch[0];
+        }
+
+        pub fn pull(self: *Self, want: usize, out: []types.Sample(T)) usize {
+            const step = @as(f64, @min(@max(self.pitch.read(), min_pitch), max_pitch)); // held per call
+            var produced: usize = 0;
+            while (produced < want) : (produced += 1) {
+                if (self.data.len == 0) {
+                    out[produced].ch[0] = 0;
+                    self.done = true;
+                    continue;
+                }
+                if (self.cursor >= @as(f64, @floatFromInt(self.data.len))) {
+                    if (self.loop) {
+                        // A `while` (true modulo), not a single subtract: a fast pitch
+                        // over a very short asset can overshoot the end by more than
+                        // one asset length in a single step, so one subtract would
+                        // leave the cursor still past the end.
+                        const len_f: f64 = @floatFromInt(self.data.len);
+                        while (self.cursor >= len_f) self.cursor -= len_f;
+                    } else {
+                        out[produced].ch[0] = 0;
+                        self.done = true;
+                        continue;
+                    }
+                }
+                const idx0: usize = @intFromFloat(@floor(self.cursor));
+                const frac: T = @floatCast(self.cursor - @as(f64, @floatFromInt(idx0)));
+                const x0 = self.readAsset(idx0);
+                // The right bracket wraps to the loop start (or is silence past end).
+                const x1 = if (idx0 + 1 < self.data.len)
+                    self.readAsset(idx0 + 1)
+                else if (self.loop and self.data.len > 0)
+                    self.readAsset(0)
+                else
+                    0;
+                out[produced].ch[0] = x0 + frac * (x1 - x0);
+                self.cursor += step;
+            }
+            return produced;
+        }
+
+        /// Has a non-looping asset been fully played out? Mirrors `LpcmSource` so the
+        /// input-exhaustion pull root can end an offline run.
+        pub fn exhausted(self: *Self) bool {
+            return self.done;
+        }
+    };
+}
+
+// ===========================================================================
 // The device-transport HAL — one interface, two desktop backends
 // ===========================================================================
 

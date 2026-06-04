@@ -201,6 +201,16 @@ pub const Stft = spectral.Stft;
 pub const iStft = spectral.iStft;
 pub const PowerSpectrum = spectral.PowerSpectrum;
 pub const Resampler = spectral.Resampler;
+/// `Varispeed` — the arbitrary-runtime-ratio resampler `VariRate` (varispeed /
+/// scrub / sample-playback pitch): a bounded `rate_bounds` interval + `max_latency`,
+/// the operating ratio a held-per-call parameter (`connect(ctrl, vs.param.ratio)`).
+pub const Varispeed = spectral.Varispeed;
+/// `TimeStretch` — runtime tempo change without pitch change: a `VariRate` source
+/// (overlap-add; the variable analysis hop is the rate seam, output = `stretch` ×
+/// input length at the same pitch). `PitchShift` — constant-duration pitch shift =
+/// time-stretch ∘ resample (a rate-1:1 `Map` source composing two VariRate stages).
+pub const TimeStretch = spectral.TimeStretch;
+pub const PitchShift = spectral.PitchShift;
 
 /// Control-side generators — the modulation *producers* that drive parameter ports.
 /// `Lfo` is a control-rate low-frequency oscillator: a zero-sample-input `Map`
@@ -238,6 +248,15 @@ pub const combinators = @import("combinators.zig");
 /// exhaustion; `writeFeatureMatrix`/`encodeFeatureMatrix` flatten the collected
 /// rows to the column-major `f32` matrix a downstream consumer reads.
 pub const FeatureCollectorSink = io.FeatureCollectorSink;
+/// `Asrc` — the device-boundary drift-correcting asynchronous resampler: a
+/// `VariRate` source over a bridging SPSC FIFO whose out:in ratio is nudged by an
+/// internal PI controller to keep the FIFO centred (the controller-driven, ≈-only
+/// determinism class). Bypass on a single full-duplex clock.
+pub const Asrc = io.Asrc;
+/// `SamplePlayer` — varispeed / scrub sample playback at an arbitrary live pitch: a
+/// `VariRate` SOURCE over an owned sample asset, `param.pitch` the held-per-call read
+/// step (parameter-driven, reproducible).
+pub const SamplePlayer = io.SamplePlayer;
 pub const writeFeatureMatrix = io.writeFeatureMatrix;
 pub const encodeFeatureMatrix = io.encodeFeatureMatrix;
 pub const featureMatrixColumns = io.featureMatrixColumns;

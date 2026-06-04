@@ -1,0 +1,11 @@
+{
+  "name": "varispeed_f32",
+  "block": "Varispeed",
+  "format": { "sample_rate": 48000, "precision": "f32", "channels": 1, "block_size": 64 },
+  "out_per_in": "varies (1.5 nominal)",
+  "algorithmic_latency": 5,
+  "seed": 5,
+  "n_frames": 1024,
+  "params": { "ratio": 1.5 },
+  "tolerance": { "atol": 1e-6, "rtol": 1e-5 }
+}

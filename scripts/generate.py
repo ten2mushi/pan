@@ -227,11 +227,45 @@ def _ref_adsr(x: np.ndarray, params: dict) -> np.ndarray:
     return y
 
 
+def _ref_varispeed(x: np.ndarray, params: dict) -> np.ndarray:
+    """Varispeed (arbitrary-runtime-ratio LINEAR resampler) reference — an
+    INDEPENDENT f64 re-derivation of the block's streaming linear-interpolation
+    recurrence (catalog Rule 9). `ratio` is the out:in operating point, clamped to
+    [0.25, 4.0]; the read step is `1/ratio` input samples per output. The previous
+    input is the left bracket, the next-unconsumed input the right bracket, with a
+    fractional phase carried across the loop; outputs are emitted until the input is
+    exhausted. The pre-roll left bracket is silence (0). This mirrors the recurrence;
+    the f32-vs-f64 arithmetic gap is forgiven by the manifest's allclose tolerance."""
+    r = float(params["ratio"])
+    r = min(max(r, 0.25), 4.0)
+    step = 1.0 / r
+    xs = x[:, 0].astype(np.float64)
+    want = int(params.get("want", xs.shape[0] * 8))  # large: produce until input exhausted
+    out: list[float] = []
+    prev = 0.0
+    frac = 0.0
+    i = 0
+    while len(out) < want:
+        if frac < 1.0:
+            if i >= xs.shape[0]:
+                break
+            out.append(prev + frac * (xs[i] - prev))
+            frac += step
+        else:
+            if i >= xs.shape[0]:
+                break
+            prev = float(xs[i])
+            i += 1
+            frac -= 1.0
+    return np.array(out, dtype=np.float64).reshape(-1, 1)
+
+
 _REFERENCES = {
     "Gain": _ref_gain,
     "Biquad": _ref_biquad,
     "ConstantPowerPan": _ref_pan,
     "Resampler": _ref_resampler,
+    "Varispeed": _ref_varispeed,
     "Lfo": _ref_lfo,
     "Adsr": _ref_adsr,
     # STFT is complex-output → validated hermetically (see note above), not here.

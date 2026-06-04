@@ -184,9 +184,10 @@ fn outElemOf(comptime Block: type) type {
 }
 
 /// Read the block's rate ratio `p:q`. A `Map` is rate-1:1; a `Rate` declares
-/// `out_per_in = .{ p, q }`. (A `VariRate`'s scheduling uses its `rate_bounds`
-/// min endpoint — wired in with the rate-elastic blocks; here it falls back to
-/// 1:1, which no committed graph yet exercises.)
+/// `out_per_in = .{ p, q }`. A `VariRate` declares no point ratio, so scheduling
+/// plans on its WORST-CASE endpoint — the `rate_bounds.min` ratio, the most input
+/// ever needed for a given output demand — which is what sizes its edge buffers
+/// and its upstream's per-callback demand. A block with neither falls back to 1:1.
 fn ratioOf(comptime Block: type) struct { p: usize, q: usize } {
     if (@hasDecl(Block, "out_per_in")) {
         const r = Block.out_per_in;
@@ -256,7 +257,18 @@ pub const Graph = struct {
             // ring length): a unit delay declares 1, a delay line declares L.
             .is_delay = comptime @hasDecl(Block, "delay_len"),
             .delay_len = comptime if (@hasDecl(Block, "delay_len")) Block.delay_len else 0,
-            .algorithmic_latency = comptime if (@hasDecl(Block, "algorithmic_latency")) Block.algorithmic_latency else 0,
+            // A Map declares no latency (0); a Rate declares `algorithmic_latency`;
+            // a VariRate declares `max_latency` (its worst-case delay over the whole
+            // rate interval). PDC plans the longest path on this single per-node
+            // figure, so a VariRate is compensated for its worst case — the most
+            // delay it could ever introduce — keeping fan-in alignment correct at
+            // every operating ratio.
+            .algorithmic_latency = comptime if (@hasDecl(Block, "algorithmic_latency"))
+                Block.algorithmic_latency
+            else if (@hasDecl(Block, "max_latency"))
+                Block.max_latency
+            else
+                0,
             .out_per_in_p = ratio.p,
             .out_per_in_q = ratio.q,
             .aliasing_safe = comptime @hasDecl(Block, "aliasing_safe") and Block.aliasing_safe,

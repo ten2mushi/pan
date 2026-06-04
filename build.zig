@@ -114,6 +114,13 @@ pub fn build(b: *std.Build) void {
         "tests/dynamics_yoneda_test.zig",
         "tests/modulation_gold_test.zig",
         "tests/adaptive_yoneda_test.zig",
+        "tests/varirate_latency_test.zig",
+        "tests/varispeed_yoneda_test.zig",
+        "tests/asrc_yoneda_test.zig",
+        "tests/varirate_gold_test.zig",
+        "tests/sampleplayer_yoneda_test.zig",
+        "tests/timestretch_yoneda_test.zig",
+        "tests/pitchshift_yoneda_test.zig",
     };
     for (harnesses) |path| {
         const h_mod = b.createModule(.{
