@@ -864,6 +864,106 @@ pub const Unsupported = struct {
     }
 };
 
+// ===========================================================================
+// The embedded I2S-DMA transport — the ISR-as-callback mapping (target-generic)
+// ===========================================================================
+//
+// On an MCU the render callback IS the I2S DMA ping-pong interrupt. The DMA runs
+// in CIRCULAR mode over a buffer of `2N` frames (two halves): while the DMA
+// streams one half to/from the codec, the processing side owns the OTHER half.
+//   - HALF-TRANSFER (HT) IRQ → the DMA has finished the FIRST half; process the
+//     first half while the DMA streams the second.
+//   - TRANSFER-COMPLETE (TC) IRQ → the DMA has finished the SECOND half; process
+//     the second while the DMA refills the first.
+// "Fill before the deadline" therefore means "finish before the next HT/TC IRQ."
+//
+// Here N (= half the DMA buffer) is COMPTIME-KNOWN — strictly easier than the
+// desktop runtime-N path: the scalar tail vanishes and kernels fully unroll. This
+// struct is the PORTABLE circular-buffer + active-half model the freestanding
+// embedded profile exercises; the register-level DMA configuration and the IRQ
+// vector binding are target-specific (a concrete MCU register map, with its
+// known STM32-HAL circular-mode TC-callback suppression caveat to verify, is a
+// later phase — this build targets the freestanding stub, so the device-poke
+// layer is left as a documented seam, not invented).
+pub fn I2sDma(comptime num: numeric.Numeric, comptime N: usize) type {
+    const T = num.Lane;
+    return struct {
+        const Self = @This();
+        /// Frames per half (= the comptime block size N the graph commits against).
+        pub const half_frames = N;
+        /// The `2N`-frame circular DMA buffer (two N-frame halves), cache-line
+        /// aligned. Lives in `.bss` on the target — no heap exists there.
+        buf: [2 * N]types.Sample(T) align(64) = @splat(.{ .ch = .{0} }),
+        /// Which half the PROCESSING side currently owns (the DMA owns the other).
+        active: u1 = 0,
+
+        /// The half indexed `which` (0 = first, 1 = second), as a frame slice.
+        pub fn half(self: *Self, which: u1) []types.Sample(T) {
+            const base = @as(usize, which) * N;
+            return self.buf[base .. base + N];
+        }
+        /// The half the processing side currently owns (read by a source, written
+        /// by a sink during the render this IRQ drives).
+        pub fn activeHalf(self: *Self) []types.Sample(T) {
+            return self.half(self.active);
+        }
+        /// Half-transfer IRQ entry: the DMA finished the FIRST half → own it.
+        pub fn onHalfTransfer(self: *Self) void {
+            self.active = 0;
+        }
+        /// Transfer-complete IRQ entry: the DMA finished the SECOND half → own it.
+        pub fn onTransferComplete(self: *Self) void {
+            self.active = 1;
+        }
+    };
+}
+
+/// `I2sDmaSource(num, N)` — a Source (zero sample input) reading the active half
+/// of an RX I2S DMA buffer. Bound to its `I2sDma` transport at init; the ISR sets
+/// the active half (via `onHalfTransfer`/`onTransferComplete`) before the render,
+/// then this block copies that half into the graph. The output length is the pull
+/// demand N (= `half_frames`); a short demand zero-pads the remainder. Mono lane
+/// (`Sample`) — a multi-channel I2S stream deinterleaves at this boundary with the
+/// same `deinterleave` codec the desktop sinks use; the embedded smoke chain is
+/// mono q15, so no transpose is needed there.
+pub fn I2sDmaSource(comptime num: numeric.Numeric, comptime N: usize) type {
+    const T = num.Lane;
+    return struct {
+        const Self = @This();
+        /// The RX transport this source reads. Bound after construction (a pointer
+        /// to mutable `.bss` is not comptime-known, so it is seeded at init, not at
+        /// commit) — `undefined` until then.
+        dma: *I2sDma(num, N) = undefined,
+
+        pub fn process(self: *Self, out: []types.Sample(T)) void {
+            const src = self.dma.activeHalf();
+            const n = @min(out.len, src.len);
+            @memcpy(out[0..n], src[0..n]);
+            for (out[n..]) |*o| o.* = .{ .ch = .{0} };
+        }
+    };
+}
+
+/// `I2sDmaSink(num, N)` — a Sink (input only) writing its input into the active
+/// half of a TX I2S DMA buffer, where the DMA will stream it to the codec. The
+/// mirror of `I2sDmaSource`. Mono lane; the multi-channel boundary interleaves
+/// with the desktop `interleave` codec.
+pub fn I2sDmaSink(comptime num: numeric.Numeric, comptime N: usize) type {
+    const T = num.Lane;
+    return struct {
+        const Self = @This();
+        /// The TX transport this sink writes. Bound after construction.
+        dma: *I2sDma(num, N) = undefined,
+
+        pub fn process(self: *Self, in: []const types.Sample(T)) void {
+            const dst = self.dma.activeHalf();
+            const n = @min(in.len, dst.len);
+            @memcpy(dst[0..n], in[0..n]);
+            for (dst[n..]) |*o| o.* = .{ .ch = .{0} };
+        }
+    };
+}
+
 // --- macOS CoreAudio backend (extern seam; dev machine) --------------------
 
 const darwin = struct {
@@ -1319,4 +1419,43 @@ test "the default backend exists for this target and reports through the seam" {
     var u = Unsupported{};
     const be = u.backend();
     try testing.expectError(error.UnsupportedAudioBackend, be.start(.{}, undefined, null));
+}
+
+test "I2sDma ping-pong: HT/TC select the half the processing side owns" {
+    const num = numeric.numericFor(.i16, .{});
+    const N = 8;
+    var dma = I2sDma(num, N){};
+    // Mark each half so we can tell which one `activeHalf` returns.
+    for (dma.half(0)) |*s| s.* = .{ .ch = .{111} };
+    for (dma.half(1)) |*s| s.* = .{ .ch = .{222} };
+
+    dma.onHalfTransfer(); // DMA finished the first half → process owns half 0
+    try testing.expectEqual(@as(i16, 111), dma.activeHalf()[0].ch[0]);
+    try testing.expectEqual(@as(usize, N), dma.activeHalf().len);
+
+    dma.onTransferComplete(); // DMA finished the second half → process owns half 1
+    try testing.expectEqual(@as(i16, 222), dma.activeHalf()[0].ch[0]);
+}
+
+test "I2sDmaSource/Sink are a Source/Sink that bridge the active DMA half" {
+    const pport = @import("port.zig");
+    const num = numeric.numericFor(.i16, .{});
+    const N = 4;
+    // A Source has zero sample inputs (its output length is the pull demand);
+    // a Sink has input only.
+    try testing.expect(comptime pport.isSource(I2sDmaSource(num, N)));
+    try testing.expect(pport.classify(I2sDmaSink(num, N)) == .Map);
+
+    var rx = I2sDma(num, N){};
+    var tx = I2sDma(num, N){};
+    rx.onHalfTransfer();
+    tx.onHalfTransfer();
+    for (rx.activeHalf(), 0..) |*s, i| s.* = .{ .ch = .{@intCast(i + 1)} };
+
+    var src = I2sDmaSource(num, N){ .dma = &rx };
+    var sink = I2sDmaSink(num, N){ .dma = &tx };
+    var mid: [N]types.Sample(i16) = undefined;
+    src.process(&mid); // RX half → graph
+    sink.process(&mid); // graph → TX half
+    for (tx.activeHalf(), 0..) |s, i| try testing.expectEqual(@as(i16, @intCast(i + 1)), s.ch[0]);
 }

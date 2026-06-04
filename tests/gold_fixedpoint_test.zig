@@ -25,6 +25,7 @@ const h = @import("harness.zig");
 
 const gain_q15_json = @embedFile("vectors/gain_q15.json");
 const pan_q15_json = @embedFile("vectors/pan_q15.json");
+const biquad_q15_json = @embedFile("vectors/biquad_q15.json");
 const num_q15 = pan.numericFor(.i16, .{});
 const SampleQ15 = pan.types.Sample(i16);
 
@@ -82,6 +83,60 @@ test "GoldVector: Gain(q15) ≡ the NumPy fixed-point oracle blob, BIT-EXACT (ca
     // Gain is stateless, so a single whole-buffer render equals any chunking.
     var gain = pan.filters.Gain(num_q15){ .gain = gain_q };
     gain.process(input, out);
+
+    const got: []const i16 = @alignCast(std.mem.bytesAsSlice(i16, std.mem.sliceAsBytes(out)));
+    try h.bitExact(i16, got, expected);
+}
+
+test "GoldVector: Biquad(q15) ≡ the NumPy fixed-point oracle blob, BIT-EXACT (catalog §1.3 / §9.3)" {
+    const gpa = std.testing.allocator;
+
+    // The pre-quantized Q2.13 integer coefficients from the committed manifest —
+    // the exact integers the kernel holds (no transcendental filter design in the
+    // bit-exact comparison). a1_q is below -8192 (the q15 ±1.0 boundary), i.e.
+    // |a1| > 1: the supra-unity feedback coefficient a plain q15 lane could never
+    // store, which is the whole point of the wider Q2.13 coefficient format.
+    const Cf = struct { b0: i16, b1: i16, b2: i16, a1: i16, a2: i16 };
+    const cf: Cf = blk: {
+        const dyn = try std.json.parseFromSlice(std.json.Value, gpa, biquad_q15_json, .{});
+        defer dyn.deinit();
+        const p = dyn.value.object.get("params").?.object;
+        break :blk .{
+            .b0 = @intCast(p.get("b0_q").?.integer),
+            .b1 = @intCast(p.get("b1_q").?.integer),
+            .b2 = @intCast(p.get("b2_q").?.integer),
+            .a1 = @intCast(p.get("a1_q").?.integer),
+            .a2 = @intCast(p.get("a2_q").?.integer),
+        };
+    };
+    try std.testing.expectEqual(@as(i16, -14000), cf.a1); // matches the committed manifest
+    try std.testing.expect(cf.a1 < -(@as(i16, 1) << 13)); // |a1| > 1.0 in Q2.13 (frac 13)
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const in_bytes = (try readBlobOrNull(io, gpa, "tests/vectors/biquad_q15/input.bin")) orelse {
+        std.debug.print("skip: biquad_q15 blobs absent — run scripts/generate.py to materialize them\n", .{});
+        return error.SkipZigTest;
+    };
+    defer gpa.free(in_bytes);
+    const exp_bytes = (try readBlobOrNull(io, gpa, "tests/vectors/biquad_q15/expected.bin")) orelse {
+        std.debug.print("skip: biquad_q15 expected blob absent\n", .{});
+        return error.SkipZigTest;
+    };
+    defer gpa.free(exp_bytes);
+
+    const input: []const SampleQ15 = @alignCast(std.mem.bytesAsSlice(SampleQ15, in_bytes));
+    const expected: []const i16 = @alignCast(std.mem.bytesAsSlice(i16, exp_bytes));
+
+    const out = try gpa.alloc(SampleQ15, input.len);
+    defer gpa.free(out);
+
+    // Biquad carries per-sample state; a single whole-buffer render over the full
+    // vector is the canonical run the oracle reproduces.
+    var bq = pan.filters.Biquad(num_q15){ .coeffs = .{ .b0 = cf.b0, .b1 = cf.b1, .b2 = cf.b2, .a1 = cf.a1, .a2 = cf.a2 } };
+    bq.process(input, out);
 
     const got: []const i16 = @alignCast(std.mem.bytesAsSlice(i16, std.mem.sliceAsBytes(out)));
     try h.bitExact(i16, got, expected);

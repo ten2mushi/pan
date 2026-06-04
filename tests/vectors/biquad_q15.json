@@ -1,0 +1,17 @@
+{
+  "name": "biquad_q15",
+  "block": "Biquad",
+  "params": {
+    "b0_q": 50, "b1_q": 100, "b2_q": 50, "a1_q": -14000, "a2_q": 6500,
+    "coeff_frac": 13,
+    "_comment": "A stable resonant low-pass in Q2.13 (coeff_frac = 16-3). Real values: b ~= [0.0061, 0.0122, 0.0061], a1 ~= -1.709, a2 ~= 0.793. a1 < -1 exercises the supra-unity feedback coefficient a plain q15 lane number cannot hold. Pre-quantized integers (like gain_q/pan_lq) so no transcendental enters the bit-exact comparison."
+  },
+  "format": { "sample_rate": 48000, "precision": "q15", "channels": 1, "block_size": 256 },
+  "in_ports":  [{ "name": "in",  "element_type": "Sample(q15)" }],
+  "out_ports": [{ "name": "out", "element_type": "Sample(q15)" }],
+  "out_per_in": "1:1",
+  "algorithmic_latency": 0,
+  "tolerance": { "bit_exact": true },
+  "seed": 7,
+  "n_frames": 1024
+}

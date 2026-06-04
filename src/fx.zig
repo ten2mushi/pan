@@ -29,8 +29,12 @@
 //! stall — these kernels are exactly the paths that rule protects.
 //!
 //! Fixed-point feedback (limit cycles, coefficient scaling, accumulator headroom)
-//! needs the same care a fixed-point `Biquad` does, so the integer path fails loud
-//! and these ship float-only for now.
+//! needs the same care a fixed-point `Biquad` does — which is now applied THERE
+//! (the DF1 wider-coefficient-format + wide-accumulator + saturate technique in
+//! `filters.zig`). These feedback kernels each have their own coefficient structure
+//! and have not yet had that technique applied, so the integer path still fails
+//! loud (a compile error, never silently-wrong audio); they ship float-only for now
+//! and are not in the P10 embedded-chain gate (which is gain → biquad → sink).
 //!
 //! **`noalias` placement (▷ authoring convention).** Each kernel's `process` reads
 //! its whole input plane and writes a distinct output plane; because none of these
@@ -68,7 +72,9 @@ fn scalars(comptime T: type, frames: []types.Sample(T)) []T {
 fn requireFloat(comptime T: type) void {
     if (!isFloat(T))
         @compileError("pan: fixed-point feedback kernels are not yet supported — limit" ++
-            " cycles + coefficient scaling are the embedded-precision phase. Use f32/f64.");
+            " cycles + coefficient scaling need the per-kernel DF1/wide-accumulator" ++
+            " treatment now applied to the fixed-point Biquad (filters.zig); it has" ++
+            " not yet been ported to these reverb/synthesis kernels. Use f32/f64.");
 }
 
 /// `Comb(num, max_delay)` — a feedback comb filter: `y[n] = x[n] + g·y[n−D]`,

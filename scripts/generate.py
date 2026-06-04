@@ -212,13 +212,46 @@ def _fix_pan(x_codes: np.ndarray, params: dict, frac: int, dt: np.dtype) -> np.n
     return np.concatenate([left, right], axis=1)
 
 
+def _fix_biquad(x_codes: np.ndarray, params: dict, frac: int, dt: np.dtype) -> np.ndarray:
+    # Bit-exact mirror of filters.zig's BiquadFixed (direct form I). The lane (q15
+    # here) is `frac` fractional bits; the COEFFICIENTS ride in a wider Q(2.cf)
+    # format, cf = bits-3, so a feedback coefficient |a1|>1 is representable (the
+    # very thing a plain q15 lane number cannot hold). The five-term MAC is summed
+    # in a wide accumulator (Python ints are unbounded, so no overflow — matching
+    # the Zig i64/iN `Wide`), then a round-to-nearest right shift by `cf` lands the
+    # result back in the lane q-format and saturates on store.
+    #
+    # For a bit-exact gold the coefficients must be IDENTICAL to the integers pan's
+    # kernel holds, so the manifest carries the PRE-QUANTIZED integers `b0_q`…`a2_q`
+    # (no transcendental coefficient design enters the comparison — exactly the
+    # gain_q/pan_lq convention).
+    info = np.iinfo(dt)
+    cf = info.bits - 3  # coefficient fractional bits (Q2.cf), matches biquadCoeffFrac
+    b0 = int(params["b0_q"])
+    b1 = int(params.get("b1_q", 0))
+    b2 = int(params.get("b2_q", 0))
+    a1 = int(params.get("a1_q", 0))
+    a2 = int(params.get("a2_q", 0))
+    bias = 1 << (cf - 1)
+    n, C = x_codes.shape
+    y = np.empty_like(x_codes)
+    for c in range(C):
+        x1 = x2 = y1 = y2 = 0
+        for nn in range(n):
+            xn = int(x_codes[nn, c])
+            acc = b0 * xn + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+            yq = (acc + bias) >> cf  # Python >> on ints is arithmetic (floor), matches Zig signed >>
+            yv = int(np.clip(yq, info.min, info.max))
+            x2, x1 = x1, xn
+            y2, y1 = y1, yv
+            y[nn, c] = yv
+    return y
+
+
 _FIXED_REFERENCES = {
     "Gain": _fix_gain,
     "ConstantPowerPan": _fix_pan,  # uses the manifest's pre-quantized `pan_lq`/`pan_rq`
-    # Biquad fixed-point is deferred (its q-format kernel is a compile error until
-    # the embedded-precision phase — a naive q15 biquad can't represent |a1|>1 and
-    # would compute wrong audio). The f32 gold covers Gain/Biquad/Pan; q15 bit-exact
-    # is proven on Gain and ConstantPowerPan.
+    "Biquad": _fix_biquad,  # DF1, pre-quantized Q2.cf coeffs (`b0_q`…`a2_q`) — the embedded q15 path
 }
 
 

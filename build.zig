@@ -106,6 +106,9 @@ pub fn build(b: *std.Build) void {
         "tests/feat_spectral_shape_yoneda_test.zig",
         "tests/feat_chroma_contrast_yoneda_test.zig",
         "tests/feat_timedomain_yoneda_test.zig",
+        "tests/embedded_chain_test.zig",
+        "tests/biquad_fixedpoint_yoneda_test.zig",
+        "tests/embedded_hal_yoneda_test.zig",
     };
     for (harnesses) |path| {
         const h_mod = b.createModule(.{
@@ -213,6 +216,7 @@ pub fn build(b: *std.Build) void {
         "bench/feedback_bench.zig",
         "bench/coloring_bench.zig",
         "bench/spectral_bench.zig",
+        "bench/embedded_q15.zig",
     };
     for (benches) |path| {
         const bench_mod = b.createModule(.{

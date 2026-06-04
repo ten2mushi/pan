@@ -134,7 +134,10 @@ pub const simd = @import("simd.zig");
 
 /// The I/O boundary: LPCM codecs (14 PCM formats + i24 packed + float PCM,
 /// endianness, channel-order reconciliation, dither), the in-memory `LpcmSource`,
-/// and the device backends (CoreAudio on macOS, ALSA on Linux) behind one seam.
+/// the desktop device backends (CoreAudio on macOS, ALSA on Linux) behind one
+/// seam, and the embedded I2S-DMA ping-pong transport (`pan.io.I2sDma` +
+/// `pan.io.I2sDmaSource`/`I2sDmaSink`) whose half-/transfer-complete IRQ is the
+/// render callback on an MCU.
 pub const io = @import("io.zig");
 /// First DSP filters — `Gain` (aliasing-safe) and `Biquad` (per-sample Mealy).
 pub const filters = @import("filters.zig");
@@ -212,10 +215,88 @@ pub const featureMatrixColumns = io.featureMatrixColumns;
 pub const ClockSource = engine.ClockSource;
 pub const RunOptions = engine.RunOptions;
 
+// =====================================================================
+// The embedded q15 profile — a strict comptime specialization of the core.
+//
+// The embedded build is NOT a fork: it is the desktop core with every runtime
+// degree of freedom collapsed to comptime. The block types are the SAME ones the
+// desktop uses (`filters.Gain`, `filters.Biquad`) — only the Numeric is fixed-
+// point (q15, no FPU, SIMD width pinned to 1) and the boundary blocks are the
+// I2S-DMA ping-pong transport instead of CoreAudio/ALSA. The whole graph commits
+// AT COMPTIME (coloring, footprint, op-list), and the bound `Executor`
+// monomorphizes the render so the op-list `inline for`s with comptime-known buffer
+// ids and dispatches each block's `process` DIRECTLY — there is no `SampleMux`
+// fat pointer and no vtable on the hot path: the concept stays, the indirection
+// vanishes. The `footprint_bytes` is a comptime constant (usable as a `.bss`
+// array length), and the render entry is the I2S DMA half-/transfer-complete ISR.
+// =====================================================================
+
+/// The embedded q15 chain: `I2sDmaSource → Gain → Biquad → I2sDmaSink`, all over
+/// the fixed-point Numeric. Reusable so both the freestanding smoke object (which
+/// places its `Exec` pool in `.bss` and renders it from an ISR) and a desktop
+/// differential test (which checks the monomorphized render is bit-identical to a
+/// hand-run chain) build the SAME thing.
+pub const embedded = struct {
+    /// The comptime block size — half a DMA ping-pong buffer. On the MCU N is
+    /// comptime-known (unlike the desktop's device-driven runtime N), so the
+    /// scalar tail vanishes and kernels fully unroll: strictly easier than desktop.
+    pub const N: usize = 64;
+    /// The embedded Numeric: q15 (i16 lane, i32 default accumulator, saturating),
+    /// SIMD width pinned to 1 (an FPU-less MCU has no float vector unit; the q15
+    /// kernels are scalar anyway). Same `Numeric` trait as desktop — only the
+    /// precision differs.
+    pub const num = numeric.numericFor(.i16, .{ .width_override = 1 });
+
+    pub const Source = io.I2sDmaSource(num, N);
+    pub const Gain = filters.Gain(num);
+    pub const Biquad = filters.Biquad(num);
+    pub const Sink = io.I2sDmaSink(num, N);
+
+    /// One block type per graph node, in node-id order (the `Executor` contract).
+    pub const node_blocks = [_]type{ Source, Gain, Biquad, Sink };
+
+    /// Build the chain on the low-level IR at comptime, block size pinned to N.
+    pub fn chainGraph() graph.Graph {
+        var g = graph.Graph.empty;
+        g.block_size = N;
+        const src = g.add(Source);
+        const gain = g.add(Gain);
+        const bq = g.add(Biquad);
+        const sink = g.add(Sink);
+        g.connect(port.MapOutPort(Source), src, 0, port.MapInPort(Gain), gain, 0);
+        g.connect(port.MapOutPort(Gain), gain, 0, port.MapInPort(Biquad), bq, 0);
+        g.connect(port.MapOutPort(Biquad), bq, 0, port.MapInPort(Sink), sink, 0);
+        return g;
+    }
+
+    /// The committed comptime graph (a comptime `Graph` value).
+    pub const graph_ir: graph.Graph = chainGraph();
+
+    /// The fully-monomorphized Tier-A executor for the q15 chain: owns the colored
+    /// `.bss` pool and the four block instances; `Exec.committed.footprint_bytes`
+    /// is a comptime constant. The render path has no vtable.
+    pub const Exec = engine.Executor(graph_ir, &node_blocks);
+
+    /// The comptime-constant pool footprint for the q15 chain (the `.bss` budget).
+    pub const footprint_bytes: usize = Exec.committed.footprint_bytes;
+};
+
 // Pull in every re-exported submodule's `test {}` blocks when this root is the
 // test target. Referencing each `pub const` submodule forces its analysis.
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "embedded q15 chain commits at comptime: footprint is a comptime constant" {
+    // Legal only because footprint_bytes is comptime-known — the same property the
+    // freestanding `.bss` render buffer relies on.
+    const proof: [embedded.footprint_bytes]u8 = undefined;
+    comptime std.debug.assert(proof.len > 0);
+    // One op per node: source → gain → biquad → sink = 4 ops.
+    try std.testing.expectEqual(@as(usize, 4), embedded.Exec.committed.op_count);
+    // The q15 lane is two bytes; the pool is sized in those, not f32's four.
+    try std.testing.expect(embedded.footprint_bytes > 0);
+    try std.testing.expectEqual(i16, embedded.num.Lane);
 }
 
 // =====================================================================
