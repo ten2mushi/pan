@@ -278,6 +278,13 @@ pub const CommitError = error{
     /// them. Mixed-rate sample fan-in is never implicitly reconciled — insert an
     /// explicit resampler/framer; only a parameter port auto-coerces across rates.
     MixedRateInputs,
+    /// A GROWABLE sink (a `FeatureCollectorSink`, which may `realloc` past its
+    /// capacity hint) was committed for a REALTIME root. A growing reallocation
+    /// cannot sit on the audio deadline — growable sinks are legal only on a non-RT
+    /// pull root (the contained H1 exception). Drive this graph as an analysis root
+    /// (`commitAnalysis` / `runToCompletion`) instead, or remove the growable sink
+    /// from the realtime path and tap it from a separate non-RT root. (Law A8.)
+    GrowableSinkOnRealtimeRoot,
 };
 
 /// Commit a graph at COMPTIME with the shipped colored pool. See `commitComptimeMode`.
@@ -983,7 +990,17 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
         for (0..NC) |i| {
             const v = topo[i];
             var in_ids: [port.max_ports_per_direction]usize = undefined;
-            var in_n: usize = 0;
+            // A node's sample inputs are placed BY DECLARED PORT INDEX, not in edge-
+            // insertion order: a `process` reads its const-port args in declaration
+            // (port) order, so `input_buffer_ids[p]` must be the buffer wired to port
+            // `p`. A multi-input fan-in (a named `Concat`) may be wired out of port
+            // order — wiring `node.in.<name>` by name records the column's port index
+            // as `to_port`; placing by `to_port` is what makes the column identity the
+            // NAME, not the connect order (so the feature matrix can't be transposed).
+            // `max_in_port` tracks the highest port used (forward or feedback-read) so
+            // `input_count` packs ports 0..=max densely. Sample inputs are total (every
+            // declared input port has exactly one producer), so there are no gaps.
+            var max_in_port: isize = -1;
             var pin_ids: [port.max_ports_per_direction]usize = undefined;
             var pin_slots: [port.max_ports_per_direction]u8 = undefined;
             var pin_n: usize = 0;
@@ -994,14 +1011,14 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
                     // A parameter (control) edge is NOT a sample input — it is a
                     // side input applied to a parameter slot before `process`, so
                     // it is gathered separately and never consumed as a `process`
-                    // argument. An ordinary sample edge feeds the next process port.
+                    // argument. An ordinary sample edge feeds its declared port.
                     if (e.is_param) {
                         pin_ids[pin_n] = edge_buf[ei];
                         pin_slots[pin_n] = e.to_port;
                         pin_n += 1;
                     } else {
-                        in_ids[in_n] = edge_buf[ei];
-                        in_n += 1;
+                        in_ids[e.to_port] = edge_buf[ei];
+                        if (@as(isize, e.to_port) > max_in_port) max_in_port = e.to_port;
                     }
                 }
                 if (e.from_node == v) {
@@ -1023,8 +1040,11 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
             // still writes exactly one output buffer.
             for (g.feedback[0..FC], 0..) |f, fi| {
                 if (f.read_node == v) {
-                    in_ids[in_n] = fb_buf[fi];
-                    in_n += 1;
+                    // A feedback read-side feeds a declared input port too — place it
+                    // by `read_port`, sharing the port-indexed input space with the
+                    // forward edges (a port has a single source, so no collision).
+                    in_ids[f.read_port] = fb_buf[fi];
+                    if (@as(isize, f.read_port) > max_in_port) max_in_port = f.read_port;
                 }
                 if (f.write_node == v) {
                     var seen = false;
@@ -1037,6 +1057,9 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
                     }
                 }
             }
+            // Inputs pack densely over ports 0..=max_in_port (every sample input port
+            // has a producer, so no gaps); -1 means a pure source/sink (no inputs).
+            const in_n: usize = if (max_in_port < 0) 0 else @intCast(max_in_port + 1);
             ops[i] = .{
                 .node_id = v,
                 .fn_ptr = null,

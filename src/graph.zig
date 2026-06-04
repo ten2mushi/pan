@@ -99,6 +99,12 @@ pub const Node = struct {
     /// (a `DelayLine` on a shorter fan-in branch / a bypass passthrough delay). The
     /// runtime engine binds a built-in delay kernel for it, like a coercion node.
     is_pdc: bool = false,
+    /// True iff this node is a GROWABLE sink (a `FeatureCollectorSink`, declaring
+    /// `growable_sink`): a sink that may `realloc` past its capacity hint. That is
+    /// legal only on a non-RT pull root — the contained H1 exception. Committing a
+    /// graph containing one for a realtime root is rejected (law A8): a growable
+    /// realloc cannot sit on the audio deadline.
+    is_growable_sink: bool = false,
 };
 
 /// A forward edge: a wiring from `(from_node, from_port)` to `(to_node, to_port)`.
@@ -258,6 +264,7 @@ pub const Graph = struct {
             .rate_domain = 0,
             .sample_rate = self.sample_rate,
             .set_param_slots = 0,
+            .is_growable_sink = comptime @hasDecl(Block, "growable_sink") and Block.growable_sink,
         };
         self.node_count += 1;
         return id;

@@ -149,6 +149,65 @@ pub fn CommandRing(comptime Cmd: type, comptime capacity: usize) type {
     };
 }
 
+/// A bounded lock-free SPSC **data** ring carrying `Elem` values — the cross-root
+/// hand-off primitive (a "tap"). When two pull roots share an upstream, the
+/// upstream is rendered ONCE by its owning root and its output is published to the
+/// other root through one of these rings; cross-root handoff is ONLY via this ring
+/// (never via shared buffer-pool coloring — each root colors its own subplan), so a
+/// non-RT analysis root tapping a live audio root can never stall the audio
+/// deadline. The producer side (`push`) is WAIT-FREE and allocation-free, safe on
+/// the RT thread; the consumer side (`pop`) runs on the other (non-RT) root.
+///
+/// Same single-writer-per-index discipline as `CommandRing`: the producer owns
+/// `tail`, the consumer owns `head`, on separate cache lines. FULL ⇒ `push` drops
+/// (returns false) so the RT producer never blocks on a slow consumer; EMPTY ⇒
+/// `pop` returns null. `capacity` is a power of two (mask, not modulo).
+pub fn SpscRing(comptime Elem: type, comptime capacity: usize) type {
+    comptime std.debug.assert(std.math.isPowerOfTwo(capacity));
+    return struct {
+        const Self = @This();
+        const mask = capacity - 1;
+
+        head: std.atomic.Value(usize) align(std.atomic.cache_line) = .init(0), // consumer-owned (read index)
+        tail: std.atomic.Value(usize) align(std.atomic.cache_line) = .init(0), // producer-owned (write index)
+        slots: [capacity]Elem = undefined,
+
+        pub const empty: Self = .{};
+        pub const cap = capacity;
+
+        /// Producer (the upstream root, possibly RT). WAIT-FREE: a plain bounded
+        /// load/store pair, no CAS, no alloc. Returns false when full (the value is
+        /// dropped — a slow non-RT consumer must never back-pressure an RT producer).
+        /// Orderings mirror `CommandRing.enqueue`: own `tail` relaxed, peer `head`
+        /// acquire, slot store, then `tail` RELEASE publishes the slot.
+        pub fn push(self: *Self, x: Elem) bool {
+            const tail = self.tail.load(.monotonic);
+            const head = self.head.load(.acquire);
+            if (tail -% head == capacity) return false; // ring full → drop
+            self.slots[tail & mask] = x;
+            self.tail.store(tail +% 1, .release);
+            return true;
+        }
+
+        /// Consumer (the tapping root, non-RT). Returns the next value or null when
+        /// empty. Orderings mirror `CommandRing.drain`: own `head` relaxed, peer
+        /// `tail` acquire (sees published slots), slot read, `head` RELEASE frees it.
+        pub fn pop(self: *Self) ?Elem {
+            const head = self.head.load(.monotonic);
+            const tail = self.tail.load(.acquire);
+            if (head == tail) return null; // empty
+            const x = self.slots[head & mask];
+            self.head.store(head +% 1, .release);
+            return x;
+        }
+
+        /// Live entry count at this instant (consumer-side estimate).
+        pub fn len(self: *const Self) usize {
+            return self.tail.load(.acquire) -% self.head.load(.monotonic);
+        }
+    };
+}
+
 // ===========================================================================
 // 2. Atomic scalar parameters — the `set` verb
 // ===========================================================================

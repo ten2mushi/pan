@@ -29,6 +29,7 @@ const builtin = @import("builtin");
 const types = @import("types.zig");
 const numeric = @import("numeric.zig");
 const engine = @import("engine.zig");
+const control = @import("control.zig");
 
 // ===========================================================================
 // LPCM sample formats
@@ -449,21 +450,223 @@ pub fn LpcmSource(comptime num: numeric.Numeric) type {
     const T = num.Lane;
     return struct {
         const Self = @This();
-        data: []const types.Sample(T),
+        /// Defaults to empty so the block is default-constructible (`add` builds
+        /// `Block{}` then overrides via params); a real buffer is set in `add`.
+        data: []const types.Sample(T) = &.{},
         cursor: usize = 0,
+        /// Wrap at the end (stream forever) vs. drain once and signal exhaustion.
+        loop: bool = true,
+        /// Set once a non-looping buffer has been fully drained.
+        done: bool = false,
 
         pub fn process(self: *Self, out: []types.Sample(T)) void {
-            if (self.data.len == 0) {
-                @memset(std.mem.sliceAsBytes(out), 0);
-                return;
-            }
             for (out) |*o| {
+                if (self.cursor >= self.data.len) {
+                    if (self.loop and self.data.len > 0) {
+                        self.cursor = 0;
+                    } else {
+                        // Drained: zero-pad the remainder and mark exhausted.
+                        self.done = true;
+                        o.* = std.mem.zeroes(types.Sample(T));
+                        continue;
+                    }
+                }
                 o.* = self.data[self.cursor];
                 self.cursor += 1;
-                if (self.cursor >= self.data.len) self.cursor = 0;
             }
         }
+
+        /// Has a non-looping buffer been fully consumed? The input-exhaustion pull
+        /// root (`engine.runToCompletion(.{ .clock = .input_exhaustion })`) polls
+        /// this to decide when the analysis run is complete. A looping source never
+        /// reports exhausted (it streams forever).
+        pub fn exhausted(self: *Self) bool {
+            return self.done;
+        }
     };
+}
+
+// ===========================================================================
+// FeatureCollectorSink — the growable, non-RT analysis sink
+// ===========================================================================
+
+/// `FeatureCollectorSink(Row)` — drain per-hop feature rows into a growable
+/// time-series for the analysis/visualization pipeline. `Row` is typically the
+/// output struct of a `Concat` (one column per named feature).
+///
+/// This is the one blessed place a `realloc` may happen: `capacity_hint`
+/// pre-reserves that many rows in a single up-front allocation at `initialize`,
+/// and growth past the hint is geometric (×2) through the unmanaged `ArrayList`
+/// per-call allocator. That growable allocation is **legal only on a non-RT pull
+/// root** — the contained H1 exception. Wiring this sink onto a realtime (audio)
+/// root is rejected at commit (`error.GrowableSinkOnRealtimeRoot`, law A8); the
+/// `growable_sink` marker below is what the commit pass keys that rejection off.
+///
+/// Lifecycle: the builder calls `initialize(alloc)` after construction (the
+/// reservation), and the engine's destroy thunk calls `deinit(alloc)` before
+/// freeing the instance (every block that declares `initialize` is paired with a
+/// `deinit`). `process` appends off-RT; on OOM past the hint it sets `overflowed`
+/// (surfaced by the non-RT driver) rather than panicking.
+pub fn FeatureCollectorSink(comptime Row: type) type {
+    return struct {
+        const Self = @This();
+
+        /// Declaring this marks the block as a growable, non-RT-only sink (law A8).
+        pub const growable_sink: bool = true;
+
+        /// Rows to pre-reserve in one up-front allocation at `initialize`.
+        capacity_hint: usize = 0,
+        rows: std.ArrayList(Row) = .empty,
+        gpa: std.mem.Allocator = undefined,
+        /// Set if an append failed (OOM past the hint). The non-RT driver surfaces it.
+        overflowed: bool = false,
+
+        pub fn initialize(self: *Self, alloc: std.mem.Allocator) !void {
+            self.gpa = alloc;
+            try self.rows.ensureTotalCapacity(alloc, self.capacity_hint);
+        }
+
+        pub fn deinit(self: *Self, alloc: std.mem.Allocator) void {
+            self.rows.deinit(alloc);
+        }
+
+        /// Sink: input only, no output port. Appends each hop's row in arrival
+        /// order. Geometric growth past `capacity_hint` is legal here (non-RT root).
+        pub fn process(self: *Self, in: []const Row) void {
+            self.rows.appendSlice(self.gpa, in) catch {
+                self.overflowed = true;
+            };
+        }
+
+        /// The collected time-series: one row per hop, in arrival order. Valid for
+        /// the owning engine's lifetime (an analysis root is not RCU-swapped).
+        pub fn frames(self: *const Self) []const Row {
+            return self.rows.items;
+        }
+    };
+}
+
+// ===========================================================================
+// Cross-root taps — fan a shared upstream to a second pull root via an SPSC ring
+// ===========================================================================
+
+/// `Tap(Elem, cap)` — a SINK that publishes its input to a lock-free SPSC ring so a
+/// SECOND pull root can read it. Placed on the upstream's owning root (often the RT
+/// audio root): the upstream is rendered ONCE there, and `Tap` fans its output to a
+/// separate analysis root through the ring. `push` is wait-free and drops on a full
+/// ring, so a slow non-RT consumer can never back-pressure (or xrun) the producer —
+/// the only cross-root coupling is this ring, never shared pool coloring.
+///
+/// The ring is shared, owned by the caller, and passed by pointer (`.{ .ring =
+/// &ring }`); the matching `TapSource(Elem, cap)` on the other root reads it.
+pub fn Tap(comptime Elem: type, comptime cap: usize) type {
+    return struct {
+        const Self = @This();
+        ring: *control.SpscRing(Elem, cap) = undefined,
+
+        pub fn process(self: *Self, in: []const Elem) void {
+            for (in) |x| _ = self.ring.push(x); // wait-free; drop on full
+        }
+    };
+}
+
+/// `TapSource(Elem, cap)` — a zero-input Map SOURCE that reads a shared SPSC ring
+/// published by a `Tap` on another root: the consumer end of a cross-root tap. Its
+/// output length is the pull demand `N`; an empty ring yields zeros (the consumer
+/// is best-effort and never blocks). Drive the tapping root with a timer/fixed-block
+/// clock (`runToCompletion(.{ .clock = .{ .wall_clock_timer = 60 }, .max_blocks =
+/// … })`) — a live tap stream has no input-exhaustion end.
+pub fn TapSource(comptime Elem: type, comptime cap: usize) type {
+    return struct {
+        const Self = @This();
+        ring: *control.SpscRing(Elem, cap) = undefined,
+
+        pub fn process(self: *Self, out: []Elem) void {
+            for (out) |*o| o.* = self.ring.pop() orelse std.mem.zeroes(Elem);
+        }
+    };
+}
+
+// ===========================================================================
+// Feature-matrix flattening — the column layout the viz consumes
+// ===========================================================================
+
+/// The number of `f32` columns a `Row` flattens to: each `FeatureFrame(K)` field
+/// contributes `K` columns, each `Scalar(T)` field one. The flattened column order
+/// is the `Row` field order — which, for a `Concat` row, is the spec's declaration
+/// order (the canonical, un-transposable feature-matrix column order).
+pub fn featureMatrixColumns(comptime Row: type) usize {
+    comptime var n: usize = 0;
+    inline for (@typeInfo(Row).@"struct".fields) |f| n += rowFieldWidth(f.type);
+    return n;
+}
+
+fn rowFieldWidth(comptime F: type) usize {
+    if (@hasDecl(F, "feature_count")) return F.feature_count; // FeatureFrame(K)
+    if (@hasField(F, "value")) return 1; // Scalar(T)
+    @compileError("pan: feature-matrix Row field '" ++ @typeName(F) ++
+        "' is not a FeatureFrame(K) or Scalar(T)");
+}
+
+fn scalarToF32(comptime T: type, x: T) f32 {
+    return switch (@typeInfo(T)) {
+        .float => @floatCast(x),
+        .int, .comptime_int => @floatFromInt(x),
+        else => @compileError("pan: feature Scalar lane '" ++ @typeName(T) ++ "' is not numeric"),
+    };
+}
+
+/// Flatten one `Row` into the writer slice `out` (length == `featureMatrixColumns`),
+/// returning the number of columns written. Integer scalars (e.g. a `DominantBand`
+/// bin index, `Scalar(u16)`) widen to `f32`; the viz reads them back per column.
+fn flattenRow(comptime Row: type, row: Row, out: []f32) usize {
+    comptime var col: usize = 0;
+    inline for (@typeInfo(Row).@"struct".fields) |f| {
+        const F = f.type;
+        const val = @field(row, f.name);
+        if (comptime @hasDecl(F, "feature_count")) {
+            inline for (0..F.feature_count) |i| out[col + i] = val.v[i];
+            col += F.feature_count;
+        } else {
+            out[col] = scalarToF32(@TypeOf(val.value), val.value);
+            col += 1;
+        }
+    }
+    return col;
+}
+
+/// Encode a collected feature matrix (`[]const Row`) into a row-major `[]f32`:
+/// `rows · featureMatrixColumns(Row)` values, row `r`'s columns contiguous. The
+/// caller owns the returned slice and frees it with `alloc`. This is the exact
+/// buffer the Python viz maps to its "Data for every point" schema (dominant →
+/// color, rms → amplitude, row index → emission time).
+pub fn encodeFeatureMatrix(alloc: std.mem.Allocator, matrix: anytype) ![]f32 {
+    const Row = @typeInfo(@TypeOf(matrix)).pointer.child;
+    const cols = comptime featureMatrixColumns(Row);
+    const buf = try alloc.alloc(f32, matrix.len * cols);
+    errdefer alloc.free(buf);
+    for (matrix, 0..) |row, r| {
+        const written = flattenRow(Row, row, buf[r * cols ..][0..cols]);
+        std.debug.assert(written == cols);
+    }
+    return buf;
+}
+
+/// Write a collected feature matrix to `path` as native-endian row-major `f32`
+/// (the `features.f32.bin` the Python 60 fps viz reads). A convenience over
+/// `encodeFeatureMatrix` for the `examples/` use case; it owns its own `Io` and
+/// scratch allocation. Disk-light by design: the matrix is the only artifact.
+pub fn writeFeatureMatrix(path: []const u8, matrix: anytype) !void {
+    const gpa = std.heap.page_allocator;
+    const floats = try encodeFeatureMatrix(gpa, matrix);
+    defer gpa.free(floats);
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const file_io = threaded.io();
+    try std.Io.Dir.cwd().writeFile(file_io, .{
+        .sub_path = path,
+        .data = std.mem.sliceAsBytes(floats),
+    });
 }
 
 /// `RuntimeResampler` — a streaming rational `p:q` (out:in) windowed-sinc polyphase

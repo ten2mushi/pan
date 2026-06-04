@@ -47,6 +47,17 @@ fn hasOutput(comptime Block: type) bool {
     };
 }
 
+/// The `i`-th input port of a block as a `PortId` type — Rate-aware. A `Map` reads
+/// its `i`-th `process` input; a `Rate`/`VariRate` reads its (single) `pull` sample
+/// input. So a homogeneous-input handle's `node.in(i)` wires correctly to a Rate
+/// block (an STFT/resampler) as well as a Map.
+fn InPortTypeAt(comptime Block: type, comptime i: usize) type {
+    return switch (port.classify(Block)) {
+        .Map => port.MapInPortAt(Block, i),
+        .Rate, .VariRate => port.RateInPort(Block),
+    };
+}
+
 /// The type of a handle's `out` field: an output `Endpoint` when the block has
 /// an output, otherwise an empty marker (so a sink handle still has the field).
 fn OutAccessor(comptime Block: type) type {
@@ -123,10 +134,19 @@ pub fn NodeHandle(comptime Block: type) type {
             out: OutAccessor(Block),
             in: NamedInputAccessor(Block),
             param: ParamAccessor(Block),
+            /// The heap block instance (owned by the engine after `commit`). Valid
+            /// for the engine's lifetime on a non-RCU-swapped root (an analysis
+            /// root); used to read a sink's collected output (`sink.instance()`).
+            inst: *Block,
 
             const Self = @This();
             pub const B = Block;
             pub const is_node_handle = true;
+
+            /// The live block instance — e.g. `collect.instance()` to read a sink.
+            pub fn instance(self: Self) *Block {
+                return self.inst;
+            }
 
             /// The `set` control verb — move a coefficient (lock-free atomic +
             /// per-block ramp). Stub.
@@ -141,14 +161,24 @@ pub fn NodeHandle(comptime Block: type) type {
         id: usize,
         out: OutAccessor(Block),
         param: ParamAccessor(Block),
+        /// The heap block instance (owned by the engine after `commit`). Valid for
+        /// the engine's lifetime on a non-RCU-swapped root; used to read a sink's
+        /// collected output (`sink.instance().frames()`).
+        inst: *Block,
 
         const Self = @This();
         pub const B = Block;
         pub const is_node_handle = true;
 
+        /// The live block instance — e.g. `sink.instance().frames()`.
+        pub fn instance(self: Self) *Block {
+            return self.inst;
+        }
+
         /// The block's `i`-th input port as a typed endpoint (`node.in(i)`).
-        /// An out-of-range index is a compile error.
-        pub fn in(self: Self, comptime i: usize) Endpoint(port.MapInPortAt(Block, i)) {
+        /// Rate-aware (a Rate block's single `pull` input wires here too). An
+        /// out-of-range index is a compile error.
+        pub fn in(self: Self, comptime i: usize) Endpoint(InPortTypeAt(Block, i)) {
             return .{ .node_id = self.id, .index = @intCast(i) };
         }
 
@@ -237,15 +267,27 @@ pub const Graph = struct {
         errdefer self.alloc.destroy(inst);
         inst.* = Block{};
         engine.applyParams(Block, inst, params);
+        // Lifecycle hook: a block owning heap state declares `initialize(alloc)`
+        // (paired with `deinit(alloc)`, called by the destroy thunk). The growable
+        // `FeatureCollectorSink` reserves its `capacity_hint` here. Done before the
+        // bound slot is published so a failure leaves nothing half-registered.
+        if (comptime @hasDecl(Block, "initialize")) {
+            inst.initialize(self.alloc) catch |e| {
+                inst.deinit(self.alloc);
+                return e;
+            };
+        }
         self.bound[id] = .{
             .self_ptr = inst,
             .render = engine.renderThunk(Block),
             .destroy = engine.destroyThunk(Block),
             .set = engine.setThunkFor(Block),
+            .exhausted = engine.exhaustThunkFor(Block),
         };
 
         var h: NodeHandle(Block) = undefined;
         h.id = id;
+        h.inst = inst;
         h.out = buildOutAccessor(Block, id);
         h.param = if (comptime @hasDecl(Block, "params"))
             buildNamedAccessor(Block, Block.params, .param, id)
@@ -290,6 +332,23 @@ pub const Graph = struct {
     pub fn commit(self: *Self) !engine.Engine {
         const eng = try engine.Engine.bind(self.alloc, self.ir, self.bound[0..self.ir.node_count], self.cfg, .{
             .mode = .realtime_streaming,
+            .max_block_size = self.cfg.max_block_size,
+        });
+        self.transferred = true;
+        return eng;
+    }
+
+    /// Commit the graph as a NON-RT **analysis** pull root (C5): the clock is a
+    /// timer or input exhaustion, not the audio device callback, so the run is never
+    /// slaved to an audio deadline. Drive the returned engine with `runToCompletion`.
+    ///
+    /// This is the only commit that accepts a growable `FeatureCollectorSink` — on a
+    /// realtime root that sink is rejected by law A8 (`commit()` →
+    /// `error.GrowableSinkOnRealtimeRoot`), because its geometric `realloc` cannot
+    /// sit on the audio deadline. The contained H1 exception lives here.
+    pub fn commitAnalysis(self: *Self) !engine.Engine {
+        const eng = try engine.Engine.bind(self.alloc, self.ir, self.bound[0..self.ir.node_count], self.cfg, .{
+            .mode = .offline_batch,
             .max_block_size = self.cfg.max_block_size,
         });
         self.transferred = true;

@@ -99,6 +99,11 @@ pub const Command = control.Command;
 pub const Param = control.Param;
 pub const Ramp = control.Ramp;
 pub const Rcu = control.Rcu;
+/// The cross-root tap primitive: a lock-free SPSC data ring that fans a shared
+/// upstream (rendered once on its owning root) to a second pull root. The graph
+/// blocks that ride it are `io.Tap` (publish, on the upstream root) and
+/// `io.TapSource` (consume, on the tapping root).
+pub const SpscRing = control.SpscRing;
 
 pub const engine = @import("engine.zig");
 pub const Engine = engine.Engine;
@@ -177,28 +182,35 @@ pub const Resampler = spectral.Resampler;
 // Layered-library roots filled by later phases.
 pub const gen = struct {};
 pub const env = struct {};
-pub const feat = struct {};
 pub const mix = struct {};
 pub const synth = struct {};
 
+/// Feature-extraction blocks — the analysis side. Each is a rate-1:1 `Map` over a
+/// per-hop power spectrum (`FeatureFrame(bins)`): `Mfcc` (→ `FeatureFrame(K)`),
+/// `SpectralCentroid`/`SpectralFlux`/`Rms` (→ `Scalar(f32)`), and `DominantBand`
+/// (→ `Scalar(u16)`, the viz's color/frequency channel). Tested against an external
+/// NumPy/librosa-equivalent oracle, not proven.
+pub const feat = @import("feat.zig");
+
 /// Graph combinators. `Concat` is the named fan-in: a comptime
 /// struct-of-(name → element-type) spec mints one typed input port per name
-/// (`node.in.<name>`) and synthesizes the output struct whose field order is the
-/// canonical column order. (Stub kernel; the full block lands with the analysis
-/// phase.)
-pub const combinators = struct {
-    pub fn Concat(comptime spec: anytype) type {
-        return struct {
-            const Self = @This();
-            pub const inputs = spec;
-            pub const Out = port.ConcatOut(spec);
-            pub fn process(self: *Self, out: []Out) void {
-                _ = self;
-                _ = out;
-            }
-        };
-    }
-};
+/// (`node.in.<name>`) and a one-for-one output struct whose field order is the
+/// canonical column order. `ChannelMap` replicates a mono block across C channels.
+/// (Accessed as `pan.combinators.Concat` / `pan.feat.Mfcc` — not aliased at the
+/// root to avoid shadowing the short block names a DSP author uses locally.)
+pub const combinators = @import("combinators.zig");
+
+/// The analysis pull root + feature collection surface. `FeatureCollectorSink` is
+/// the growable, non-RT-only time-series sink (law A8 — rejected on a realtime
+/// root); `runToCompletion`/`ClockSource` drive an analysis root by input
+/// exhaustion; `writeFeatureMatrix`/`encodeFeatureMatrix` flatten the collected
+/// rows to the column-major `f32` matrix the `notes/1.md` viz consumes.
+pub const FeatureCollectorSink = io.FeatureCollectorSink;
+pub const writeFeatureMatrix = io.writeFeatureMatrix;
+pub const encodeFeatureMatrix = io.encodeFeatureMatrix;
+pub const featureMatrixColumns = io.featureMatrixColumns;
+pub const ClockSource = engine.ClockSource;
+pub const RunOptions = engine.RunOptions;
 
 // Pull in every re-exported submodule's `test {}` blocks when this root is the
 // test target. Referencing each `pub const` submodule forces its analysis.

@@ -99,6 +99,9 @@ pub fn build(b: *std.Build) void {
         "tests/spectral_yoneda_test.zig",
         "tests/pdc_yoneda_test.zig",
         "tests/spectral_gold_test.zig",
+        "tests/analysis_root_test.zig",
+        "tests/feat_yoneda_test.zig",
+        "tests/analysis_yoneda_test.zig",
     };
     for (harnesses) |path| {
         const h_mod = b.createModule(.{

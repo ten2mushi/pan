@@ -486,6 +486,12 @@ pub const RenderThunk = *const fn (
 /// A bound node's destructor: frees its heap instance with the engine's allocator.
 pub const DestroyThunk = *const fn (alloc: std.mem.Allocator, self_ptr: *anyopaque) void;
 
+/// A bound source's exhaustion probe: true once an input-exhaustion source has
+/// drained. Present only for blocks declaring `pub fn exhausted(self) bool` (a
+/// non-looping file/stream source). The input-exhaustion pull root polls every
+/// such probe to decide when an analysis run is complete.
+pub const ExhaustThunk = *const fn (self_ptr: *anyopaque) bool;
+
 /// One node bound for runtime dispatch: its heap instance plus the monomorphized
 /// render and destroy thunks. The builder fills one per node (in node-id order);
 /// the engine fills each op's `fn_ptr`/`self_ptr` from this at commit, and frees
@@ -497,7 +503,22 @@ pub const BoundNode = struct {
     /// The external-`set`/`schedule` apply, or null if the block declares no
     /// `setParam` (a pure-DSP block with no settable parameter).
     set: ?SetThunk = null,
+    /// The exhaustion probe, or null if the block is not an exhaustible source.
+    exhausted: ?ExhaustThunk = null,
 };
+
+/// Build the optional exhaustion probe for `Block` (null unless it declares
+/// `pub fn exhausted(self: *Block) bool`). The input-exhaustion pull root polls it.
+pub fn exhaustThunkFor(comptime Block: type) ?ExhaustThunk {
+    if (!@hasDecl(Block, "exhausted")) return null;
+    const Gen = struct {
+        fn probe(self_ptr: *anyopaque) bool {
+            const inst: *Block = @ptrCast(@alignCast(self_ptr));
+            return inst.exhausted();
+        }
+    };
+    return Gen.probe;
+}
 
 /// Apply this op's wired PARAMETER-edge inputs to the block's parameter slots,
 /// just before `process` — the in-graph analogue of `set` (catalog §2.4 P3). A
@@ -722,6 +743,10 @@ pub fn destroyThunk(comptime Block: type) DestroyThunk {
     const Gen = struct {
         fn destroy(alloc: std.mem.Allocator, self_ptr: *anyopaque) void {
             const inst: *Block = @ptrCast(@alignCast(self_ptr));
+            // A block that owns heap state declares `initialize(alloc)` (paired with
+            // `deinit(alloc)`); release that state before freeing the instance. A
+            // growable `FeatureCollectorSink` is the canonical case.
+            if (comptime @hasDecl(Block, "initialize")) inst.deinit(alloc);
             alloc.destroy(inst);
         }
     };
@@ -923,6 +948,30 @@ pub fn applyParams(comptime Block: type, inst: *Block, params: anytype) void {
     }
 }
 
+/// A pull root's clock — the demand source that decides when the graph renders a
+/// block (C5). The audio device callback is one clock (RT); an analysis root runs
+/// on a non-RT thread driven by a timer or by input exhaustion, never slaved to the
+/// audio deadline (so an expensive analysis path cannot cause an xrun).
+pub const ClockSource = union(enum) {
+    /// Driven by the audio-device render callback, on the RT thread. (Not a
+    /// `runToCompletion` clock — that root is driven by `start(backend)`.)
+    audio_device_callback,
+    /// A fixed-rate wall-clock timer (frames per second). Offline, it simply bounds
+    /// the run to `max_blocks` (live timer pacing is a later refinement).
+    wall_clock_timer: u32,
+    /// Pull until every exhaustible source has drained — the file-analysis root.
+    input_exhaustion,
+};
+
+/// Options for `runToCompletion` — the non-RT pull-root drive.
+pub const RunOptions = struct {
+    clock: ClockSource = .input_exhaustion,
+    /// Safety bound on the number of render blocks. For `.input_exhaustion` it caps a
+    /// run whose source somehow never drains; for `.wall_clock_timer` it IS the run
+    /// length (offline). Default is a large ceiling.
+    max_blocks: usize = 1 << 24,
+};
+
 /// The frozen, runnable engine — the runtime, RCU-swappable sibling of the comptime
 /// `Executor`. Produced by `Graph.commit()`. It owns a heap-allocated immutable
 /// `Plan` (its ops carry bound `fn_ptr`/`self_ptr`), the flat byte pool, and the
@@ -974,6 +1023,15 @@ pub const Engine = struct {
     /// the node's thunk + instance, allocates the pool, and takes ownership of the
     /// instances (frees them at `deinit`). `bound_src` is indexed by node id.
     pub fn bind(alloc: std.mem.Allocator, ir: graph.Graph, bound_src: []const BoundNode, cfg: config.Config, opts: EngineOptions) !Self {
+        // Law A8 — a growable sink (a `FeatureCollectorSink` that may `realloc` past
+        // its capacity hint) may not sit on a realtime root: a growing reallocation
+        // cannot be on the audio deadline. It is legal only when driven as a non-RT
+        // analysis root (`.offline_batch`, via `commitAnalysis` / `runToCompletion`).
+        if (opts.mode == .realtime_streaming) {
+            for (ir.nodes[0..ir.node_count]) |n| {
+                if (n.is_growable_sink) return commit.CommitError.GrowableSinkOnRealtimeRoot;
+            }
+        }
         const bound_owned = try alloc.dupe(BoundNode, bound_src);
         errdefer alloc.free(bound_owned);
 
@@ -1403,10 +1461,50 @@ pub const Engine = struct {
         return error.OfflineNotImplemented;
     }
 
-    pub fn renderToCompletion(self: *Self, opts: anytype) !void {
-        _ = self;
-        _ = opts;
-        return error.OfflineNotImplemented;
+    /// Drive this engine as a NON-RT pull root until its clock source stops — the
+    /// analysis-root path (C5). Renders the bound op-list block by block off the
+    /// audio deadline (no realtime token / no FTZ — feature accuracy over denormal
+    /// flushing; an analysis run may not steal an audio deadline because it is a
+    /// *separate* root, never the device callback). For `.input_exhaustion`, pulls
+    /// until every exhaustible source (a non-looping `LpcmSource`) reports drained;
+    /// each block appends its per-hop feature rows to any `FeatureCollectorSink`.
+    ///
+    /// A growable sink reached this engine only via `commitAnalysis` (a realtime
+    /// commit would have been rejected by law A8), so the geometric-growth appends
+    /// in the sink's `process` are legal on this thread.
+    pub fn runToCompletion(self: *Self, opts: RunOptions) !void {
+        const plan = self.rcu.enter();
+        const guards = std.debug.runtime_safety;
+
+        const exhaustion = std.meta.activeTag(opts.clock) == .input_exhaustion;
+        if (exhaustion) {
+            var has_probe = false;
+            for (self.bound) |b| {
+                if (b.exhausted != null) has_probe = true;
+            }
+            // No drainable source ⇒ an input-exhaustion run could never terminate.
+            if (!has_probe) return error.NoExhaustibleSource;
+        }
+
+        var blocks: usize = 0;
+        while (blocks < opts.max_blocks) : (blocks += 1) {
+            self.ring.drain(self);
+            replayBound(plan, self.pool, guards, &self.tele.fault);
+            if (exhaustion) {
+                var all_done = true;
+                for (self.bound) |b| {
+                    if (b.exhausted) |probe| {
+                        if (!probe(b.self_ptr)) all_done = false;
+                    }
+                }
+                if (all_done) break;
+            }
+        }
+    }
+
+    /// Back-compatible alias for `runToCompletion` (older spelling).
+    pub fn renderToCompletion(self: *Self, opts: RunOptions) !void {
+        return self.runToCompletion(opts);
     }
 
     pub fn telemetry(self: *Self) Telemetry {
