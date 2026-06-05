@@ -124,19 +124,30 @@ test "PullSampleMux: output bytes round-trip the pool arena exactly (catalog §4
     try testing.expectEqualSlices(u8, &in, &out);
 }
 
-test "RingSampleMux: output bytes round-trip the seam exactly (catalog §4 round-trip)" {
-    var in = [_]u8{0} ** 32;
-    var out = [_]u8{0xff} ** 32;
-    fillRamp(&in, 0x77);
+test "RingSampleMux: an interior stage round-trips a block from in-ring to out-ring exactly (catalog §4 round-trip)" {
+    const gpa = testing.allocator;
+    var inr = try pan.Ring.init(gpa, 32, 2);
+    defer inr.deinit(gpa);
+    var outr = try pan.Ring.init(gpa, 32, 2);
+    defer outr.deinit(gpa);
 
-    var rm = pan.RingSampleMux{ .in_buf = &in, .out_buf = &out };
+    var expected: [32]u8 = undefined;
+    fillRamp(&expected, 0x77);
+    @memcpy(inr.produceSlot(), &expected);
+    inr.commitProduce();
+    inr.setEos();
+
+    var rm = pan.RingSampleMux{ .in_ring = &inr, .out_ring = &outr };
     const mux = rm.sampleMux();
 
-    @memcpy(mux.getOutputBuffer(0), mux.getInputBuffer(0));
-    mux.updateInputBuffer(0, in.len);
-    mux.updateOutputBuffer(0, out.len);
+    mux.waitInputAvailable(0, 32);
+    mux.waitOutputAvailable(0, 32);
+    @memcpy(mux.getOutputBuffer(0)[0..32], mux.getInputBuffer(0)[0..32]);
+    mux.updateInputBuffer(0, 32);
+    mux.updateOutputBuffer(0, 32);
 
-    try testing.expectEqualSlices(u8, &in, &out);
+    const got = outr.consumeSlot() orelse return error.Unexpected;
+    try testing.expectEqualSlices(u8, &expected, got);
 }
 
 // A buggy realization that swapped input/output, dropped a byte, or returned a
@@ -204,32 +215,39 @@ test "PullTestSampleMux: repeated update drains availability monotonically to ex
     try testing.expectEqual(out.len, pm.out_cursor);
 }
 
-test "RingSampleMux: repeated update drains availability monotonically to exactly zero (catalog §4 cursor)" {
-    var in = [_]u8{0} ** 30;
-    var out = [_]u8{0} ** 30;
-    fillRamp(&in, 0x11);
-    var rm = pan.RingSampleMux{ .in_buf = &in, .out_buf = &out };
+test "RingSampleMux: input availability is one slot while data pends and drains to exactly zero after EOS (catalog §4 cursor)" {
+    const gpa = testing.allocator;
+    const slots = 5;
+    var inr = try pan.Ring.init(gpa, 4, slots);
+    defer inr.deinit(gpa);
+    var outr = try pan.Ring.init(gpa, 4, slots);
+    defer outr.deinit(gpa);
+
+    var s: u8 = 0;
+    while (s < slots) : (s += 1) {
+        @memset(inr.produceSlot(), s + 1); // slot k holds the byte k+1
+        inr.commitProduce();
+    }
+    inr.setEos();
+
+    var rm = pan.RingSampleMux{ .in_ring = &inr, .out_ring = &outr };
     const mux = rm.sampleMux();
 
-    const chunk: usize = 4; // 4∤30
-    var prev = mux.getInputAvailable(0);
-    try testing.expectEqual(@as(usize, 30), prev);
-    while (mux.getInputAvailable(0) > 0) {
+    var consumed: usize = 0;
+    while (true) {
+        mux.waitInputAvailable(0, 4);
         const avail = mux.getInputAvailable(0);
-        const n = @min(chunk, avail);
-        const src = mux.getInputBuffer(0);
-        try testing.expectEqual(avail, src.len);
-        try testing.expectEqual(in[in.len - avail], src[0]);
-        mux.updateInputBuffer(0, n);
-        mux.updateOutputBuffer(0, n);
-        const now = mux.getInputAvailable(0);
-        try testing.expectEqual(prev - n, now);
-        prev = now;
+        if (avail == 0) break;
+        try testing.expectEqual(@as(usize, 4), avail); // exactly one slot offered at a time
+        try testing.expectEqual(@as(u8, @intCast(consumed + 1)), mux.getInputBuffer(0)[0]); // FIFO order
+        mux.waitOutputAvailable(0, 4);
+        @memcpy(mux.getOutputBuffer(0)[0..4], mux.getInputBuffer(0)[0..4]);
+        mux.updateInputBuffer(0, 4);
+        mux.updateOutputBuffer(0, 4);
+        consumed += 1;
     }
-    try testing.expectEqual(@as(usize, 0), mux.getInputAvailable(0));
-    try testing.expectEqual(@as(usize, 0), mux.getOutputAvailable(0));
-    try testing.expectEqual(in.len, rm.in_cursor);
-    try testing.expectEqual(out.len, rm.out_cursor);
+    try testing.expectEqual(@as(usize, slots), consumed); // every slot delivered, none lost
+    try testing.expectEqual(@as(usize, 0), mux.getInputAvailable(0)); // drained to exactly zero
 }
 
 test "PullTestSampleMux: a single full-length update collapses availability to zero (catalog §4 cursor)" {
@@ -385,15 +403,18 @@ test "PullSampleMux: update* are no-ops; the arena view never shrinks (catalog �
 // ===========================================================================
 
 test "setEOS sets the eos flag on muxes that carry one (catalog §4 EOS)" {
+    const gpa = testing.allocator;
     var tin = [_]u8{0} ** 4;
     var tout = [_]u8{0} ** 4;
     var tm = pan.TestSampleMux{ .input = &tin, .output = &tout };
     var pm = pan.PullTestSampleMux{ .input = &tin, .output = &tout };
-    var rm = pan.RingSampleMux{ .in_buf = &tin, .out_buf = &tout };
+    var outr = try pan.Ring.init(gpa, 4, 2);
+    defer outr.deinit(gpa);
+    var rm = pan.RingSampleMux{ .out_ring = &outr }; // the ring transport ends its output ring
 
     try testing.expect(!tm.eos);
     try testing.expect(!pm.eos);
-    try testing.expect(!rm.eos);
+    try testing.expect(!outr.ended());
 
     tm.sampleMux().setEOS();
     pm.sampleMux().setEOS();
@@ -401,7 +422,7 @@ test "setEOS sets the eos flag on muxes that carry one (catalog §4 EOS)" {
 
     try testing.expect(tm.eos);
     try testing.expect(pm.eos);
-    try testing.expect(rm.eos);
+    try testing.expect(outr.ended());
 }
 
 // setEOS is idempotent: a second call keeps the flag set (a realization that
@@ -434,7 +455,7 @@ test "getNumReadersForOutput reports the fan-out reader count (1 here) for every
     var tm = pan.TestSampleMux{ .input = &in, .output = &out };
     var pm = pan.PullTestSampleMux{ .input = &in, .output = &out };
     var ps = pan.PullSampleMux{ .in_buf = &in, .out_buf = &out };
-    var rm = pan.RingSampleMux{ .in_buf = &in, .out_buf = &out };
+    var rm = pan.RingSampleMux{}; // fan-out count is transport-independent (no rings needed)
     try testing.expectEqual(@as(usize, 1), tm.sampleMux().getNumReadersForOutput(0));
     try testing.expectEqual(@as(usize, 1), pm.sampleMux().getNumReadersForOutput(0));
     try testing.expectEqual(@as(usize, 1), ps.sampleMux().getNumReadersForOutput(0));
@@ -470,23 +491,33 @@ fn driveIdentityPull(in: []const Sample(f32), out: []Sample(f32), chunk: usize) 
     }
 }
 
-/// Ring-style driver loop, structurally identical (RingSampleMux is the offline
-/// push stub with the same cursor advance).
+/// Ring-style driver loop: drive an identity stage through the **ring-backed**
+/// `RingSampleMux` (the offline push transport) in `chunk`-sized ring slots,
+/// single-threaded (produce one input slot, copy it through the seam, consume one
+/// output slot). The fixed-slot ring carries the timeline a block at a time, the
+/// final partial block sized to its remainder — bit-exact identity throughout.
 fn driveIdentityRing(in: []const Sample(f32), out: []Sample(f32), chunk: usize) void {
     std.debug.assert(in.len == out.len);
-    var rm = pan.RingSampleMux{
-        .in_buf = bytesOfConst(Sample(f32), in),
-        .out_buf = bytesOf(Sample(f32), out),
-    };
+    const gpa = std.testing.allocator;
+    var inr = pan.Ring.init(gpa, chunk * esz, 2) catch unreachable;
+    defer inr.deinit(gpa);
+    var outr = pan.Ring.init(gpa, chunk * esz, 2) catch unreachable;
+    defer outr.deinit(gpa);
+    var rm = pan.RingSampleMux{ .in_ring = &inr, .out_ring = &outr };
     const mux = rm.sampleMux();
-    while (mux.getInputAvailable(0) > 0) {
-        const avail_elems = mux.getInputAvailable(0) / esz;
-        const n = @min(chunk, avail_elems);
-        const src = samplesOfConst(Sample(f32), mux.getInputBuffer(0))[0..n];
-        const dst = samplesOf(Sample(f32), mux.getOutputBuffer(0))[0..n];
-        @memcpy(dst, src);
+    var i: usize = 0;
+    while (i < in.len) {
+        const n = @min(chunk, in.len - i);
+        @memcpy(inr.produceSlot()[0 .. n * esz], bytesOfConst(Sample(f32), in[i .. i + n]));
+        inr.commitProduce();
+        mux.waitInputAvailable(0, n * esz);
+        @memcpy(mux.getOutputBuffer(0)[0 .. n * esz], mux.getInputBuffer(0)[0 .. n * esz]);
         mux.updateInputBuffer(0, n * esz);
         mux.updateOutputBuffer(0, n * esz);
+        const r = outr.consumeSlot() orelse unreachable;
+        @memcpy(bytesOf(Sample(f32), out[i .. i + n]), r[0 .. n * esz]);
+        outr.commitConsume();
+        i += n;
     }
 }
 

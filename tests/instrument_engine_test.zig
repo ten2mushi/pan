@@ -266,3 +266,69 @@ test "Instrument: live + timeline events merge and sort within a block" {
     try std.testing.expect(energy(out[4..N]) > 0);
     try std.testing.expect(!eng.telemetry().fault);
 }
+
+// ===========================================================================
+// O3 — An Instrument timeline bounce is reproducible (catalog §11.1b / plan §14
+// gate). Render the SAME absolutely-timed score offline twice (two fresh engines,
+// driven by the wall-clock timer for a fixed block count, NOT the audio device),
+// and assert the captured output is BIT-IDENTICAL. The bounce is O3-reproducible
+// because the engine's event timeline is deterministic: `scheduleEventAt` events
+// are drained per block by their absolute transport window and stably offset-
+// sorted, so neither thread scheduling nor wall-clock timing affects the result.
+// ===========================================================================
+
+/// A capture sink that ADVANCES across blocks (unlike `BufSink`, which overwrites
+/// a single block), so a multi-block offline bounce lands in one contiguous
+/// buffer. Clamps at the buffer end.
+const BounceSink = struct {
+    const Self = @This();
+    dest: []Sample(f32) = &.{},
+    cursor: usize = 0,
+    pub fn process(self: *Self, in: []const Sample(f32)) void {
+        const n = @min(in.len, self.dest.len - self.cursor);
+        @memcpy(self.dest[self.cursor .. self.cursor + n], in[0..n]);
+        self.cursor += n;
+    }
+};
+
+fn bounceScoreOffline(alloc: std.mem.Allocator, out: []Sample(f32), n_blocks: usize) !void {
+    const N = 64;
+    var g = pan.Graph.init(alloc, cfg(N));
+    defer g.deinit();
+    const poly = try g.add(pan.PolyVoice(pan.SawVoice, 4), .{ .prototype = FastVoice });
+    const sink = try g.add(BounceSink, .{ .dest = out });
+    try g.connect(poly, sink);
+    var eng = try g.commit();
+    defer eng.deinit();
+
+    // A deterministic absolute-transport score spanning several blocks.
+    _ = eng.scheduleEventAt(poly.id, 10, .{ .note_on = .{ .note_id = 1, .pitch_hz = 440, .velocity = 1.0 } });
+    _ = eng.scheduleEventAt(poly.id, 90, .{ .note_on = .{ .note_id = 2, .pitch_hz = 660, .velocity = 0.8 } });
+    _ = eng.scheduleEventAt(poly.id, 200, .{ .note_off = .{ .note_id = 1, .velocity = 0 } });
+
+    // Offline, fixed-length: the wall-clock-timer clock renders exactly `n_blocks`
+    // blocks off the audio deadline (no device).
+    try eng.renderOffline(.{ .clock = .{ .wall_clock_timer = 48_000 }, .max_blocks = n_blocks });
+}
+
+test "Instrument timeline bounce is O3-reproducible (two offline renders are bit-identical)" {
+    const N = 64;
+    const blocks = 6;
+    const T = N * blocks;
+    var a: [T]Sample(f32) = undefined;
+    var b: [T]Sample(f32) = undefined;
+    @memset(&a, .{ .ch = .{0} });
+    @memset(&b, .{ .ch = .{0} });
+
+    try bounceScoreOffline(std.testing.allocator, &a, blocks);
+    try bounceScoreOffline(std.testing.allocator, &b, blocks);
+
+    // Bit-identical across the two independent offline renders (O3), and the
+    // score actually sounded (not vacuously-equal silence).
+    try std.testing.expectEqualSlices(f32, sampleVals(&a), sampleVals(&b));
+    try std.testing.expect(energy(&a) > 0);
+}
+
+fn sampleVals(frames: []const Sample(f32)) []const f32 {
+    return @alignCast(std.mem.bytesAsSlice(f32, std.mem.sliceAsBytes(frames)));
+}

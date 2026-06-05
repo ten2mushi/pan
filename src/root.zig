@@ -58,6 +58,21 @@ pub const TestSampleMux = mux.TestSampleMux;
 pub const PullTestSampleMux = mux.PullTestSampleMux;
 pub const PullSampleMux = mux.PullSampleMux;
 pub const RingSampleMux = mux.RingSampleMux;
+/// `Ring` — the bounded SPSC block channel that backs `RingSampleMux` (the
+/// offline push transport's substance; the inter-stage carrier in pipeline
+/// parallelism).
+pub const Ring = mux.Ring;
+
+// --- OfflineBatch (Tier C): the push / throughput execution mode -----------
+
+/// The OfflineBatch executor and its timeline I/O endpoints. `OfflineBatch(g,
+/// node_blocks)` renders a committed comptime graph off the audio deadline:
+/// sequentially (the K=1 ground truth), data-parallel chunked across cores (with
+/// the `warmup_samples` lead-in + ordered merge → O3), or pipelined stage-per-
+/// thread over `Ring`s. `offline.Source`/`offline.Sink` inject and capture the
+/// timeline.
+pub const offline = @import("offline.zig");
+pub const OfflineBatch = offline.OfflineBatch;
 
 // --- graph, commit, engine ------------------------------------------------
 

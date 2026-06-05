@@ -125,6 +125,8 @@ pub fn build(b: *std.Build) void {
         "tests/generator_gold_vector_test.zig",
         "tests/polyvoice_behaviour_test.zig",
         "tests/channelmap_functoriality_test.zig",
+        "tests/offline_yoneda_test.zig",
+        "tests/ring_yoneda_test.zig",
     };
     for (harnesses) |path| {
         const h_mod = b.createModule(.{
@@ -169,6 +171,21 @@ pub fn build(b: *std.Build) void {
     neg_concat.has_side_effects = true;
     neg_step.dependOn(&neg_concat.step);
     test_step.dependOn(&neg_concat.step);
+
+    // The P14 companion (catalog §2.5 W1 / A18): asking the OfflineBatch chunker to
+    // data-parallel partition a graph with a stateful block that declares no
+    // `warmup_samples` is a `@compileError` ("presence gates chunkability"). This
+    // fixture references `OfflineBatch.renderChunked` on such a graph and MUST fail
+    // to compile — the active form of the no-warmup-stateful-chunk commit error.
+    const neg_offline = b.addSystemCommand(&.{
+        b.graph.zig_exe,      "build-obj", "-fno-emit-bin",
+        "--dep",              "pan",       "-Mroot=tests/negative/offline_no_warmup.zig",
+        "-Mpan=src/root.zig",
+    });
+    neg_offline.expectExitCode(1);
+    neg_offline.has_side_effects = true;
+    neg_step.dependOn(&neg_offline.step);
+    test_step.dependOn(&neg_offline.step);
 
     // ---- Freestanding ReleaseSmall smoke object ------------------------
     // Proves the commit pass evaluates at comptime against a no-std target —
@@ -233,6 +250,8 @@ pub fn build(b: *std.Build) void {
         "bench/coloring_bench.zig",
         "bench/spectral_bench.zig",
         "bench/embedded_q15.zig",
+        "bench/offline_bench.zig",
+        "bench/biquad_cascade_bench.zig",
     };
     for (benches) |path| {
         const bench_mod = b.createModule(.{
@@ -247,6 +266,26 @@ pub fn build(b: *std.Build) void {
         linkPlatformAudio(target, bench_mod);
         const bench_exe = b.addExecutable(.{ .name = b.fmt("bench-{s}", .{std.fs.path.stem(path)}), .root_module = bench_mod });
         bench_step.dependOn(&b.addRunArtifact(bench_exe).step);
+    }
+
+    // macOS-only head-to-head against Apple vDSP (Accelerate) — a tracked,
+    // regression-visible comparison of pan's biquad-cascade graph path vs a
+    // top-tier hand-tuned DSP library on the same hardware. Gated to Darwin
+    // because it links `-framework Accelerate` and calls `vDSP_biquad`.
+    if (target.result.os.tag.isDarwin()) {
+        const vdsp_mod = b.createModule(.{
+            .root_source_file = b.path("bench/vdsp_compare_bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "pan", .module = pan_mod },
+                .{ .name = "build_options", .module = bench_opts_mod },
+            },
+        });
+        linkPlatformAudio(target, vdsp_mod); // libc + pan's CoreAudio externs
+        vdsp_mod.linkFramework("Accelerate", .{});
+        const vdsp_exe = b.addExecutable(.{ .name = "bench-vdsp-compare", .root_module = vdsp_mod });
+        bench_step.dependOn(&b.addRunArtifact(vdsp_exe).step);
     }
 }
 

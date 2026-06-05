@@ -1638,10 +1638,21 @@ pub const Engine = struct {
         self.footprint_bytes = new_plan.footprint_bytes;
     }
 
-    /// Offline batch render (Tier C) — deferred to the offline-execution phase.
-    pub fn renderOffline(self: *Self) !void {
-        _ = self;
-        return error.OfflineNotImplemented;
+    /// Offline batch render (Tier C) through the runtime engine: drive the bound
+    /// op-list block-by-block off the audio deadline — the sequential offline
+    /// render (the K=1 ground truth). The default `.input_exhaustion` clock drives
+    /// a file-analysis graph until every exhaustible source drains; pass
+    /// `.{ .clock = .{ .wall_clock_timer = fs }, .max_blocks = T / block_size }`
+    /// for a fixed-length timeline bounce (e.g. an Instrument score), whose output
+    /// is O3-reproducible because the engine's event timeline is deterministic
+    /// (events are drained per block and stably offset-sorted). This is the
+    /// runtime-`Engine` offline entry; the **parallel** offline executor (data-
+    /// parallel timeline chunking + pipeline parallelism, the O3 machinery and the
+    /// `K=1 ≡ K=ncores` differential) is the comptime-graph `offline.OfflineBatch(
+    /// g, node_blocks)` facility, which can hold the K independent block-state
+    /// copies a runtime single-instance engine cannot.
+    pub fn renderOffline(self: *Self, opts: RunOptions) !void {
+        return self.runToCompletion(opts);
     }
 
     /// Drive this engine as a NON-RT pull root until its clock source stops — the
