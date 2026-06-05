@@ -32,6 +32,7 @@ const control = @import("control.zig");
 const config = @import("config.zig");
 const io = @import("io.zig");
 const synth = @import("synth.zig");
+const parallel = @import("parallel.zig");
 
 // ===========================================================================
 // Floating-point environment — flush-to-zero / denormals-are-zero
@@ -823,6 +824,299 @@ fn replayBound(plan: *const RuntimePlan, pool: []u8, events: *const EventDispatc
 }
 
 // ===========================================================================
+// Tier B — the static-parallel multicore overlay bound to a runtime plan
+// ===========================================================================
+
+/// The per-callback context the Tier-B per-op runner casts back to. Built fresh on
+/// the caller's stack each render; the workers read it through the type-erased user
+/// pointer the worker pool publishes with its generation bump.
+const RunCtx = struct {
+    plan: *const RuntimePlan,
+    base: [*]u8,
+    n_dyn: *const [graph.max_nodes]usize,
+    events: *const EventDispatch,
+    guards: bool,
+    fault: *bool,
+    /// Paranoid-poison state (used by `paranoidPostOp`): the per-op reader counts and
+    /// the live per-buffer reader-completion counters.
+    poison: *const parallel.PoisonPlan = undefined,
+    pending: []std.atomic.Value(i32) = &.{},
+    fills: *std.atomic.Value(u64) = undefined,
+};
+
+/// The paranoid post-op the parallel render runs after each op (safe builds only):
+/// publish this op's output values' reader counts, then decrement the counter of each
+/// scratch buffer it just read and NaN-poison any buffer whose count reaches zero (its
+/// value's last reader has finished). Persistent feedback buffers (offset at/after the
+/// scratch region) carry state across the callback and are never tracked or poisoned.
+/// The single op that brings a buffer's counter to zero is the last reader to FINISH
+/// for ANY interleaving (the counter is atomic), so the poison never races a peer read.
+fn paranoidPostOp(op_index: usize, user: *anyopaque) void {
+    const c: *RunCtx = @ptrCast(@alignCast(user));
+    const op = &c.plan.ops[op_index];
+    const pool_bytes = c.plan.pool_bytes;
+    // Publish the reader counts for the values this op produces (release-ordered ahead
+    // of the publish in `replayWorker`, so a consumer/reuse-writer sees them).
+    var k: usize = 0;
+    while (k < op.output_count) : (k += 1) {
+        const b = op.output_buffer_ids[k];
+        if (b < graph.max_buffers and c.plan.buffer_offset[b] < pool_bytes) {
+            c.pending[b].store(@intCast(c.poison.out_reader_count[op_index][k]), .release);
+        }
+    }
+    // Decrement each scratch buffer this op read; the zero-hitter poisons it.
+    poisonReads(c, op.input_buffer_ids[0..op.input_count], pool_bytes);
+    poisonReads(c, op.param_input_buffer_ids[0..op.param_input_count], pool_bytes);
+}
+
+fn poisonReads(c: *RunCtx, ids: []const usize, pool_bytes: usize) void {
+    for (ids) |b| {
+        if (b >= graph.max_buffers or c.plan.buffer_offset[b] >= pool_bytes) continue;
+        if (c.pending[b].fetchSub(1, .acq_rel) == 1) {
+            // Last reader finished — fill the buffer with NaN. A later legitimate
+            // writer (ordered after this op by the reuse anti-dependency) overwrites it;
+            // a stale/illegal read sees the NaN and it propagates to the sink.
+            const off = c.plan.buffer_offset[b];
+            const len = c.plan.buffer_byte_len[b];
+            const region = c.base[off .. off + len];
+            const floats: []f32 = @alignCast(std.mem.bytesAsSlice(f32, region));
+            for (floats) |*f| f.* = std.math.nan(f32);
+            _ = c.fills.fetchAdd(1, .monotonic);
+        }
+    }
+}
+
+/// Run one op of the plan over the shared pool — the parallel analogue of one
+/// iteration of `replayBound`. Resolves the op's per-callback element count from the
+/// shared `n_dyn` (a resampler's producer count is overridden there, single-threaded,
+/// before dispatch), then invokes the bound kernel.
+fn runOneOp(op_index: usize, user: *anyopaque) void {
+    const c: *RunCtx = @ptrCast(@alignCast(user));
+    const op = &c.plan.ops[op_index];
+    if (op.fn_ptr == null) return;
+    const thunk: RenderThunk = @ptrCast(@alignCast(op.fn_ptr.?));
+    const n = c.n_dyn[op_index];
+    if (n == op.n_or_pull_spec) {
+        thunk(op.self_ptr.?, c.base, op, c.plan, c.events, c.guards, c.fault);
+    } else {
+        var op_copy = op.*;
+        op_copy.n_or_pull_spec = n;
+        thunk(op.self_ptr.?, c.base, &op_copy, c.plan, c.events, c.guards, c.fault);
+    }
+}
+
+/// The Tier-B overlay: the worker pool, the render workgroup, the schedule derived
+/// from the active plan, the cross-worker sync, the spin telemetry, and the
+/// auto-demote policy. Heap-allocated so the worker pool (which captures `&self.pool`)
+/// has a stable address across the engine's by-value move out of `bind`. Tier B runs
+/// the engine's OWN colored plan over the engine's OWN pool — the schedule's op-DAG
+/// includes the colored-pool anti-dependencies, so the existing coloring is a valid
+/// concurrent schedule and the parallel output is bit-identical to Tier A.
+const TierB = struct {
+    alloc: std.mem.Allocator,
+    workgroup: parallel.Workgroup,
+    pool: parallel.WorkerPool,
+    dag: parallel.Dag = .{},
+    costs: parallel.CostModel = .{},
+    sched: parallel.Schedule = .{},
+    ready: parallel.ReadyFlags = .{},
+    barrier: parallel.Barrier = .{},
+    tele: parallel.SpinTelemetry = .{},
+    policy: parallel.DemotePolicy = .{},
+    executor: parallel.Executor = .level_barrier,
+    gate: parallel.GateConfig = .{},
+    p_max: usize = 1,
+    /// The gate's structural decision (work/span parallelism + workgroup) at build.
+    decision: parallel.GateDecision = .{ .enable = false, .p = 1, .parallelism = 1, .single_core_load = 0 },
+    spawned: bool = false,
+    /// Whether Tier B runs the next callback. Read by the render (acquire), written
+    /// by the demote policy and the live-edit guard (release) — both off the steady-
+    /// state critical path. False ⇒ the always-correct Tier A replay.
+    active: std.atomic.Value(bool) = .init(false),
+    /// Tier B's OWN non-coalesced (per-edge) bound plan over its OWN scratch pool.
+    /// Every produced value has a distinct buffer, so independent parallel paths
+    /// carry no false anti-dependency and the schedule exposes the real parallelism;
+    /// the per-edge render is bit-identical to the engine's colored Tier-A render
+    /// (the colorer is a memory-reuse optimization, not a value change). The plan
+    /// binds the SAME block instances as the engine (shared `self_ptr`), so block-
+    /// internal state (delay rings, biquad z⁻¹, ramps) is shared; only pool-resident
+    /// z⁻¹ feedback (rare on a Tier-B-shaped voice bank) lives in this pool's own
+    /// tail, so a Tier A↔B demote on such a graph may click for one block — absent
+    /// for the feedback-free graphs Tier B promotes.
+    plan: *RuntimePlan,
+    inserted: []InsertedSlot,
+    edge_pool: []align(64) u8,
+    pool_cap: usize,
+    /// The worst-case block size the per-edge pool was pre-sized for (so a rebind
+    /// after an edit/reconfigure reproduces the same capacity policy as the engine).
+    max_block_size: usize = 0,
+    /// The paranoid NaN-poison plan (per-op output-port reader counts) + the live
+    /// per-buffer reader-completion counters. In a safe build the parallel render
+    /// poisons each scratch buffer the instant its value's last reader finishes, so a
+    /// colorer/schedule bug that reads a buffer past its last legitimate reader — or a
+    /// cross-worker reuse-before-last-reader — surfaces as a NaN at the sink rather
+    /// than silently-stale audio. Compiled-in only where guards are (Debug/ReleaseSafe).
+    poison: parallel.PoisonPlan = .{},
+    pending: [graph.max_buffers]std.atomic.Value(i32) = blk: {
+        var a: [graph.max_buffers]std.atomic.Value(i32) = undefined;
+        for (&a) |*c| c.* = std.atomic.Value(i32).init(0);
+        break :blk a;
+    },
+    /// Count of NaN-poison fills in the last paranoid callback (a witness that the
+    /// safety net is ACTIVE, not a silent no-op). Zero in a release build.
+    poison_fills: std.atomic.Value(u64) = .init(0),
+
+    /// Allocate and fully build the Tier-B overlay: its per-edge bound plan + pool,
+    /// the worker pool, and the schedule. Heap-allocated so the worker pool's stable
+    /// `&self.pool` survives the engine's by-value move out of `bind`.
+    fn create(alloc: std.mem.Allocator, ir: graph.Graph, bound: []const BoundNode, cfg: config.Config, opts: EngineOptions) !*TierB {
+        const p_max = @min(opts.cores, parallel.max_workers);
+        const wg = if (opts.force_workgroup)
+            parallel.Workgroup{ .available = true, .handle = null }
+        else
+            parallel.Workgroup.detect();
+
+        const built = try Engine.buildBoundPlanMode(alloc, ir, bound, .per_edge);
+        errdefer {
+            alloc.destroy(built.plan);
+            for (built.inserted) |s| s.free(alloc, s.ptr);
+            alloc.free(built.inserted);
+        }
+        const tb = try alloc.create(TierB);
+        errdefer alloc.destroy(tb);
+        tb.* = .{
+            .alloc = alloc,
+            .workgroup = wg,
+            .pool = try parallel.WorkerPool.init(alloc, p_max, wg),
+            .executor = opts.tier_b_executor,
+            .gate = opts.gate,
+            .p_max = p_max,
+            .plan = built.plan,
+            .inserted = built.inserted,
+            .edge_pool = try Engine.allocPool(alloc, 0),
+            .pool_cap = 0,
+            .max_block_size = opts.max_block_size,
+        };
+        // buildFor recolors the per-edge plan to the concurrency-aware minimal
+        // footprint, so the pool is sized AFTER it (from the shrunk pool_bytes).
+        tb.buildFor(built.plan);
+        const cap = Engine.poolCapacityFor(built.plan.pool_bytes + built.plan.persistent_bytes, cfg.block_size, opts.max_block_size);
+        tb.edge_pool = try Engine.allocPool(alloc, cap);
+        tb.pool_cap = cap;
+        return tb;
+    }
+
+    /// Rebuild the per-edge plan + pool + schedule for a new graph (an edit→commit /
+    /// reconfigure). Off-RT; the caller demotes Tier B across the swap so no callback
+    /// reads a stale plan/schedule. Frees the old per-edge plan/inserted/pool.
+    fn rebind(self: *TierB, ir: graph.Graph, bound: []const BoundNode, cfg: config.Config) !void {
+        const built = try Engine.buildBoundPlanMode(self.alloc, ir, bound, .per_edge);
+        errdefer {
+            self.alloc.destroy(built.plan);
+            for (built.inserted) |s| s.free(self.alloc, s.ptr);
+            self.alloc.free(built.inserted);
+        }
+        // Free the old plan + its inserted state, adopt the new, recolor (buildFor),
+        // THEN size the pool from the shrunk pool_bytes.
+        self.alloc.destroy(self.plan);
+        for (self.inserted) |s| s.free(self.alloc, s.ptr);
+        self.alloc.free(self.inserted);
+        self.plan = built.plan;
+        self.inserted = built.inserted;
+        self.buildFor(built.plan);
+        const need = Engine.poolCapacityFor(built.plan.pool_bytes + built.plan.persistent_bytes, cfg.block_size, self.max_block_size);
+        if (need > self.pool_cap) {
+            const new_pool = try Engine.allocPool(self.alloc, need);
+            Engine.freePool(self.alloc, self.edge_pool);
+            self.edge_pool = new_pool;
+            self.pool_cap = need;
+        }
+    }
+
+    /// Build the Tier-B schedule + memory plan for `plan` (a non-coalesced per-edge
+    /// plan), in two passes, and **recolor `plan` in place** to the concurrency-aware
+    /// minimal footprint. Off-RT (allocation-free — all fixed arrays). MUTATES `plan`
+    /// (its buffer ids / pool layout shrink), so the caller must size the Tier-B pool
+    /// from `plan.pool_bytes` AFTER this returns.
+    ///
+    /// Pass 0 (per-edge DAG → gate + preliminary schedule): the per-edge DAG carries
+    /// only true producer→consumer order, so its work/span give the graph's REAL
+    /// achievable parallelism (a near-linear chain ≈ 1 is refused). A preliminary
+    /// schedule fixes each op's wall-time interval. Pass 1 (recolor → rebuilt DAG →
+    /// final schedule): `concurrencyColor` reuses scratch buffers across values whose
+    /// intervals do not overlap — shrinking the pool without serializing concurrent
+    /// work, since coalesced values were already ordered. Rebuilding the DAG from the
+    /// recolored plan materialises those reuse anti-dependencies as the cross-worker
+    /// ready-flag / barrier ordering, so the final schedule honours them and the
+    /// parallel render stays bit-identical to Tier A.
+    fn buildFor(self: *TierB, plan: *RuntimePlan) void {
+        const dag0 = parallel.buildDag(plan.*);
+        var costs0 = parallel.CostModel.fromPlan(plan.*);
+        const w = parallel.totalWork(&dag0, &costs0);
+        const s = parallel.span(&dag0, &costs0);
+        // Engine-side promotion uses the deadline-FREE structural condition: the graph
+        // is parallel enough (work/span clears the speedup threshold — a near-linear
+        // chain, where span ≈ work, is refused) AND a workgroup bounds the spin. The
+        // worker count tracks the available parallelism, capped by the core budget.
+        // (The full cost gate — busy test + P-from-load — is `parallel.costGate`,
+        // wired to live deadline-headroom telemetry on-device; the static promotion
+        // here cannot size P without a real deadline, so it sizes from parallelism.)
+        const pmaxf: f32 = @floatFromInt(@max(self.p_max, 1));
+        const span_floor = @max(s, w / pmaxf);
+        const parallelism: f32 = if (span_floor > 0) w / span_floor else 1.0;
+        const enable = parallelism >= self.gate.theta_speedup and self.workgroup.available;
+        var p: usize = @intFromFloat(@round(parallelism));
+        if (p < 2) p = 2;
+        if (p > self.p_max) p = self.p_max;
+        if (!enable) p = 1;
+        self.decision = .{ .enable = enable, .p = p, .parallelism = parallelism, .single_core_load = 0 };
+
+        // Pass 0: a preliminary schedule (on the per-edge DAG) → recolor on its
+        // intervals. Even a disabled (p=1) overlay coalesces to the minimal
+        // sequential footprint so its unused pool is small.
+        const sched0 = switch (self.executor) {
+            .level_barrier => parallel.levelSchedule(&dag0, &costs0, p),
+            .heft => parallel.heftSchedule(&dag0, &costs0, p),
+        };
+        parallel.concurrencyColor(plan, &sched0);
+
+        // Pass 1: the DAG rebuilt from the recolored plan, walking the ops in the
+        // preliminary schedule's global order (the order a reused buffer's value-
+        // sequence advances) so the reuse anti-dependencies are correct; then the
+        // final schedule honouring them.
+        self.dag = parallel.buildDagOrdered(plan.*, sched0.global_order[0..plan.op_count]);
+        self.costs = parallel.CostModel.fromPlan(plan.*);
+        self.sched = switch (self.executor) {
+            .level_barrier => parallel.levelSchedule(&self.dag, &self.costs, p),
+            .heft => parallel.heftSchedule(&self.dag, &self.costs, p),
+        };
+        self.barrier.p = self.sched.p;
+        // The paranoid poison plan keyed to the final (recolored) schedule.
+        self.poison = parallel.computePoison(plan.*, &self.sched);
+        self.policy = parallel.DemotePolicy.init(enable);
+        self.active.store(enable, .release);
+    }
+
+    /// Spawn the worker pool once, at its final (heap-stable) address. Idempotent.
+    /// Called off the steady-state path (engine `start`, or one-time on the first
+    /// manually-driven render) — spawning is a syscall, never per callback.
+    fn ensureSpawned(self: *TierB) !void {
+        if (self.spawned) return;
+        try self.pool.spawn();
+        self.spawned = true;
+    }
+
+    fn deinit(self: *TierB, alloc: std.mem.Allocator) void {
+        self.pool.deinit();
+        alloc.destroy(self.plan);
+        for (self.inserted) |s| s.free(alloc, s.ptr);
+        alloc.free(self.inserted);
+        Engine.freePool(alloc, self.edge_pool);
+        alloc.destroy(self);
+    }
+};
+
+// ===========================================================================
 // The engine surface (runtime; the builder/DX arc + control-plane)
 // ===========================================================================
 
@@ -864,6 +1158,19 @@ pub const EngineOptions = struct {
     /// to any N ≤ this is a live RCU swap (no reallocation). 0 ⇒ size exactly for
     /// the committed N.
     max_block_size: usize = 0,
+    /// Which Tier-B executor the multicore overlay uses when `cores > 1`. The
+    /// level-barrier fork-join is the deadlock-free-by-construction safe default;
+    /// HEFT + point-to-point ready-flags fills the bubbles a barrier leaves but
+    /// relies on the standard static-schedule deadlock-freedom argument.
+    tier_b_executor: parallel.Executor = .level_barrier,
+    /// Treat the render workgroup as available even without a real device
+    /// `os_workgroup` binding (dev/bench/test on a host where the CoreAudio
+    /// workgroup handle is not threaded in). HONEST CAVEAT: the bounded-spin claim
+    /// is then ▷/≈ only by the demote policy, not by OS co-scheduling. Off by
+    /// default, so a bare engine keeps Tier A when no workgroup is present.
+    force_workgroup: bool = false,
+    /// Cost-gate constants (the busy / speedup thresholds, headroom target).
+    gate: parallel.GateConfig = .{},
 };
 
 /// What a committed graph reports to the engine: the static op count and the
@@ -1153,6 +1460,10 @@ pub const Engine = struct {
     /// epoch no one advances would deadlock). A concurrency test sets it to model a
     /// manual RT thread.
     running: std.atomic.Value(bool) = .init(false),
+    /// The Tier-B multicore overlay, present when `opts.cores > 1` on a realtime
+    /// root. Null ⇒ Tier A only (the frozen single-core ground truth). Heap-stable
+    /// (the worker pool captures its address).
+    tb: ?*TierB = null,
 
     const Self = @This();
 
@@ -1192,6 +1503,15 @@ pub const Engine = struct {
         const pool = try allocPool(alloc, cap);
         errdefer freePool(alloc, pool);
 
+        // The Tier-B multicore overlay, when more than one core is requested on a
+        // realtime root. The cores budget caps the worker count; the cost gate
+        // decides whether to actually promote (a near-linear chain stays Tier A).
+        var tb_opt: ?*TierB = null;
+        errdefer if (tb_opt) |tb| tb.deinit(alloc);
+        if (opts.cores > 1 and opts.mode == .realtime_streaming) {
+            tb_opt = try TierB.create(alloc, ir, bound_owned, cfg, opts);
+        }
+
         return .{
             .alloc = alloc,
             .mode = opts.mode,
@@ -1205,7 +1525,11 @@ pub const Engine = struct {
             .ring = CommandRing.empty,
             .op_count = plan.op_count,
             .footprint_bytes = plan.footprint_bytes,
-            .tele = .{ .guards_compiled_out = !std.debug.runtime_safety },
+            // Start with full headroom so a manually-driven engine (no backend
+            // reporting real headroom) keeps Tier B active; the device callback
+            // overwrites this with the measured headroom each render.
+            .tele = .{ .guards_compiled_out = !std.debug.runtime_safety, .deadline_headroom = 1.0 },
+            .tb = tb_opt,
         };
     }
 
@@ -1223,12 +1547,29 @@ pub const Engine = struct {
     const BuiltPlan = struct { plan: *RuntimePlan, inserted: []InsertedSlot };
 
     fn buildBoundPlan(alloc: std.mem.Allocator, ir: graph.Graph, bound: []const BoundNode) !BuiltPlan {
+        return buildBoundPlanMode(alloc, ir, bound, .colored);
+    }
+
+    /// As `buildBoundPlan`, but under an explicit buffer mode. `.colored` is the
+    /// shipped Tier-A pool (in-place coalescing); `.per_edge` gives every produced
+    /// value its own buffer — the non-coalesced plan the Tier-B parallel overlay runs
+    /// over, since a coalesced (colored) pool's buffer-reuse anti-dependencies would
+    /// serialize independent parallel paths back into a chain. A `.per_edge` render
+    /// is bit-identical to the `.colored` render (the buffer assignment is a
+    /// memory-reuse optimization, not a value change), so Tier B (per-edge) ≡ Tier A
+    /// (colored) bit-for-bit.
+    fn buildBoundPlanMode(alloc: std.mem.Allocator, ir: graph.Graph, bound: []const BoundNode, mode: commit.BufferMode) !BuiltPlan {
         // Negotiation (resampler coercions) THEN plugin-delay-compensation: the
         // runtime path now mirrors `commitRuntime` so a latency-mismatched fan-in is
         // compensated here too. `insertPdc` is a no-op for any graph without such a
         // fan-in (every Engine graph to date), so this is inert for them.
         const g2 = commit.insertPdc(commit.insertCoercions(ir));
-        const full = try commit.commitGraph(g2, .colored);
+        // `commitGraph`'s mode is comptime; dispatch the (small, closed) set so each
+        // branch passes a comptime-literal mode.
+        const full = switch (mode) {
+            .colored => try commit.commitGraph(g2, .colored),
+            .per_edge => try commit.commitGraph(g2, .per_edge),
+        };
         const plan = try alloc.create(RuntimePlan);
         errdefer alloc.destroy(plan);
         plan.* = full;
@@ -1317,6 +1658,9 @@ pub const Engine = struct {
 
     pub fn deinit(self: *Self) void {
         if (self.backend) |b| b.stop();
+        // Tear down the Tier-B worker pool (joins the spawned workers) before the
+        // instances/pool it renders over are freed.
+        if (self.tb) |tb| tb.deinit(self.alloc);
         // Free the block instances via their destroy thunks.
         for (self.bound) |b| b.destroy(self.alloc, b.self_ptr);
         self.alloc.free(self.bound);
@@ -1334,6 +1678,9 @@ pub const Engine = struct {
     /// on-device step (no audio HW in a sandbox); the callback path compiles and
     /// links here.
     pub fn start(self: *Self, backend: io.AudioBackend) !void {
+        // Spawn the Tier-B workers ONCE here (off the RT path), at the engine's
+        // final address — spawning is a syscall, never per callback.
+        if (self.tb) |tb| try tb.ensureSpawned();
         self.backend = backend;
         self.running.store(true, .release);
         try backend.start(.{
@@ -1380,8 +1727,67 @@ pub const Engine = struct {
         // (the onset split is internal to the consuming block, e.g. PolyVoice).
         const dispatch = self.drainEvents();
         const guards = std.debug.runtime_safety;
-        replayBound(plan, self.pool, &dispatch, guards, &self.tele.fault);
+        // Tier B when promoted; otherwise the frozen Tier A sequential replay. Both
+        // run the same plan over the same pool, so the choice is a branch, not a
+        // swap — and bit-identical.
+        if (!self.renderTierB(plan, &dispatch, guards)) {
+            replayBound(plan, self.pool, &dispatch, guards, &self.tele.fault);
+        }
         self.transport.advance(self.cfg.block_size);
+    }
+
+    /// Render the active plan in parallel across the Tier-B worker pool if the
+    /// overlay is present and currently promoted; returns whether it ran (false ⇒
+    /// the caller falls back to the Tier A sequential replay). The result is
+    /// bit-identical to Tier A: the schedule places whole ops over the same colored
+    /// pool with the colored-pool anti-dependencies honoured.
+    fn renderTierB(self: *Self, plan: *const RuntimePlan, dispatch: *const EventDispatch, guards: bool) bool {
+        _ = plan; // Tier B replays its OWN per-edge plan over its OWN pool (below).
+        const tb = self.tb orelse return false;
+        if (!tb.active.load(.acquire)) return false;
+        // Spawn the pool once if `start` did not (a manually-driven engine). Off the
+        // steady-state path; a spawn failure degrades to Tier A.
+        tb.ensureSpawned() catch return false;
+        const tb_plan = tb.plan;
+        // Per-op element counts (a resampler's producer overridden) — computed once,
+        // single-threaded, before dispatch, so every worker reads a stable value.
+        var n_dyn: [graph.max_nodes]usize = undefined;
+        dynamicCounts(tb_plan, n_dyn[0..tb_plan.op_count]);
+        const base: [*]u8 = if (tb.edge_pool.len == 0) undefined else tb.edge_pool.ptr;
+        var rc = RunCtx{
+            .plan = tb_plan,
+            .base = base,
+            .n_dyn = &n_dyn,
+            .events = dispatch,
+            .guards = guards,
+            .fault = &self.tele.fault,
+            .poison = &tb.poison,
+            .pending = &tb.pending,
+            .fills = &tb.poison_fills,
+        };
+        // In a safe build, run the paranoid NaN-poison post-op so a colorer/schedule
+        // bug surfaces as a loud NaN at the sink (compiled out where guards are off).
+        const post_op: ?parallel.RunOp = if (guards) paranoidPostOp else null;
+        if (guards) tb.poison_fills.store(0, .monotonic);
+        _ = parallel.replayParallel(
+            &tb.pool,
+            tb.executor,
+            &tb.sched,
+            &tb.dag,
+            &tb.ready,
+            &tb.barrier,
+            runOneOp,
+            &rc,
+            &tb.tele,
+            post_op,
+        );
+        self.tele.spin_time = @floatFromInt(tb.tele.maxSpins(tb.sched.p));
+        // Feed the demote policy the measured headroom (1.0 until a backend reports
+        // real headroom); its verdict governs the NEXT callback. Sustained low
+        // headroom demotes to Tier A; a stable high-headroom window re-promotes.
+        _ = tb.policy.observe(self.tele.deadline_headroom);
+        tb.active.store(tb.policy.active, .release);
+        return true;
     }
 
     /// Drain BOTH note-event rings into the per-block scratch and return the dispatch
@@ -1544,6 +1950,12 @@ pub const Engine = struct {
         }
         if (new_plan.pool_bytes + new_plan.persistent_bytes > self.pool_cap) return error.PoolCapacityExceeded;
 
+        // The Tier-B schedule is keyed to the active plan's op-list. Demote to Tier A
+        // across the swap so a callback never replays a new plan against a stale
+        // schedule; the schedule is rebuilt (and re-promoted per the gate) below, once
+        // no callback can hold the old plan.
+        if (self.tb) |tb| tb.active.store(false, .release);
+
         // Adopt the new owned bound set, but DON'T free instances the edit dropped
         // yet — the still-active old plan references them. Keep the old set to free
         // after the grace period (below), so a callback rendering the old plan never
@@ -1586,6 +1998,16 @@ pub const Engine = struct {
 
         self.op_count = new_plan.op_count;
         self.footprint_bytes = new_plan.footprint_bytes;
+
+        // Rebuild the Tier-B per-edge plan + schedule for the new graph and re-promote
+        // per the gate. Safe now: the old colored plan is freed (no callback reads the
+        // old schedule), and `active` was demoted before the swap; on a rebind failure
+        // Tier B simply stays demoted (Tier A — always correct). Read from the engine's
+        // freshly-duped `self.bound`, NOT the `new_bound` parameter: on the `recommit`
+        // path `new_bound` ALIASES the old bound slice that `free(old_bound)` just
+        // released, so reading its render thunks would be a use-after-free; `self.bound`
+        // is the live owned copy with identical `self_ptr`/`render` values.
+        if (self.tb) |tb| tb.rebind(new_ir, self.bound, self.cfg) catch {};
     }
 
     /// Device-reconfiguration (route switch): re-negotiate for a new block size,
@@ -1606,6 +2028,10 @@ pub const Engine = struct {
             for (built.inserted) |s| s.free(self.alloc, s.ptr);
             self.alloc.free(built.inserted);
         }
+        // Demote Tier B across the swap; the schedule is rebuilt for the new plan
+        // below (the op-DAG is N-independent, but costs scale with N, so the gate is
+        // re-evaluated).
+        if (self.tb) |tb| tb.active.store(false, .release);
         const old_inserted = self.inserted;
         self.inserted = built.inserted;
 
@@ -1636,6 +2062,7 @@ pub const Engine = struct {
         self.cfg.block_size = block_size;
         self.op_count = new_plan.op_count;
         self.footprint_bytes = new_plan.footprint_bytes;
+        if (self.tb) |tb| tb.rebind(new_ir, self.bound, self.cfg) catch {};
     }
 
     /// Offline batch render (Tier C) through the runtime engine: drive the bound
@@ -1705,6 +2132,53 @@ pub const Engine = struct {
 
     pub fn telemetry(self: *Self) Telemetry {
         return self.tele;
+    }
+
+    /// Whether the Tier-B multicore overlay is present AND currently promoted (it
+    /// runs the next callback in parallel). False ⇒ Tier A — either no overlay
+    /// (`cores = 1`), the cost gate refused (a near-linear chain / no workgroup), or
+    /// the demote policy fell back under load.
+    pub fn tierBActive(self: *Self) bool {
+        return if (self.tb) |tb| tb.active.load(.acquire) else false;
+    }
+
+    /// The Tier-B worker count the schedule uses (1 when not promoted). The
+    /// commit-time achievable-parallelism estimate (work/span-bounded makespan ratio)
+    /// is `tierBParallelism`.
+    pub fn tierBWorkers(self: *Self) usize {
+        return if (self.tb) |tb| tb.sched.p else 1;
+    }
+
+    /// The commit-time achievable-parallelism estimate of the committed graph
+    /// (work / max(span, work/P)) — 1 for a near-linear chain. 0 when no overlay.
+    pub fn tierBParallelism(self: *Self) f32 {
+        return if (self.tb) |tb| tb.decision.parallelism else 0;
+    }
+
+    /// The currently-active immutable plan (read-only). Exposed for telemetry and
+    /// tests that rebuild the Tier-B op-DAG / schedule from the committed op-list.
+    pub fn currentPlan(self: *Self) *const RuntimePlan {
+        return self.rcu.current();
+    }
+
+    /// The Tier-B overlay's concurrency-aware-colored scratch pool size in bytes
+    /// (0 when no overlay). The Tier-B footprint addendum: the per-edge plan recolored
+    /// to the peak-concurrent live-edge count, plus its persistent feedback tail.
+    pub fn tierBScratchBytes(self: *Self) usize {
+        return if (self.tb) |tb| tb.plan.pool_bytes + tb.plan.persistent_bytes else 0;
+    }
+
+    /// The number of distinct scratch+persistent buffers in the Tier-B colored plan
+    /// (the `M` of the footprint formula; ≤ the per-edge worst case of one per value).
+    pub fn tierBScratchBuffers(self: *Self) usize {
+        return if (self.tb) |tb| tb.plan.pool_buffer_count else 0;
+    }
+
+    /// The number of paranoid NaN-poison fills in the last Tier-B render (a witness
+    /// that the safety net is live). Zero in a release build (guards compiled out) or
+    /// when Tier B did not run.
+    pub fn tierBPoisonFills(self: *Self) u64 {
+        return if (self.tb) |tb| tb.poison_fills.load(.monotonic) else 0;
     }
 };
 

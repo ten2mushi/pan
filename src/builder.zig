@@ -338,6 +338,19 @@ pub const Graph = struct {
         return eng;
     }
 
+    /// Commit with explicit engine options — the entry for the Tier-B multicore
+    /// overlay (`opts.cores > 1`, `opts.tier_b_executor`, `opts.force_workgroup`).
+    /// `mode` defaults to realtime_streaming and `max_block_size` to the builder's
+    /// config unless the caller overrides them. The frozen single-core Tier A is
+    /// `opts.cores = 1` (the default `commit`).
+    pub fn commitWith(self: *Self, opts: engine.EngineOptions) !engine.Engine {
+        var o = opts;
+        if (o.max_block_size == 0) o.max_block_size = self.cfg.max_block_size;
+        const eng = try engine.Engine.bind(self.alloc, self.ir, self.bound[0..self.ir.node_count], self.cfg, o);
+        self.transferred = true;
+        return eng;
+    }
+
     /// Commit the graph as a NON-RT **analysis** pull root (C5): the clock is a
     /// timer or input exhaustion, not the audio device callback, so the run is never
     /// slaved to an audio deadline. Drive the returned engine with `runToCompletion`.

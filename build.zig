@@ -127,6 +127,10 @@ pub fn build(b: *std.Build) void {
         "tests/channelmap_functoriality_test.zig",
         "tests/offline_yoneda_test.zig",
         "tests/ring_yoneda_test.zig",
+        "tests/parallel_tier_b_test.zig",
+        "tests/parallel_pure_yoneda_test.zig",
+        "tests/parallel_concurrent_yoneda_test.zig",
+        "tests/parallel_ratparam_yoneda_test.zig",
     };
     for (harnesses) |path| {
         const h_mod = b.createModule(.{
@@ -252,6 +256,7 @@ pub fn build(b: *std.Build) void {
         "bench/embedded_q15.zig",
         "bench/offline_bench.zig",
         "bench/biquad_cascade_bench.zig",
+        "bench/parallel_bench.zig",
     };
     for (benches) |path| {
         const bench_mod = b.createModule(.{

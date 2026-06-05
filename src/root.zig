@@ -141,6 +141,17 @@ pub const ExecutorMode = engine.ExecutorMode;
 /// sink as a loud NaN rather than as silently-stale audio.
 pub const ParanoidExecutor = engine.ParanoidExecutor;
 
+/// Tier B — the static-parallel RealtimeStreaming overlay (worker pool, render-
+/// workgroup HAL, cost-model gate, op-DAG, level-barrier + HEFT schedules,
+/// point-to-point ready flags, auto-demote). An opt-in, measured layer over the
+/// frozen Tier-A ground truth: bit-identical output, auto-demoting under load.
+pub const parallel = @import("parallel.zig");
+pub const Workgroup = parallel.Workgroup;
+pub const GateConfig = parallel.GateConfig;
+pub const GateDecision = parallel.GateDecision;
+pub const costGate = parallel.costGate;
+pub const TierBExecutor = parallel.Executor;
+
 // --- the Compute HAL (portable @Vector kernels) ---------------------------
 
 pub const simd = @import("simd.zig");

@@ -22,3 +22,6 @@ venv/
 # OS / editor
 .DS_Store
 *.swp
+
+# Local Claude Code agent state (session locks, not project content)
+.claude/
