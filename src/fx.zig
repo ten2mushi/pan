@@ -163,6 +163,116 @@ pub fn Allpass(comptime num: numeric.Numeric, comptime max_delay: usize) type {
     };
 }
 
+/// `Chorus(num, max_delay)` — a single-voice chorus: the dry input is blended with
+/// a copy read from a delay line whose length is slowly swept by a low-frequency
+/// oscillator, producing the small time-varying pitch detune that thickens a sound.
+/// The swept delay is read with LINEAR INTERPOLATION (a fractional delay), and the
+/// sweep is `delay = base_delay + depth·sin(2π·phase)`. `out = (1−mix)·x + mix·wet`.
+/// Rate-1:1 with persistent delay state ⇒ a `Map` (and a delay element, so a cycle
+/// built through it is causal). Float-only.
+pub fn Chorus(comptime num: numeric.Numeric, comptime max_delay: usize) type {
+    const T = num.Lane;
+    requireFloat(T);
+    if (max_delay < 4) @compileError("pan: Chorus max_delay must be >= 4");
+    return struct {
+        const Self = @This();
+
+        /// Internal ring length — registers this as a delay element (SCC-has-delay).
+        pub const delay_len: usize = max_delay;
+
+        ring: [max_delay]T = @splat(0),
+        /// Centre (average) swept delay, in samples.
+        base_delay: f32 = 0,
+        /// Sweep depth in samples (peak deviation around `base_delay`); the realised
+        /// delay is clamped to `[1, max_delay−2]` so the interpolation taps stay valid.
+        depth: f32 = 0,
+        /// LFO rate as a NORMALIZED frequency (cycles per sample = Hz / sample_rate).
+        rate: f32 = 0,
+        /// Dry/wet blend in `[0, 1]` (`0` = dry only, `1` = wet only).
+        mix: f32 = 0.5,
+        pos: usize = 0,
+        phase: f32 = 0,
+
+        pub fn process(self: *Self, in: []const types.Sample(T), out: []types.Sample(T)) void {
+            const xs = scalarsConst(T, in);
+            const ys = scalars(T, out);
+            const m: T = @floatCast(std.math.clamp(self.mix, 0.0, 1.0));
+            var p = self.pos;
+            var ph = self.phase;
+            for (xs, ys) |x, *y| {
+                const lfo = @sin(2.0 * std.math.pi * ph);
+                const d = std.math.clamp(self.base_delay + self.depth * lfo, 1.0, @as(f32, @floatFromInt(max_delay - 2)));
+                const k0: usize = @intFromFloat(@floor(d));
+                const frac: T = @floatCast(d - @floor(d));
+                // Read the fractional delayed sample from PAST slots (d ≥ 1 ⇒ the
+                // current write slot is never one of them), then write the input.
+                const a = self.ring[(p + max_delay - k0) % max_delay];
+                const b = self.ring[(p + max_delay - k0 - 1) % max_delay];
+                const wet = a * (1.0 - frac) + b * frac;
+                self.ring[p] = x;
+                y.* = (1.0 - m) * x + m * wet;
+                p = (p + 1) % max_delay;
+                ph += self.rate;
+                if (ph >= 1.0) ph -= 1.0;
+            }
+            self.pos = p;
+            self.phase = ph;
+        }
+    };
+}
+
+/// `Flanger(num, max_delay)` — like `Chorus` but with a SHORT swept delay and a
+/// FEEDBACK path, so the comb notches it creates are deep and resonant (the
+/// characteristic sweeping "jet" sound). The fed-back wet signal is written into
+/// the ring: `ring[p] = x + feedback·wet`; `out = (1−mix)·x + mix·wet`. The internal
+/// feedback makes it a fused tight-feedback kernel — keep `|feedback| < 1` for a
+/// stable, decaying response. Rate-1:1 with persistent state ⇒ a `Map`. Float-only.
+pub fn Flanger(comptime num: numeric.Numeric, comptime max_delay: usize) type {
+    const T = num.Lane;
+    requireFloat(T);
+    if (max_delay < 4) @compileError("pan: Flanger max_delay must be >= 4");
+    return struct {
+        const Self = @This();
+
+        pub const delay_len: usize = max_delay;
+
+        ring: [max_delay]T = @splat(0),
+        base_delay: f32 = 0,
+        depth: f32 = 0,
+        rate: f32 = 0,
+        mix: f32 = 0.5,
+        /// Feedback gain in the swept-delay path (`|feedback| < 1` for stability).
+        feedback: T = 0,
+        pos: usize = 0,
+        phase: f32 = 0,
+
+        pub fn process(self: *Self, in: []const types.Sample(T), out: []types.Sample(T)) void {
+            const xs = scalarsConst(T, in);
+            const ys = scalars(T, out);
+            const m: T = @floatCast(std.math.clamp(self.mix, 0.0, 1.0));
+            const fb = self.feedback;
+            var p = self.pos;
+            var ph = self.phase;
+            for (xs, ys) |x, *y| {
+                const lfo = @sin(2.0 * std.math.pi * ph);
+                const d = std.math.clamp(self.base_delay + self.depth * lfo, 1.0, @as(f32, @floatFromInt(max_delay - 2)));
+                const k0: usize = @intFromFloat(@floor(d));
+                const frac: T = @floatCast(d - @floor(d));
+                const a = self.ring[(p + max_delay - k0) % max_delay];
+                const b = self.ring[(p + max_delay - k0 - 1) % max_delay];
+                const wet = a * (1.0 - frac) + b * frac;
+                self.ring[p] = x + fb * wet; // feedback path
+                y.* = (1.0 - m) * x + m * wet;
+                p = (p + 1) % max_delay;
+                ph += self.rate;
+                if (ph >= 1.0) ph -= 1.0;
+            }
+            self.pos = p;
+            self.phase = ph;
+        }
+    };
+}
+
 /// `KarplusStrong(num, max_delay)` — the plucked-string algorithm: a delay line of
 /// `D` samples with a two-tap averaging low-pass in the feedback path,
 /// `y[n] = x[n] + 0.5·damping·(y[n−D] + y[n−D−1])`. An impulse / noise burst at
@@ -434,6 +544,56 @@ test "fused kernels classify as delay elements and are not aliasing_safe" {
     try testing.expect(!@hasDecl(Comb(f32num, 64), "aliasing_safe"));
     try testing.expect(@hasDecl(KarplusStrong(f32num, 64), "delay_len"));
     try testing.expect(!@hasDecl(Allpass(f32num, 64), "aliasing_safe"));
+}
+
+test "Chorus/Flanger classify as delay-element Maps; mix=0 is the dry signal" {
+    const port = @import("port.zig");
+    try testing.expect(port.classify(Chorus(f32num, 64)) == .Map);
+    try testing.expect(port.classify(Flanger(f32num, 64)) == .Map);
+    try testing.expect(@hasDecl(Chorus(f32num, 64), "delay_len"));
+    try testing.expect(@hasDecl(Flanger(f32num, 64), "delay_len"));
+    // mix=0 ⇒ pure dry passthrough, regardless of the sweep.
+    var ch = Chorus(f32num, 64){ .base_delay = 10, .depth = 4, .rate = 0.01, .mix = 0 };
+    var in: [16]types.Sample(f32) = undefined;
+    for (&in, 0..) |*s, i| s.* = S(@floatFromInt(i + 1));
+    var out: [16]types.Sample(f32) = undefined;
+    ch.process(&in, &out);
+    for (in, out) |x, y| try testing.expectApproxEqAbs(x.ch[0], y.ch[0], 1e-6);
+}
+
+test "Chorus with a static delay (depth=0) is a hand-computable dry+wet mix" {
+    // depth=0 ⇒ a fixed integer delay D; wet[n] = x[n−D], out = (1−m)x + m·x[n−D].
+    const D = 5;
+    var ch = Chorus(f32num, 64){ .base_delay = D, .depth = 0, .rate = 0, .mix = 0.5 };
+    var in: [12]types.Sample(f32) = undefined;
+    for (&in, 0..) |*s, i| s.* = S(@floatFromInt(i + 1));
+    var out: [12]types.Sample(f32) = undefined;
+    ch.process(&in, &out);
+    for (out, 0..) |y, n| {
+        const dry = in[n].ch[0];
+        const wet: f32 = if (n >= D) in[n - D].ch[0] else 0; // ring pre-rolls with zeros
+        try testing.expectApproxEqAbs(0.5 * dry + 0.5 * wet, y.ch[0], 1e-5);
+    }
+}
+
+test "Flanger feedback stays bounded for |feedback|<1 and reduces to Chorus at feedback=0" {
+    const D = 4;
+    var fl = Flanger(f32num, 64){ .base_delay = D, .depth = 0, .rate = 0, .mix = 0.5, .feedback = 0 };
+    var ch = Chorus(f32num, 64){ .base_delay = D, .depth = 0, .rate = 0, .mix = 0.5 };
+    var in: [10]types.Sample(f32) = undefined;
+    for (&in, 0..) |*s, i| s.* = S(@floatFromInt(i + 1));
+    var of: [10]types.Sample(f32) = undefined;
+    var oc: [10]types.Sample(f32) = undefined;
+    fl.process(&in, &of);
+    ch.process(&in, &oc);
+    for (of, oc) |a, b| try testing.expectApproxEqAbs(a.ch[0], b.ch[0], 1e-6); // fb=0 ⇒ identical
+    // With feedback the output stays finite and bounded for a unit-impulse excitation.
+    var fl2 = Flanger(f32num, 64){ .base_delay = D, .depth = 0, .rate = 0, .mix = 1.0, .feedback = 0.7 };
+    var imp: [200]types.Sample(f32) = [_]types.Sample(f32){S(0)} ** 200;
+    imp[0] = S(1);
+    var o2: [200]types.Sample(f32) = undefined;
+    fl2.process(&imp, &o2);
+    for (o2) |y| try testing.expect(@abs(y.ch[0]) < 10.0); // decaying, never blows up
 }
 
 test "Ladder is a 4-pole low-pass: settles toward the DC input, bounded, stateful" {
@@ -974,6 +1134,259 @@ pub fn HowlSuppressor(comptime num: numeric.Numeric, comptime taps: usize) type 
     };
 }
 
+/// `Limiter(num)` — a brick-wall (peak) limiter: a downward compressor with an
+/// effectively infinite ratio above `threshold`. A per-sample envelope follower
+/// tracks the signal level; whenever that level exceeds `threshold` the gain is
+/// reduced to exactly `threshold / env`, so the *enveloped* level is clamped at the
+/// ceiling and never rises above it — the "brick wall". Below the threshold the
+/// gain is unity (the signal passes untouched). A limiter is just the ratio→∞ limit
+/// of a `Compressor`, so the gain law is `min(1, threshold/env)` rather than the
+/// `(env/threshold)^(1/ratio−1)` soft knee.
+///
+/// `threshold`, `release`, and `attack` are **parameter ports** (`f32`), settable
+/// via `set`/`schedule` or a wired modulation edge. The attack/release are the
+/// per-sample one-pole envelope coefficients in `(0, 1]` (higher = faster); a fast
+/// attack is what makes the limiter catch transients before they pass. The envelope
+/// smoothing is itself the anti-zipper mechanism for the gain, so no separate ramp
+/// is needed — and because the envelope (not the raw sample) is what is clamped, the
+/// guarantee is "the smoothed level holds at the ceiling", with a brief overshoot
+/// allowed only while the fast-attack envelope is still rising to a sudden transient.
+///
+/// NOT `aliasing_safe`: the envelope follower carries per-sample state, so the
+/// colorer must not run it in place. Float lanes only (a level estimate / gain is
+/// f32), declared loud via `requireFloat`.
+pub fn Limiter(comptime num: numeric.Numeric) type {
+    const T = num.Lane;
+    requireFloat(T);
+    return struct {
+        const Self = @This();
+
+        /// The ceiling, the release coefficient, and the attack coefficient — three
+        /// control ports (control element `Scalar(f32)`) at slots 0, 1, 2.
+        pub const params = .{
+            .threshold = types.Scalar(f32),
+            .release = types.Scalar(f32),
+            .attack = types.Scalar(f32),
+        };
+
+        /// Peak ceiling (linear amplitude); the enveloped level is held at or below it.
+        threshold: control.Param = control.Param.init(0.5),
+        /// Envelope fall coefficient per sample in (0, 1] — slower recovery.
+        release: control.Param = control.Param.init(0.05),
+        /// Envelope rise coefficient per sample in (0, 1] — fast to catch transients.
+        attack: control.Param = control.Param.init(0.5),
+        /// The envelope-follower state (persistent across calls).
+        env: f32 = 0,
+
+        pub fn setParam(self: *Self, slot: u8, value: f32) void {
+            switch (slot) {
+                0 => self.threshold.set(value),
+                1 => self.release.set(value),
+                2 => self.attack.set(value),
+                else => {},
+            }
+        }
+
+        pub fn process(self: *Self, in: []const types.Sample(T), out: []types.Sample(T)) void {
+            const xs = scalarsConst(T, in);
+            const ys = scalars(T, out);
+            const thr = self.threshold.read();
+            const atk = self.attack.read();
+            const rel = self.release.read();
+            var env = self.env;
+            for (xs, ys) |x, *y| {
+                env = followEnvelope(env, @floatCast(x), atk, rel);
+                // Infinite-ratio law: pass below the ceiling, clamp the enveloped
+                // level to it above. gain = min(1, threshold/env).
+                const gv: T = @floatCast(if (env > thr and thr > 0) thr / env else 1.0);
+                y.* = x * gv;
+            }
+            self.env = env;
+        }
+    };
+}
+
+/// `Expander(num)` — a downward expander: the inverse of a compressor. *Above*
+/// `threshold` the signal passes at unity; *below* it the signal is attenuated by
+/// `ratio` (in the log domain), widening the dynamic range by pushing quiet material
+/// further down. The gain law below threshold is `(env/threshold)^(ratio−1)`: with
+/// `ratio = 1` it is unity (no expansion), and a larger `ratio` attenuates harder as
+/// the level falls — the steep large-ratio limit is a noise gate (the hard-knee
+/// `PowerGate` is that {0,1} extreme; this is its soft, continuous-ratio form).
+///
+/// `threshold`, `ratio`, `attack`, and `release` are **parameter ports** (`f32`).
+/// The attack/release are the per-sample one-pole envelope coefficients in `(0, 1]`;
+/// the envelope smoothing is the anti-zipper mechanism, so no separate ramp is
+/// needed. NOT `aliasing_safe` (per-sample envelope state). Float lanes only.
+pub fn Expander(comptime num: numeric.Numeric) type {
+    const T = num.Lane;
+    requireFloat(T);
+    return struct {
+        const Self = @This();
+
+        /// Threshold, ratio, attack, release — four control ports (`Scalar(f32)`)
+        /// at slots 0, 1, 2, 3.
+        pub const params = .{
+            .threshold = types.Scalar(f32),
+            .ratio = types.Scalar(f32),
+            .attack = types.Scalar(f32),
+            .release = types.Scalar(f32),
+        };
+
+        /// Level below which attenuation begins (linear amplitude).
+        threshold: control.Param = control.Param.init(0.1),
+        /// Expansion ratio (≥ 1); 1 is no expansion, larger attenuates quiet harder.
+        ratio: control.Param = control.Param.init(2.0),
+        /// Envelope rise coefficient per sample in (0, 1].
+        attack: control.Param = control.Param.init(0.5),
+        /// Envelope fall coefficient per sample in (0, 1].
+        release: control.Param = control.Param.init(0.05),
+        /// The envelope-follower state (persistent across calls).
+        env: f32 = 0,
+
+        pub fn setParam(self: *Self, slot: u8, value: f32) void {
+            switch (slot) {
+                0 => self.threshold.set(value),
+                1 => self.ratio.set(value),
+                2 => self.attack.set(value),
+                3 => self.release.set(value),
+                else => {},
+            }
+        }
+
+        pub fn process(self: *Self, in: []const types.Sample(T), out: []types.Sample(T)) void {
+            const xs = scalarsConst(T, in);
+            const ys = scalars(T, out);
+            const thr = self.threshold.read();
+            const rat = self.ratio.read();
+            const atk = self.attack.read();
+            const rel = self.release.read();
+            var env = self.env;
+            for (xs, ys) |x, *y| {
+                env = followEnvelope(env, @floatCast(x), atk, rel);
+                // Unity at/above threshold; attenuate below by (env/threshold)^(ratio−1).
+                // ratio ≥ 1 ⇒ exponent ≥ 0 ⇒ a gain ≤ 1 for env < threshold.
+                const gv: T = @floatCast(if (env < thr and thr > 0 and rat > 0)
+                    std.math.pow(f32, env / thr, rat - 1.0)
+                else
+                    1.0);
+                y.* = x * gv;
+            }
+            self.env = env;
+        }
+    };
+}
+
+/// `SoftClip(num)` — a memoryless cubic soft-clip waveshaper. With `drive ≥ 1` the
+/// input is scaled, passed through the cubic transfer curve, then scaled back so the
+/// nominal unity slope is preserved at small signals:
+///
+///     u      = clamp(drive·x, −1, 1)
+///     shaped = u − u³/3                         // odd, monotonic on [−1, 1]
+///     y      = shaped / drive                    // undo the pre-gain at small signals
+///
+/// The cubic `u − u³/3` is the classic soft saturator: odd-symmetric (`f(−u) =
+/// −f(u)`), monotonically increasing on `[−1, 1]`, and bounded — its slope is `1 −
+/// u²`, which is `1` at the origin and falls to `0` at the rails (a smooth knee, no
+/// hard corner). Dividing the shaped value by `drive` undoes the pre-gain, so the
+/// small-signal slope is `drive · 1 · (1/drive) = 1` (quiet signals pass at unity,
+/// transparent) while the post-clamp ceiling is `±(2/3)/drive` (the flat `±2/3` of
+/// the curve at the rails, scaled back). The output therefore never exceeds that
+/// soft ceiling regardless of input level. Higher `drive` reaches the saturating
+/// region sooner and lowers the ceiling (more harmonic warmth, more level reduction).
+///
+/// Stateless and per-element ⇒ a pure `Map` and `aliasing_safe` (each output is a
+/// function of only the matching input, so the colorer may run it in place). The
+/// hot loop is a branch-free `@Vector` kernel (the clamp is `@min`/`@max` on lanes)
+/// with a scalar tail, since a memoryless waveshaper is an ideal SIMD candidate.
+/// Float lanes only.
+pub fn SoftClip(comptime num: numeric.Numeric) type {
+    const T = num.Lane;
+    requireFloat(T);
+    return struct {
+        const Self = @This();
+
+        /// Per-element write from only the matching input element ⇒ in-place legal.
+        pub const aliasing_safe = true;
+
+        /// Pre-gain into the cubic curve (≥ 1 drives harder into saturation).
+        drive: T = 1.0,
+
+        pub fn process(self: *Self, in: []const types.Sample(T), out: []types.Sample(T)) void {
+            const xs = scalarsConst(T, in);
+            const ys = scalars(T, out);
+            const d = self.drive;
+            // Undo the pre-gain so the small-signal slope is unity (drive·1·(1/drive)
+            // = 1): quiet signals pass transparently, while the post-clamp ceiling is
+            // ±(2/3)/drive — the flat rail value of the curve scaled back.
+            const inv: T = 1.0 / d;
+
+            const lanes = num.W;
+            const V = @Vector(lanes, T);
+            const one: V = @splat(@as(T, 1));
+            const neg_one: V = @splat(@as(T, -1));
+            const third: V = @splat(@as(T, 1.0 / 3.0));
+            const dv: V = @splat(d);
+            const invv: V = @splat(inv);
+
+            var i: usize = 0;
+            while (i + lanes <= xs.len) : (i += lanes) {
+                const x: V = xs[i..][0..lanes].*;
+                const u = @min(@max(x * dv, neg_one), one); // clamp(drive·x, −1, 1)
+                const shaped = u - u * u * u * third; // u − u³/3
+                ys[i..][0..lanes].* = shaped * invv;
+            }
+            // Scalar tail for the remainder (identical arithmetic, lane width 1).
+            while (i < xs.len) : (i += 1) {
+                const u = std.math.clamp(xs[i] * d, -1.0, 1.0);
+                ys[i] = (u - u * u * u * (1.0 / 3.0)) * inv;
+            }
+        }
+    };
+}
+
+/// `Trim(num)` — a static gain trim specified in **decibels**. Unlike `Vca` (whose
+/// gain is a signal-controlled, ramped parameter port) the trim is a fixed mixing
+/// offset the author sets once: `y = x · 10^(gain_db/20)`. It is the dB-domain face
+/// of `filters.Gain` (which takes a raw linear/fixed-point coefficient): the *only*
+/// difference is that `Trim` converts dB → linear for you, so 0 dB is unity, −6 dB ≈
+/// 0.5012, +6 dB ≈ 1.995. Where you already have a linear coefficient (or need the
+/// fixed-point lane), reach for `filters.Gain`; where you think in dB, reach for
+/// `Trim`. (This overlap is deliberate and surfaced rather than duplicated — `Trim`
+/// is float-only because the dB conversion is a float operation.)
+///
+/// Stateless and per-element ⇒ a `Map` and `aliasing_safe` (in-place legal).
+pub fn Trim(comptime num: numeric.Numeric) type {
+    const T = num.Lane;
+    requireFloat(T);
+    return struct {
+        const Self = @This();
+
+        /// Per-element write from only the matching input element ⇒ in-place legal.
+        pub const aliasing_safe = true;
+
+        /// The trim in decibels (0 = unity). Converted to a linear multiplier in
+        /// `process`: linear = 10^(dB/20).
+        gain_db: T = 0,
+
+        pub fn process(self: *Self, in: []const types.Sample(T), out: []types.Sample(T)) void {
+            const xs = scalarsConst(T, in);
+            const ys = scalars(T, out);
+            // dB → linear amplitude: a 20·log10 scale, so +6 dB ≈ ×2, −6 dB ≈ ÷2.
+            const g: T = std.math.pow(T, 10.0, self.gain_db / 20.0);
+            const lanes = num.W;
+            const V = @Vector(lanes, T);
+            const gv: V = @splat(g);
+            var i: usize = 0;
+            while (i + lanes <= xs.len) : (i += lanes) {
+                const x: V = xs[i..][0..lanes].*;
+                ys[i..][0..lanes].* = x * gv;
+            }
+            while (i < xs.len) : (i += 1) ys[i] = xs[i] * g;
+        }
+    };
+}
+
 test "Compressor: passes below threshold, attenuates a hot signal above it" {
     var comp = Compressor(f32num){ .threshold = 0.5, .ratio = 4.0, .attack = 1.0, .release = 1.0 };
     // A steady 0.25 amplitude (below threshold) passes unchanged once the envelope
@@ -1080,4 +1493,165 @@ test "HowlSuppressor: leaky NLMS converges and keeps the taps bounded" {
     var wmax: f32 = 0;
     for (hs.w) |wk| wmax = @max(wmax, @abs(wk));
     try testing.expect(wmax < 10.0 and std.math.isFinite(wmax));
+}
+
+// ---------------------------------------------------------------------------
+// Dynamics gaps: Limiter, Expander, SoftClip, Trim. Tests encode the defining
+// guarantee of each block (Rule 9: WHY, not just WHAT) — the brick wall, the
+// downward-expansion direction, the waveshaper's odd/monotone/bounded laws, and
+// the exact dB→linear conversion.
+// ---------------------------------------------------------------------------
+
+test "Limiter: classifies as a Map with threshold/release/attack params; not aliasing-safe" {
+    const port = @import("port.zig");
+    const L = Limiter(f32num);
+    try testing.expect(port.classify(L) == .Map);
+    try testing.expect(port.ParamPort(L, "threshold").Elem == types.Scalar(f32));
+    try testing.expect(port.ParamPort(L, "release").Elem == types.Scalar(f32));
+    try testing.expect(port.ParamPort(L, "attack").Elem == types.Scalar(f32));
+    // Stateful envelope follower ⇒ the colorer must NOT run it in place.
+    try testing.expect(!@hasDecl(L, "aliasing_safe"));
+}
+
+test "Limiter: brick wall — a loud steady input is held at the threshold ceiling" {
+    // Instant attack/release (coeff 1.0) makes the envelope equal |x| each sample,
+    // so the steady-state guarantee is exact and testable without settling lag.
+    var lim = Limiter(f32num){
+        .threshold = control.Param.init(0.5),
+        .attack = control.Param.init(1.0),
+        .release = control.Param.init(1.0),
+    };
+    // A hot 1.0 input (env = 1.0 > 0.5): gain = 0.5/1.0 = 0.5, output = 0.5 = ceiling.
+    var hot: [64]types.Sample(f32) = @splat(S(1.0));
+    var hout: [64]types.Sample(f32) = undefined;
+    lim.process(&hot, &hout);
+    // No sample exceeds the ceiling, and the steady level sits AT it (true limiting,
+    // not mere attenuation): peak ≤ threshold and the tail equals it.
+    var peak: f32 = 0;
+    for (hout) |s| peak = @max(peak, @abs(s.ch[0]));
+    try testing.expect(peak <= 0.5 + 1e-6); // brick wall: never above the ceiling
+    try testing.expectApproxEqAbs(@as(f32, 0.5), hout[63].ch[0], 1e-6);
+
+    // A quiet 0.25 input (env = 0.25 < 0.5) passes at unity — below the wall is untouched.
+    var quiet: [16]types.Sample(f32) = @splat(S(0.25));
+    var qout: [16]types.Sample(f32) = undefined;
+    lim.process(&quiet, &qout);
+    try testing.expectApproxEqAbs(@as(f32, 0.25), qout[15].ch[0], 1e-6);
+}
+
+test "Expander: classifies as a Map with four params; not aliasing-safe" {
+    const port = @import("port.zig");
+    const E = Expander(f32num);
+    try testing.expect(port.classify(E) == .Map);
+    try testing.expect(port.ParamPort(E, "threshold").Elem == types.Scalar(f32));
+    try testing.expect(port.ParamPort(E, "ratio").Elem == types.Scalar(f32));
+    try testing.expect(port.ParamPort(E, "attack").Elem == types.Scalar(f32));
+    try testing.expect(port.ParamPort(E, "release").Elem == types.Scalar(f32));
+    try testing.expect(!@hasDecl(E, "aliasing_safe"));
+}
+
+test "Expander: attenuates a quiet signal below threshold, passes a loud one ~unchanged" {
+    // Instant envelope (coeff 1.0) so env = |x| each sample and the law is exact.
+    var exp = Expander(f32num){
+        .threshold = control.Param.init(0.5),
+        .ratio = control.Param.init(2.0),
+        .attack = control.Param.init(1.0),
+        .release = control.Param.init(1.0),
+    };
+    // Quiet 0.25 (< threshold 0.5): gain = (0.25/0.5)^(2−1) = 0.5, output = 0.125.
+    // The DEFINING direction of a downward expander: quiet gets quieter.
+    var quiet: [32]types.Sample(f32) = @splat(S(0.25));
+    var qout: [32]types.Sample(f32) = undefined;
+    exp.process(&quiet, &qout);
+    try testing.expectApproxEqAbs(@as(f32, 0.125), qout[31].ch[0], 1e-6);
+    try testing.expect(qout[31].ch[0] < 0.25); // genuinely attenuated below threshold
+
+    // Loud 0.8 (> threshold): passes at unity (above the threshold is the pass band).
+    var loud: [16]types.Sample(f32) = @splat(S(0.8));
+    var lout: [16]types.Sample(f32) = undefined;
+    exp.process(&loud, &lout);
+    try testing.expectApproxEqAbs(@as(f32, 0.8), lout[15].ch[0], 1e-6);
+}
+
+test "SoftClip: classifies as an aliasing-safe Map" {
+    const port = @import("port.zig");
+    const SC = SoftClip(f32num);
+    try testing.expect(port.classify(SC) == .Map);
+    try testing.expect(SC.aliasing_safe);
+}
+
+test "SoftClip: odd-symmetric, monotonic, and bounded waveshaper" {
+    var sc = SoftClip(f32num){ .drive = 1.0 };
+    // A ramp from −2 to +2 (well past the rails) at drive 1.
+    const n = 41;
+    var in: [n]types.Sample(f32) = undefined;
+    for (&in, 0..) |*s, i| s.* = S(-2.0 + @as(f32, @floatFromInt(i)) * (4.0 / 40.0));
+    var out: [n]types.Sample(f32) = undefined;
+    sc.process(&in, &out);
+
+    // Odd symmetry: f(−x) = −f(x). Pair index i with its mirror (n−1−i), which is
+    // the negated input by construction of the symmetric ramp.
+    for (0..n) |i| {
+        const mirror = out[n - 1 - i].ch[0];
+        try testing.expectApproxEqAbs(out[i].ch[0], -mirror, 1e-5);
+    }
+    // Monotonic non-decreasing: the cubic's slope 1−u² ≥ 0 on the clamped domain.
+    for (1..n) |i| try testing.expect(out[i].ch[0] >= out[i - 1].ch[0] - 1e-6);
+    // Bounded: the normalized soft ceiling is ±1 (at the rails u=±1, shaped=±2/3,
+    // divided by 2/3 gives ±1); no output escapes it even for the ±2 overdrive.
+    for (out) |s| try testing.expect(@abs(s.ch[0]) <= 1.0 + 1e-6);
+    // Zero maps to zero (the curve passes through the origin): index 20 is the
+    // midpoint of the −2..+2 ramp, i.e. exactly x = 0.
+    try testing.expectApproxEqAbs(@as(f32, 0.0), out[20].ch[0], 1e-6);
+}
+
+test "SoftClip: small signal is near-transparent; drive deepens saturation" {
+    var sc = SoftClip(f32num){ .drive = 1.0 };
+    // A small 0.05 input: slope ≈ 1 at the origin, so output ≈ input.
+    var small: [8]types.Sample(f32) = @splat(S(0.05));
+    var sout: [8]types.Sample(f32) = undefined;
+    sc.process(&small, &sout);
+    try testing.expectApproxEqAbs(@as(f32, 0.05), sout[0].ch[0], 2e-3);
+
+    // Same mid-level input at higher drive saturates harder: the signal is pushed
+    // deeper into the compressing region of the curve, so the applied gain
+    // (output/input) is LOWER and the output level is reduced (the level-taming /
+    // soft-ceiling effect of a waveshaper). drive 1: 0.6 − 0.6³/3 = 0.528; drive 3:
+    // u clamps to 1, shaped 2/3, /3 = 0.222.
+    var mid: [8]types.Sample(f32) = @splat(S(0.6));
+    var m1: [8]types.Sample(f32) = undefined;
+    sc.process(&mid, &m1);
+    var sc2 = SoftClip(f32num){ .drive = 3.0 };
+    var m2: [8]types.Sample(f32) = undefined;
+    sc2.process(&mid, &m2);
+    try testing.expect(m2[0].ch[0] < m1[0].ch[0]); // harder drive saturates → more gain reduction
+    try testing.expectApproxEqAbs(@as(f32, 0.528), m1[0].ch[0], 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 2.0 / 3.0 / 3.0), m2[0].ch[0], 1e-5);
+}
+
+test "Trim: aliasing-safe Map applying the exact dB→linear gain" {
+    const port = @import("port.zig");
+    const Tr = Trim(f32num);
+    try testing.expect(port.classify(Tr) == .Map);
+    try testing.expect(Tr.aliasing_safe);
+
+    // 0 dB is unity.
+    var t0 = Trim(f32num){ .gain_db = 0 };
+    var in: [16]types.Sample(f32) = @splat(S(0.5));
+    var out: [16]types.Sample(f32) = undefined;
+    t0.process(&in, &out);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), out[0].ch[0], 1e-6);
+
+    // −6.0206 dB is exactly ×0.5 (20·log10(0.5)); +6.0206 dB is ×2.
+    var tm6 = Trim(f32num){ .gain_db = -20.0 * std.math.log10(@as(f32, 2.0)) };
+    tm6.process(&in, &out);
+    try testing.expectApproxEqAbs(@as(f32, 0.25), out[0].ch[0], 1e-5); // 0.5 × 0.5
+    var tp6 = Trim(f32num){ .gain_db = 20.0 * std.math.log10(@as(f32, 2.0)) };
+    tp6.process(&in, &out);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), out[0].ch[0], 1e-5); // 0.5 × 2
+    // Verify the scalar tail path matches by using a non-multiple-of-W length.
+    var odd: [13]types.Sample(f32) = @splat(S(1.0));
+    var oout: [13]types.Sample(f32) = undefined;
+    tp6.process(&odd, &oout);
+    try testing.expectApproxEqAbs(@as(f32, 2.0), oout[12].ch[0], 1e-5);
 }

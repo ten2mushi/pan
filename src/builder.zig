@@ -312,6 +312,16 @@ pub const Graph = struct {
         self.ir.connect(@TypeOf(out_ep).Port, out_ep.node_id, out_ep.index, @TypeOf(in_ep).Port, in_ep.node_id, in_ep.index);
     }
 
+    /// Connect an output to an input whose channel LAYOUT differs (a registered
+    /// up/down-mix): the negotiation pass auto-inserts the canonical matrix at
+    /// commit. The lane type must match — only the layout may differ. An
+    /// unregistered pair wires here but is rejected at commit as a hard mismatch.
+    pub fn connectCoerced(self: *Self, from: anytype, to: anytype) !void {
+        const out_ep = toOutEndpoint(from);
+        const in_ep = toInEndpoint(to);
+        self.ir.connectCoerced(@TypeOf(out_ep).Port, out_ep.node_id, out_ep.index, @TypeOf(in_ep).Port, in_ep.node_id, in_ep.index);
+    }
+
     /// Connect a declared feedback (back) edge: same type-check, flagged so the
     /// commit pass removes it before the topological sort and requires its
     /// cycle to contain a delay.

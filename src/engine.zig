@@ -792,6 +792,57 @@ fn freeRuntimeResampler(alloc: std.mem.Allocator, self_ptr: *anyopaque) void {
     alloc.destroy(rs);
 }
 
+/// State for an auto-inserted channel up/down-mix MATRIX coercion: the from/to
+/// channel counts and the flattened (`to_ch` rows of `from_ch`) canonical
+/// coefficients filled by `commit.runtimeMixMatrix`. Plane-major f32 (the internal
+/// pipeline precision — channel coercions are not auto-inserted for non-f32 lanes).
+const ChannelMatrixState = struct {
+    from_ch: usize,
+    to_ch: usize,
+    coeffs: [64]f32, // ≤ 8×8
+};
+
+/// The bound render thunk for an auto-inserted channel up/down-mix matrix coercion:
+/// `out[o][k] = Σ_i coeffs[o·from_ch + i]·in[i][k]` over the `n` frames, reading the
+/// `from_ch` plane-major input planes and writing the `to_ch` output planes.
+fn channelMatrixThunk(
+    self_ptr: *anyopaque,
+    pool: [*]u8,
+    op: *const commit.RenderOp,
+    plan: *const RuntimePlan,
+    guards: bool,
+    fault: *bool,
+) void {
+    _ = guards;
+    _ = fault;
+    const st: *ChannelMatrixState = @ptrCast(@alignCast(self_ptr));
+    const n = op.n_or_pull_spec;
+    const in_id = op.input_buffer_ids[0];
+    const out_id = op.output_buffer_ids[0];
+    const in_bytes = pool[plan.buffer_offset[in_id] .. plan.buffer_offset[in_id] + st.from_ch * n * @sizeOf(f32)];
+    const out_bytes = pool[plan.buffer_offset[out_id] .. plan.buffer_offset[out_id] + st.to_ch * n * @sizeOf(f32)];
+    const in_f32: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, in_bytes));
+    const out_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, out_bytes));
+    var o: usize = 0;
+    while (o < st.to_ch) : (o += 1) {
+        const dst = out_f32[o * n ..][0..n];
+        @memset(dst, 0);
+        var i: usize = 0;
+        while (i < st.from_ch) : (i += 1) {
+            const g = st.coeffs[o * st.from_ch + i];
+            if (g == 0) continue;
+            const src = in_f32[i * n ..][0..n];
+            var k: usize = 0;
+            while (k < n) : (k += 1) dst[k] += g * src[k];
+        }
+    }
+}
+
+fn freeChannelMatrixState(alloc: std.mem.Allocator, self_ptr: *anyopaque) void {
+    const st: *ChannelMatrixState = @ptrCast(@alignCast(self_ptr));
+    alloc.destroy(st);
+}
+
 /// Build the destroy thunk for `Block`.
 pub fn destroyThunk(comptime Block: type) DestroyThunk {
     const Gen = struct {
@@ -1328,7 +1379,7 @@ pub const EventCommand = struct {
 /// `at_sample` is a within-block offset (the `sendEvent` "place it at offset k in the
 /// next block" path), and a **timeline** ring whose `at_sample` is an ABSOLUTE
 /// transport sample (the `scheduleEventAt` "place it at transport position S" path —
-/// the deterministic timeline of §9). Producer = control / MIDI-ingestion thread;
+/// the deterministic transport timeline). Producer = control / MIDI-ingestion thread;
 /// consumer = the render, draining at each callback boundary.
 const EventRing = control.CommandRing(EventCommand, command_ring_capacity);
 
@@ -1528,7 +1579,7 @@ pub const Engine = struct {
     /// The TIMELINE note-event ring (SPSC) — `at_sample` is an ABSOLUTE transport
     /// sample (`scheduleEventAt`). Each block, the events whose absolute position
     /// falls in the block window `[transport.position, +block_size)` are delivered,
-    /// converted to a block-relative offset — the §9 timeline driving the event lane.
+    /// converted to a block-relative offset — the transport timeline driving the event lane.
     timeline_ring: EventRing = EventRing.empty,
     /// Per-block event scratch: the drained, merged, offset-sorted events for the
     /// current callback. Bounded → no audio-thread allocation. Overwritten every render.
@@ -1688,6 +1739,27 @@ pub const Engine = struct {
                 op.fn_ptr = @ptrCast(&pdcDelayThunk);
                 op.self_ptr = st;
                 inserted[slot_i] = .{ .ptr = st, .free = freePdcDelayState };
+                slot_i += 1;
+            } else if (node.is_coercion and node.is_channel_matrix) {
+                // A channel up/down-mix matrix coercion: bind the built-in matrix
+                // kernel with the canonical coefficients for this (from_ch, to_ch)
+                // pair. `to_ch` is the node's output element width in f32 lanes;
+                // `from_ch` is the channel count of the (single) edge feeding it.
+                const to_ch = node.out_elem_size / @sizeOf(f32);
+                var from_ch: usize = to_ch;
+                for (g2.edges[0..g2.edge_count]) |fe| {
+                    if (fe.to_node == nid and !fe.is_param) {
+                        from_ch = fe.channels;
+                        break;
+                    }
+                }
+                const st = try alloc.create(ChannelMatrixState);
+                errdefer alloc.destroy(st);
+                st.* = .{ .from_ch = from_ch, .to_ch = to_ch, .coeffs = undefined };
+                _ = commit.runtimeMixMatrix(from_ch, to_ch, &st.coeffs) orelse unreachable; // negotiate proved it registered
+                op.fn_ptr = @ptrCast(&channelMatrixThunk);
+                op.self_ptr = st;
+                inserted[slot_i] = .{ .ptr = st, .free = freeChannelMatrixState };
                 slot_i += 1;
             } else if (node.is_coercion) {
                 // A real sample-rate-conversion resampler coercion: a streaming
@@ -2003,7 +2075,7 @@ pub const Engine = struct {
     /// The instrument TIMELINE verb — schedule a `NoteEvent` for node `node` at an
     /// **absolute transport sample** `abs_sample`. It is delivered in the render block
     /// whose window `[transport.position, +block_size)` contains it, at the correct
-    /// block-relative offset — so the transport timeline drives the event lane (§9) and
+    /// block-relative offset — so the transport timeline drives the event lane and
     /// an offline render of an absolutely-timed score is a pure function of the
     /// transport (deterministic). The producer must enqueue in non-decreasing
     /// `abs_sample` order (the SPSC scheduling convention the window drain relies on).

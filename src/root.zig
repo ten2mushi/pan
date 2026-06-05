@@ -170,8 +170,44 @@ pub const io = @import("io.zig");
 /// LFO/envelope sweeps).
 pub const filters = @import("filters.zig");
 pub const OnePole = filters.OnePole;
-/// Spatial blocks — `ConstantPowerPan` (mono → stereo, layout-changing).
+/// `StateVariable` (TPT/zero-delay-feedback SVF — lowpass/bandpass/highpass from one
+/// pass; cutoff/Q are parameter ports) and `Fir` (windowed-sinc / arbitrary-tap FIR,
+/// vectorized dot product; `firwinLowpass` builds the canonical lowpass table).
+pub const StateVariable = filters.StateVariable;
+pub const Fir = filters.Fir;
+/// Windowed-sinc FIR coefficient designers: `firwinLowpass`, `firwinHighpass`
+/// (spectral inversion), `firwinBandpass` (lowpass difference), `firwinBandstop` —
+/// comptime tables for the `Fir` block's `coeffs`.
+pub const firwinLowpass = filters.firwinLowpass;
+pub const firwinHighpass = filters.firwinHighpass;
+pub const firwinBandpass = filters.firwinBandpass;
+pub const firwinBandstop = filters.firwinBandstop;
+/// Spatial blocks — the layout-aware "pan" core. `ConstantPowerPan` (mono → stereo);
+/// `Balance`/`Width` (stereo field, layout-preserving); `Upmix`/`Downmix`/`MixMatrix`
+/// (the registered canonical up/down-mix matrices — geometry is block data, not the
+/// stream type; an unregistered layout pair has no canonical matrix and is rejected).
 pub const spatial = @import("spatial.zig");
+pub const ConstantPowerPan = spatial.ConstantPowerPan;
+pub const Balance = spatial.Balance;
+pub const Width = spatial.Width;
+pub const Upmix = spatial.Upmix;
+pub const Downmix = spatial.Downmix;
+pub const MixMatrix = spatial.MixMatrix;
+pub const canonicalMixMatrix = spatial.canonicalMixMatrix;
+/// `Vbap` (2-D vector base amplitude panning, mono → speaker layout) and ambisonic
+/// `AmbisonicEncode` (mono+direction → B-format, ACN/SN3D, orders 0–2) /
+/// `AmbisonicDecode` (B-format → speaker layout) — geometry as block data (L3).
+pub const Vbap = spatial.Vbap;
+pub const AmbisonicEncode = spatial.AmbisonicEncode;
+pub const AmbisonicDecode = spatial.AmbisonicDecode;
+/// Mix / routing `Map` blocks — `SummingMixer` (additive N→1, wide-accumulator on the
+/// integer path), `Splitter` (1→N fan-out), `MatrixRouter` (N→M weighted routing
+/// matrix), `DryWet` (a `mix`-parameter crossfade of a dry and a wet input).
+pub const dsp_mix = @import("dsp_mix.zig");
+pub const SummingMixer = dsp_mix.SummingMixer;
+pub const Splitter = dsp_mix.Splitter;
+pub const MatrixRouter = dsp_mix.MatrixRouter;
+pub const DryWet = dsp_mix.DryWet;
 /// The realtime-thread entry: `pan.realtime.enterRealtimeThread()` sets FTZ/DAZ.
 pub const realtime = struct {
     pub const enterRealtimeThread = engine.enterRealtimeThread;
@@ -197,6 +233,11 @@ pub const Allpass = fx.Allpass;
 pub const KarplusStrong = fx.KarplusStrong;
 pub const Ladder = fx.Ladder;
 pub const FdnMatrix = fx.FdnMatrix;
+/// Modulated-delay effects: `Chorus` (LFO-swept fractional delay blended with the
+/// dry signal — thickening) and `Flanger` (a short swept delay WITH feedback — the
+/// resonant comb sweep). Both are rate-1:1 `Map`s over an internal delay ring.
+pub const Chorus = fx.Chorus;
+pub const Flanger = fx.Flanger;
 /// Modulation appliers & adaptive dynamics — the parameter-port *consumers* and
 /// audio→control producers: `Vca` (gain via `param.gain`, the bit-exact-to-`set`
 /// modulation target), `Agc` (fused adaptive gain), `AgcController` (its decoupled
@@ -214,6 +255,14 @@ pub const Compressor = fx.Compressor;
 pub const CompressorController = fx.CompressorController;
 pub const Aec = fx.Aec;
 pub const HowlSuppressor = fx.HowlSuppressor;
+/// Static dynamics-shaping `Map`s: `Limiter` (brick-wall peak limiter — the
+/// infinite-ratio limit of the compressor), `Expander` (downward expander, the soft
+/// continuous-ratio form of the gate), `SoftClip` (memoryless cubic waveshaper with a
+/// `drive`, aliasing-safe), and `Trim` (a static dB-gain, the dB face of `Gain`).
+pub const Limiter = fx.Limiter;
+pub const Expander = fx.Expander;
+pub const SoftClip = fx.SoftClip;
+pub const Trim = fx.Trim;
 
 /// The rate-elastic seam — `Rate` blocks where output-per-input ≠ the algorithmic
 /// latency: the `Framer`/`Stft`/`iStft` analysis-synthesis pair (radix-2 FFT, Hann
@@ -237,6 +286,22 @@ pub const Varispeed = spectral.Varispeed;
 /// time-stretch ∘ resample (a rate-1:1 `Map` source composing two VariRate stages).
 pub const TimeStretch = spectral.TimeStretch;
 pub const PitchShift = spectral.PitchShift;
+/// Spectral-domain library blocks: `PartitionedConvolution` (uniform-partitioned
+/// overlap-add FFT convolution reverb, a `Rate` over a frequency-domain delay line),
+/// `SpectralGate` (per-bin magnitude noise gate) and `SpectralEq` (per-bin real-gain
+/// EQ) — both `Map`s over the `Spectrum` stream. FFT-HAL consumers.
+pub const PartitionedConvolution = spectral.PartitionedConvolution;
+pub const SpectralGate = spectral.SpectralGate;
+pub const SpectralEq = spectral.SpectralEq;
+
+/// Multi-rate filterbanks — a CASCADE/bank of uniform-rate `Rate` stages (NOT one
+/// block): `WaveletAnalysis`/`WaveletSynthesis` (Haar 2-band, perfect-reconstruction),
+/// `DwtOctaveTree` (octave-band cascade) and `Cqt` (constant-Q bandpass bank).
+pub const filterbank = @import("filterbank.zig");
+pub const WaveletAnalysis = filterbank.WaveletAnalysis;
+pub const WaveletSynthesis = filterbank.WaveletSynthesis;
+pub const DwtOctaveTree = filterbank.DwtOctaveTree;
+pub const Cqt = filterbank.Cqt;
 
 /// Control-side generators — the modulation *producers* that drive parameter ports.
 /// `Lfo` is a control-rate low-frequency oscillator: a zero-sample-input `Map`

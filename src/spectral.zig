@@ -106,65 +106,207 @@ pub fn TimeFrame(comptime T: type, comptime FRAME: usize) type {
 }
 
 // ===========================================================================
-// Radix-2 FFT (in place) — the spectral kernel
+// Split-radix FFT (in place) — the spectral kernel
 // ===========================================================================
 
-/// In-place iterative radix-2 Cooley-Tukey FFT over `N` (a power of two) complex
+/// Comptime split-radix twiddle table for an N-point recursion node, stored as
+/// planar (struct-of-arrays) real and imaginary lanes so the combine butterfly
+/// can vector-load them straight into `@Vector` registers with no per-element
+/// deinterleave. `W_N = exp(s·i·2π/N)` with `s = +1` for the inverse transform
+/// and `s = -1` for the forward; the node needs `W_N^k` and `W_N^{3k}` for the
+/// quarter-range `k ∈ [0, N/4)` (the two odd sub-spectra's twiddles). Computed at
+/// compile time, so the table lives in read-only data at zero runtime cost — and
+/// because every twiddle is evaluated directly from its own angle (not advanced
+/// by a per-step complex rotation), there is no accumulated rotation round-off.
+fn SrTwiddle(comptime T: type, comptime N: usize) type {
+    const q = N / 4;
+    return struct {
+        w1_re: [q]T,
+        w1_im: [q]T,
+        w3_re: [q]T,
+        w3_im: [q]T,
+    };
+}
+
+fn srTwiddle(comptime T: type, comptime N: usize, comptime inverse: bool) SrTwiddle(T, N) {
+    const q = N / 4;
+    var t: SrTwiddle(T, N) = undefined;
+    const sign: T = if (inverse) 1.0 else -1.0;
+    var k: usize = 0;
+    while (k < q) : (k += 1) {
+        const a1: T = sign * 2.0 * std.math.pi * @as(T, @floatFromInt(k)) / @as(T, @floatFromInt(N));
+        const a3: T = sign * 2.0 * std.math.pi * @as(T, @floatFromInt(3 * k)) / @as(T, @floatFromInt(N));
+        t.w1_re[k] = @cos(a1);
+        t.w1_im[k] = @sin(a1);
+        t.w3_re[k] = @cos(a3);
+        t.w3_im[k] = @sin(a3);
+    }
+    return t;
+}
+
+/// Recursive conjugate-pair split-radix FFT, decimation-in-time, written
+/// out-of-place: it computes the `N`-point DFT of the input read at stride `s`
+/// (`in[0], in[s], in[2s], …`) and writes the `N` outputs contiguously into
+/// `out[0..N]`. Split-radix is the fewest-real-multiply power-of-two FFT: it
+/// recurses ONE length-N/2 DFT over the even input samples and TWO length-N/4
+/// DFTs over the odd samples split by the L-shaped 4k+1 / 4k+3 decimation, then
+/// recombines with the W twiddles. The recombination, for `k ∈ [0, N/4)`, with
+/// `E` the even sub-DFT, `O1`/`O3` the two odd sub-DFTs, and `Z1 = W_N^k·O1[k]`,
+/// `Z3 = W_N^{3k}·O3[k]`:
+///   X[k]       = E[k]      + (Z1 + Z3)
+///   X[k+N/2]   = E[k]      − (Z1 + Z3)
+///   X[k+N/4]   = E[k+N/4]  − (i·s)·(Z1 − Z3)
+///   X[k+3N/4]  = E[k+N/4]  + (i·s)·(Z1 − Z3)
+/// where `s = -1` forward / `+1` inverse selects the rotation direction. The even
+/// sub-DFT lands in `out[0..N/2]` and the two odd sub-DFTs in `out[N/2..3N/4]`
+/// and `out[3N/4..N]`, so the four combine operands `E[k]`, `E[k+N/4]`, `O1[k]`,
+/// `O3[k]` are four contiguous quarter-length runs — read planar into vectors,
+/// combined, written back, with no strided gather.
+fn srfft(
+    comptime T: type,
+    comptime N: usize,
+    comptime inverse: bool,
+    out: [*]std.math.Complex(T),
+    in: [*]const std.math.Complex(T),
+    comptime s: usize,
+) void {
+    const C = std.math.Complex(T);
+    if (N == 1) {
+        out[0] = in[0];
+        return;
+    }
+    if (N == 2) {
+        // The single radix-2 butterfly: X[0]=x[0]+x[1], X[1]=x[0]−x[1].
+        const a = in[0];
+        const b = in[s];
+        out[0] = .{ .re = a.re + b.re, .im = a.im + b.im };
+        out[1] = .{ .re = a.re - b.re, .im = a.im - b.im };
+        return;
+    }
+
+    const q = N / 4;
+    srfft(T, N / 2, inverse, out, in, s * 2); // even samples → out[0..N/2]
+    srfft(T, N / 4, inverse, out + N / 2, in + s, s * 4); // odd 4k+1 → out[N/2..3N/4]
+    srfft(T, N / 4, inverse, out + 3 * N / 4, in + s * 3, s * 4); // odd 4k+3 → out[3N/4..N]
+
+    const tw = comptime srTwiddle(T, N, inverse);
+    const sign: T = if (inverse) 1.0 else -1.0;
+
+    // Vectorize the combine across `k`. The four operand groups are contiguous
+    // quarter-length runs (E[0..q] at out[0..q], E[q..2q] at out[q..2q], O1[0..q]
+    // at out[2q..3q], O3[0..q] at out[3q..4q]); each is loaded planar (re lanes,
+    // im lanes) so the complex multiplies and the L-butterfly add/subtracts are
+    // plain lane-wise vector arithmetic. `@Vector` lowers this to NEON/AVX where
+    // present and scalarizes correctly where there is none (embedded), so the
+    // kernel keeps its no-HAL, runs-on-every-target property. A scalar tail
+    // mops up when `q` is not a whole multiple of the vector width.
+    const lanes = comptime blk: {
+        const w = std.simd.suggestVectorLength(T) orelse 4;
+        break :blk if (w <= q) w else q;
+    };
+    const V = @Vector(lanes, T);
+
+    var k: usize = 0;
+    while (k + lanes <= q) : (k += lanes) {
+        // Planar deinterleave of the four contiguous complex runs.
+        var u_re: V = undefined;
+        var u_im: V = undefined;
+        var uh_re: V = undefined;
+        var uh_im: V = undefined;
+        var o1_re: V = undefined;
+        var o1_im: V = undefined;
+        var o3_re: V = undefined;
+        var o3_im: V = undefined;
+        var w1_re: V = undefined;
+        var w1_im: V = undefined;
+        var w3_re: V = undefined;
+        var w3_im: V = undefined;
+        inline for (0..lanes) |l| {
+            u_re[l] = out[k + l].re;
+            u_im[l] = out[k + l].im;
+            uh_re[l] = out[k + q + l].re;
+            uh_im[l] = out[k + q + l].im;
+            o1_re[l] = out[k + 2 * q + l].re;
+            o1_im[l] = out[k + 2 * q + l].im;
+            o3_re[l] = out[k + 3 * q + l].re;
+            o3_im[l] = out[k + 3 * q + l].im;
+            w1_re[l] = tw.w1_re[k + l];
+            w1_im[l] = tw.w1_im[k + l];
+            w3_re[l] = tw.w3_re[k + l];
+            w3_im[l] = tw.w3_im[k + l];
+        }
+        // Z1 = W^k·O1, Z3 = W^{3k}·O3 (lane-wise complex multiply).
+        const z1_re = o1_re * w1_re - o1_im * w1_im;
+        const z1_im = o1_re * w1_im + o1_im * w1_re;
+        const z3_re = o3_re * w3_re - o3_im * w3_im;
+        const z3_im = o3_re * w3_im + o3_im * w3_re;
+        const sp_re = z1_re + z3_re;
+        const sp_im = z1_im + z3_im;
+        const dm_re = z1_re - z3_re;
+        const dm_im = z1_im - z3_im;
+        // (i·s)·(Z1−Z3): multiply by i flips/swaps components, s picks direction.
+        const sv: V = @splat(sign);
+        const idm_re = sv * dm_im;
+        const idm_im = -sv * dm_re;
+        const x0_re = u_re + sp_re;
+        const x0_im = u_im + sp_im;
+        const x2_re = u_re - sp_re;
+        const x2_im = u_im - sp_im;
+        const x1_re = uh_re - idm_re;
+        const x1_im = uh_im - idm_im;
+        const x3_re = uh_re + idm_re;
+        const x3_im = uh_im + idm_im;
+        inline for (0..lanes) |l| {
+            out[k + l] = .{ .re = x0_re[l], .im = x0_im[l] };
+            out[k + 2 * q + l] = .{ .re = x2_re[l], .im = x2_im[l] };
+            out[k + q + l] = .{ .re = x1_re[l], .im = x1_im[l] };
+            out[k + 3 * q + l] = .{ .re = x3_re[l], .im = x3_im[l] };
+        }
+    }
+    // Scalar tail.
+    while (k < q) : (k += 1) {
+        const u = out[k];
+        const uh = out[k + q];
+        const o1 = out[k + 2 * q];
+        const o3 = out[k + 3 * q];
+        const z1 = C{
+            .re = o1.re * tw.w1_re[k] - o1.im * tw.w1_im[k],
+            .im = o1.re * tw.w1_im[k] + o1.im * tw.w1_re[k],
+        };
+        const z3 = C{
+            .re = o3.re * tw.w3_re[k] - o3.im * tw.w3_im[k],
+            .im = o3.re * tw.w3_im[k] + o3.im * tw.w3_re[k],
+        };
+        const sp = C{ .re = z1.re + z3.re, .im = z1.im + z3.im };
+        const dm = C{ .re = z1.re - z3.re, .im = z1.im - z3.im };
+        const idm = C{ .re = sign * dm.im, .im = -sign * dm.re };
+        out[k] = .{ .re = u.re + sp.re, .im = u.im + sp.im };
+        out[k + 2 * q] = .{ .re = u.re - sp.re, .im = u.im - sp.im };
+        out[k + q] = .{ .re = uh.re - idm.re, .im = uh.im - idm.im };
+        out[k + 3 * q] = .{ .re = uh.re + idm.re, .im = uh.im + idm.im };
+    }
+}
+
+/// In-place split-radix Cooley-Tukey FFT over `N` (a power of two) complex
 /// samples. `inverse = false` is the forward transform; `inverse = true` is the
-/// inverse (scaled by `1/N`). Bit-reversal permutation then `log2 N` butterfly
-/// stages with twiddles advanced by a per-stage complex rotation.
+/// inverse (scaled by `1/N`). The recursive split-radix kernel is naturally
+/// out-of-place, so a single stack scratch buffer holds its result and is copied
+/// back — the routine allocates nothing on the heap, takes `N` as a compile-time
+/// constant, and (the split-radix recursion and the `@Vector` combine both lower
+/// to scalar where there is no vector unit) runs on every target including the
+/// freestanding embedded one.
 pub fn fftInPlace(comptime T: type, comptime N: usize, data: *[N]std.math.Complex(T), comptime inverse: bool) void {
     comptime std.debug.assert(isPow2(N));
     const C = std.math.Complex(T);
 
-    // Decimation-in-time bit-reversal permutation.
-    var i: usize = 1;
-    var j: usize = 0;
-    while (i < N) : (i += 1) {
-        var bit = N >> 1;
-        while (j & bit != 0) : (bit >>= 1) j ^= bit;
-        j ^= bit;
-        if (i < j) {
-            const tmp = data[i];
-            data[i] = data[j];
-            data[j] = tmp;
-        }
-    }
-
-    // Butterfly stages.
-    var len: usize = 2;
-    while (len <= N) : (len <<= 1) {
-        const sign: T = if (inverse) 2.0 else -2.0;
-        const ang: T = sign * std.math.pi / @as(T, @floatFromInt(len));
-        const wlen = C{ .re = @cos(ang), .im = @sin(ang) };
-        var s: usize = 0;
-        while (s < N) : (s += len) {
-            var w = C{ .re = 1, .im = 0 };
-            var k: usize = 0;
-            const half = len >> 1;
-            while (k < half) : (k += 1) {
-                const a = data[s + k];
-                const b = data[s + k + half];
-                const v = C{ .re = b.re * w.re - b.im * w.im, .im = b.re * w.im + b.im * w.re };
-                data[s + k] = .{ .re = a.re + v.re, .im = a.im + v.im };
-                data[s + k + half] = .{ .re = a.re - v.re, .im = a.im - v.im };
-                // Advance the twiddle: w *= wlen. Capture old components first —
-                // a struct literal assigned back into `w` would write `.re` in
-                // place before the `.im` expression reads it (result-location
-                // aliasing), corrupting the recurrence.
-                const w_re = w.re * wlen.re - w.im * wlen.im;
-                const w_im = w.re * wlen.im + w.im * wlen.re;
-                w = .{ .re = w_re, .im = w_im };
-            }
-        }
-    }
+    var scratch: [N]C = undefined;
+    srfft(T, N, inverse, &scratch, data, 1);
 
     if (inverse) {
         const inv_n: T = 1.0 / @as(T, @floatFromInt(N));
-        for (data) |*c| {
-            c.re *= inv_n;
-            c.im *= inv_n;
-        }
+        for (data, &scratch) |*d, c| d.* = .{ .re = c.re * inv_n, .im = c.im * inv_n };
+    } else {
+        @memcpy(data, &scratch);
     }
 }
 
@@ -934,6 +1076,295 @@ pub fn PitchShift(comptime num: numeric.Numeric, comptime FRAME: usize) type {
 }
 
 // ===========================================================================
+// PartitionedConvolution — uniform-partitioned overlap-add FFT convolution (Rate)
+// ===========================================================================
+
+/// `PartitionedConvolution(num, FRAME, HOP, n_partitions)` — uniform-partitioned
+/// overlap-add (UPOLA) frequency-domain convolution of the mono input with an
+/// impulse response of up to `n_partitions·HOP` taps. A `Sample → Sample`
+/// transform whose out:in is exactly 1:1, but it is a `Rate` block (not a `Map`):
+/// it owns an internal clocked ring — a frequency-domain delay line of the last
+/// `n_partitions` input-block spectra plus a time-domain overlap-add accumulator —
+/// so its output is not a pure function of the current input slice. That ring is
+/// the defining Rate smell, and it carries `HOP` samples of group delay.
+///
+/// **How it partitions and why FRAME ≥ 2·HOP.** The IR is sliced into
+/// `n_partitions` contiguous blocks of `HOP` taps each (zero-padded if the IR is
+/// shorter); block `p` is zero-extended to `FRAME` samples and pre-transformed to
+/// its half-spectrum `H[p]` once, at `initialize`. Input is buffered into blocks
+/// of `HOP` samples; each full block is zero-extended to `FRAME` and forward-rfft'd
+/// to `X`, then pushed into the spectral delay line. The output block's spectrum is
+/// the per-bin complex multiply-accumulate `Y = Σ_p X[now−p]·H[p]`, inverse-rfft'd
+/// to `FRAME` time samples and overlap-added into a running accumulator; the
+/// accumulator's first `HOP` samples are emitted and it shifts down by `HOP`. The
+/// linear convolution of one `HOP`-sample input block with one `HOP`-tap IR block
+/// has length `2·HOP − 1`; the per-block FFT must be at least that long or the
+/// result time-aliases (the circular convolution wraps the tail back over the
+/// head), so `FRAME ≥ 2·HOP` is required and enforced. With that, each block
+/// product is an exact linear (not circular) convolution and the overlap-add of
+/// the `2·HOP − 1`-sample spreads reconstructs the full linear convolution.
+///
+/// **Latency.** Zero group delay. A block of `HOP` inputs is buffered before its
+/// `HOP` outputs can be produced, but that buffering is throughput latency, not
+/// group delay: the spectral delay line is indexed so partition `p`'s contribution
+/// lands at the correct output sample, so output block `b` carries `Σ_p
+/// x_block[b−p] ⊛ h_part[p]` aligned with input block `b`. Convolving with a
+/// unit-impulse IR (`ir[0] = 1`, rest 0) therefore returns the input UNSHIFTED (the
+/// convolution identity); a general IR's group delay is the IR's own, in its taps.
+///
+/// **Float-only**, mono. The IR is block data set via `initialize(ir)`; an unset
+/// IR convolves with silence (all-zero spectra ⇒ silent output).
+pub fn PartitionedConvolution(
+    comptime num: numeric.Numeric,
+    comptime FRAME: usize,
+    comptime HOP: usize,
+    comptime n_partitions: usize,
+) type {
+    const T = num.Lane;
+    requireFloat(T);
+    if (!isPow2(FRAME)) @compileError("pan: PartitionedConvolution FRAME must be a power of two");
+    if (HOP == 0) @compileError("pan: PartitionedConvolution HOP must be >= 1");
+    if (FRAME < 2 * HOP)
+        @compileError("pan: PartitionedConvolution FRAME must be >= 2·HOP — a HOP-sample" ++
+            " block convolved with a HOP-tap IR partition is 2·HOP−1 samples long, so a" ++
+            " shorter FFT would time-alias (the circular tail wraps over the head)");
+    if (n_partitions == 0) @compileError("pan: PartitionedConvolution n_partitions must be >= 1");
+    const BINS = FRAME / 2 + 1;
+    const C = std.math.Complex(T);
+    return struct {
+        const Self = @This();
+
+        /// Same number of samples out as in — convolution is rate-preserving.
+        pub const out_per_in = .{ 1, 1 };
+        /// Zero group delay. A block of `HOP` inputs is buffered before its `HOP`
+        /// outputs are produced, but that is throughput latency, not group delay:
+        /// the spectral delay line is indexed so partition `p`'s contribution lands
+        /// at the correct output sample, so output block `b` carries `Σ_p
+        /// x_block[b−p] ⊛ h_part[p]` aligned with input block `b`. (A Rate block may
+        /// declare zero group delay — latency is orthogonal to the rate ratio;
+        /// declaring it, even as 0, is the contract.) Convolving with a unit-impulse
+        /// IR therefore returns the input UNSHIFTED; a general IR's group delay is
+        /// the IR's own, carried in its taps.
+        pub const algorithmic_latency: usize = 0;
+        pub const state_size: usize = @sizeOf([n_partitions]([BINS]C)) +
+            @sizeOf([BINS]C) * n_partitions + @sizeOf([FRAME]T) + 2 * @sizeOf([HOP]T) + 4 * @sizeOf(usize);
+
+        /// IR partition spectra: `ir_spec[p]` is the half-spectrum of IR block `p`
+        /// (taps `[p·HOP, p·HOP+HOP)` zero-extended to `FRAME`). Zero until set.
+        ir_spec: [n_partitions][BINS]C =
+            [_][BINS]C{[_]C{.{ .re = 0, .im = 0 }} ** BINS} ** n_partitions,
+        /// Frequency-domain delay line of the most-recent input-block spectra:
+        /// `fdl[(head − p) mod n_partitions]` is `X[now − p]`, the input block `p`
+        /// blocks ago. A circular buffer indexed by `head`.
+        fdl: [n_partitions][BINS]C =
+            [_][BINS]C{[_]C{.{ .re = 0, .im = 0 }} ** BINS} ** n_partitions,
+        /// Write cursor into `fdl`: the slot holding the most-recently inserted
+        /// input-block spectrum.
+        head: usize = 0,
+        /// Time-domain overlap-add accumulator for the inverse-FFT output spreads.
+        overlap: [FRAME]T = [_]T{0} ** FRAME,
+        /// The current partially-filled input block (the clocked ring): `fill`
+        /// samples accumulated toward the next `HOP`-sample block.
+        block: [HOP]T = [_]T{0} ** HOP,
+        /// Count of samples in `block` (0..HOP); carries the sub-`HOP` remainder of
+        /// a chunk across `pull` calls so no input is dropped on a `HOP ∤ chunk` pull.
+        fill: usize = 0,
+        /// Completed-but-not-yet-emitted output samples — a FIFO ring. A whole block
+        /// produces `HOP` outputs at once; if the caller's `want` is not block-aligned
+        /// the leftover is held here and drained on the next `pull`, so no output is
+        /// ever lost on a `HOP ∤ want` pull. Capacity `FRAME` (≥ `2·HOP`) absorbs a
+        /// sub-`HOP` carry plus one freshly-completed block. `oavail` samples remain,
+        /// the oldest at `ohead`, wrapping modulo `FRAME`.
+        obuf: [FRAME]T = [_]T{0} ** FRAME,
+        ohead: usize = 0,
+        oavail: usize = 0,
+
+        /// Install the impulse response (up to `n_partitions·HOP` taps). Each
+        /// `HOP`-tap partition is zero-extended to `FRAME` and pre-transformed to
+        /// its half-spectrum, so the per-block hot path is a pure spectral MAC.
+        /// Taps past `ir.len` (and the zero-extension to `FRAME`) are silence.
+        pub fn initialize(self: *Self, ir: []const T) void {
+            var p: usize = 0;
+            while (p < n_partitions) : (p += 1) {
+                var padded: [FRAME]T = [_]T{0} ** FRAME;
+                var t: usize = 0;
+                while (t < HOP) : (t += 1) {
+                    const idx = p * HOP + t;
+                    padded[t] = if (idx < ir.len) ir[idx] else 0;
+                }
+                rfftForward(T, FRAME, &padded, &self.ir_spec[p]);
+            }
+        }
+
+        /// Out:in is 1:1, so `want` outputs need `want` inputs.
+        pub fn needed_input(self: *Self, want: usize) usize {
+            _ = self;
+            return want;
+        }
+
+        pub fn pull(self: *Self, in: []const types.Sample(T), want: usize, out: []types.Sample(T)) usize {
+            const xs = scalarsConst(T, in);
+            const ys = scalars(T, out);
+            var produced: usize = 0;
+
+            // Drain any output left over from a prior non-block-aligned pull first.
+            self.drain(ys, &produced, want);
+
+            // Consume ALL provided input (never drop a sample): each input goes into
+            // the block ring; a completed block is convolved and its HOP outputs are
+            // appended to the output FIFO; we then drain up to the `want` ceiling.
+            // Whatever the `want` budget could not take stays in the FIFO (and a
+            // sub-HOP remainder stays in `block`) for the next call. With the 1:1 rate
+            // and the scheduler's `needed_input(want) == want` supply, the FIFO holds
+            // at most a sub-HOP carry plus one freshly-completed block (≤ FRAME).
+            for (xs) |x| {
+                self.block[self.fill] = x;
+                self.fill += 1;
+                if (self.fill < HOP) continue;
+                self.fill = 0;
+
+                // The completed input block, zero-extended to FRAME, forward-rfft'd
+                // and inserted at the head of the frequency-domain delay line.
+                var padded: [FRAME]T = [_]T{0} ** FRAME;
+                @memcpy(padded[0..HOP], self.block[0..HOP]);
+                self.head = (self.head + 1) % n_partitions;
+                rfftForward(T, FRAME, &padded, &self.fdl[self.head]);
+
+                // Y = Σ_p X[now−p]·H[p], a per-bin complex multiply-accumulate over
+                // the delay line against the IR partition spectra.
+                var acc: [BINS]C = [_]C{.{ .re = 0, .im = 0 }} ** BINS;
+                var p: usize = 0;
+                while (p < n_partitions) : (p += 1) {
+                    const slot = (self.head + n_partitions - p) % n_partitions;
+                    const xf = &self.fdl[slot];
+                    const hf = &self.ir_spec[p];
+                    var b: usize = 0;
+                    while (b < BINS) : (b += 1) {
+                        // (a+bi)(c+di) = (ac−bd) + (ad+bc)i
+                        acc[b].re += xf[b].re * hf[b].re - xf[b].im * hf[b].im;
+                        acc[b].im += xf[b].re * hf[b].im + xf[b].im * hf[b].re;
+                    }
+                }
+
+                // Inverse-rfft to FRAME time samples, overlap-add into the running
+                // accumulator. The first HOP samples are this block's finished output;
+                // append them to the output FIFO, then shift the accumulator down by
+                // HOP and zero the vacated tail.
+                var tdom: [FRAME]T = undefined;
+                rfftInverse(T, FRAME, &acc, &tdom);
+                for (&self.overlap, tdom) |*o, s| o.* += s;
+                var k: usize = 0;
+                while (k < HOP) : (k += 1) {
+                    const w = (self.ohead + self.oavail) % FRAME; // FIFO write index
+                    self.obuf[w] = self.overlap[k];
+                    self.oavail += 1;
+                }
+                std.mem.copyForwards(T, self.overlap[0 .. FRAME - HOP], self.overlap[HOP..FRAME]);
+                @memset(self.overlap[FRAME - HOP .. FRAME], 0);
+
+                self.drain(ys, &produced, want);
+            }
+            return produced;
+        }
+
+        /// Move buffered output into `ys` up to the `want` ceiling, advancing the
+        /// FIFO read cursor; the remainder (if `want` is reached mid-block) stays in
+        /// the FIFO for the next call so no output sample is lost.
+        fn drain(self: *Self, ys: []T, produced: *usize, want: usize) void {
+            while (self.oavail > 0 and produced.* < want) {
+                ys[produced.*] = self.obuf[self.ohead];
+                self.ohead = (self.ohead + 1) % FRAME;
+                self.oavail -= 1;
+                produced.* += 1;
+            }
+        }
+    };
+}
+
+// ===========================================================================
+// SpectralGate — per-bin spectral noise gate (Map, Spectrum -> Spectrum)
+// ===========================================================================
+
+/// `SpectralGate(num, bins)` — a spectral noise gate: zero every bin whose
+/// magnitude is below the `threshold` parameter, pass the rest unchanged. A
+/// per-bin rate-1:1 `Map` over the spectrum stream (`Spectrum → Spectrum`, element
+/// type unchanged), so it is a `Map`, not a `Rate`.
+///
+/// The gate compares `|z|²` against `threshold²` to avoid a per-bin square root
+/// (magnitude ≥ threshold ⟺ power ≥ threshold², for non-negative threshold). A bin
+/// at exactly the threshold passes (the boundary is inclusive). Float-only.
+pub fn SpectralGate(comptime num: numeric.Numeric, comptime bins: usize) type {
+    const T = num.Lane;
+    requireFloat(T);
+    const In = Spectrum(T, bins);
+    return struct {
+        const Self = @This();
+
+        /// The gate threshold, a magnitude floor. Bins with `|z| < threshold` are
+        /// zeroed; `|z| >= threshold` passes unchanged.
+        pub const params = .{ .threshold = types.Scalar(f32) };
+
+        threshold: control.Param = control.Param.init(0.0),
+
+        pub fn setParam(self: *Self, slot: u8, value: f32) void {
+            if (slot == 0) self.threshold.set(value);
+        }
+
+        pub fn process(self: *Self, in: []const In, out: []In) void {
+            const thr: T = @floatCast(self.threshold.read()); // held per call
+            const thr2 = thr * thr;
+            for (in, out) |frame, *o| {
+                for (&o.bin, frame.bin) |*ob, z| {
+                    const power = z.re * z.re + z.im * z.im;
+                    ob.* = if (power >= thr2) z else .{ .re = 0, .im = 0 };
+                }
+            }
+        }
+    };
+}
+
+// ===========================================================================
+// SpectralEq — per-bin real-gain spectral EQ (Map, Spectrum -> Spectrum)
+// ===========================================================================
+
+/// `SpectralEq(num, bins)` — a linear-phase spectral equalizer: multiply each bin
+/// by a real (zero-phase) gain from a settable `[bins]f32` curve. A per-bin
+/// rate-1:1 `Map` over the spectrum stream (`Spectrum → Spectrum`, element type
+/// unchanged), so it is a `Map`, not a `Rate`.
+///
+/// The gains are REAL (not complex): each bin is multiplied component-wise by
+/// `gain[b]`. For a NON-NEGATIVE gain this is zero-phase (it scales the magnitude by
+/// `gain[b]` and leaves the phase untouched); a negative gain is exactly a magnitude
+/// scale by `|gain[b]|` plus a π phase flip (multiplying by a negative real). The
+/// default curve is unity (all gains 1), which is the identity. Float-only.
+pub fn SpectralEq(comptime num: numeric.Numeric, comptime bins: usize) type {
+    const T = num.Lane;
+    requireFloat(T);
+    const In = Spectrum(T, bins);
+    return struct {
+        const Self = @This();
+
+        /// Per-bin real gain curve; unity (identity) until set via `initialize`.
+        gain: [bins]f32 = [_]f32{1.0} ** bins,
+
+        /// Install the gain curve. `curve.len` must equal `bins`.
+        pub fn initialize(self: *Self, curve: []const f32) void {
+            std.debug.assert(curve.len == bins);
+            @memcpy(&self.gain, curve);
+        }
+
+        pub fn process(self: *Self, in: []const In, out: []In) void {
+            for (in, out) |frame, *o| {
+                for (&o.bin, frame.bin, self.gain) |*ob, z, g| {
+                    const gg: T = @floatCast(g);
+                    ob.* = .{ .re = z.re * gg, .im = z.im * gg };
+                }
+            }
+        }
+    };
+}
+
+// ===========================================================================
 // Tests — basic behaviour of the FFT and the Rate pair (compile coverage of
 // the generic over f32; the autonomous Yoneda suite owns the full matrix:
 // dual-mux, latency-contract, sub-block granularity, reconstruction).
@@ -1052,4 +1483,232 @@ test "the spectral Rate blocks declare both rate facts (classify as Rate)" {
     // The Rate output/input elements are mintable from `pull`.
     try testing.expect(port.RateInElem(Stft(f32num, 64, 32)) == types.Sample(f32));
     try testing.expect(port.RateOutElem(Stft(f32num, 64, 32)) == Spectrum(f32, 33));
+}
+
+// --- PartitionedConvolution -------------------------------------------------
+
+test "PartitionedConvolution classifies as a (Sample->Sample) Rate, zero group delay" {
+    const port = @import("port.zig");
+    const Conv = PartitionedConvolution(f32num, 16, 8, 4);
+    try testing.expect(port.classify(Conv) == .Rate);
+    try testing.expect(port.RateInElem(Conv) == types.Sample(f32));
+    try testing.expect(port.RateOutElem(Conv) == types.Sample(f32));
+    // Zero group delay (the buffering is throughput, not group delay).
+    try testing.expectEqual(@as(usize, 0), Conv.algorithmic_latency);
+    // Rate ratio is 1:1 (convolution is rate-preserving).
+    try testing.expectEqual(@as(usize, 1), Conv.out_per_in[0]);
+    try testing.expectEqual(@as(usize, 1), Conv.out_per_in[1]);
+}
+
+test "PartitionedConvolution: unit-impulse IR returns the input unshifted (identity)" {
+    // ORACLE: convolving with δ[n] is the identity; the block declares zero group
+    // delay, so the output must equal the input sample-for-sample. The reference is
+    // the raw input series, independent of the block's own path. (The block buffers
+    // a HOP-sample block before emitting, so the last partial sub-HOP block of the
+    // stream is not yet flushed — only whole blocks are checked.)
+    const FRAME = 16;
+    const HOP = 8;
+    const NP = 4;
+    var conv = PartitionedConvolution(f32num, FRAME, HOP, NP){};
+    conv.initialize(&[_]f32{1.0}); // δ: only tap 0 is 1, all later taps 0
+
+    const N = 96; // a whole number of HOP blocks
+    var in: [N]types.Sample(f32) = undefined;
+    var rng = std.Random.DefaultPrng.init(13);
+    for (&in) |*s| s.ch[0] = rng.random().float(f32) * 2 - 1;
+
+    var out: [N]types.Sample(f32) = undefined;
+    const got = conv.pull(&in, N, &out);
+    try testing.expectEqual(@as(usize, N), got);
+
+    var n: usize = 0;
+    while (n < N) : (n += 1) try testing.expectApproxEqAbs(in[n].ch[0], out[n].ch[0], 1e-4);
+}
+
+test "PartitionedConvolution: matches a naive O(N·M) time-domain convolution" {
+    // ORACLE: an independent, schoolbook linear convolution y[n] = Σ_m h[m]·x[n−m]
+    // computed directly in the time domain (shares only the definition of
+    // convolution with the FFT path, not the algorithm). The block's output is the
+    // same series delayed by its declared HOP latency.
+    const FRAME = 32;
+    const HOP = 16;
+    const NP = 3; // IR up to NP·HOP = 48 taps
+    const M = 40; // an IR shorter than the full partition budget (last block partial)
+    var ir: [M]f32 = undefined;
+    var rng = std.Random.DefaultPrng.init(2027);
+    for (&ir) |*h| h.* = rng.random().float(f32) * 2 - 1;
+
+    const N = 128;
+    var x: [N]f32 = undefined;
+    for (&x) |*v| v.* = rng.random().float(f32) * 2 - 1;
+
+    // Independent naive convolution into a reference series of length N.
+    var ref: [N]f32 = [_]f32{0} ** N;
+    for (0..N) |n| {
+        var acc: f32 = 0;
+        for (0..M) |m| {
+            if (m <= n) acc += ir[m] * x[n - m];
+        }
+        ref[n] = acc;
+    }
+
+    var conv = PartitionedConvolution(f32num, FRAME, HOP, NP){};
+    conv.initialize(&ir);
+    var in: [N]types.Sample(f32) = undefined;
+    for (&in, x) |*s, v| s.ch[0] = v;
+    var out: [N]types.Sample(f32) = undefined;
+    _ = conv.pull(&in, N, &out);
+
+    // Zero group delay: out[n] == ref[n] aligned (NP·HOP = 48 >= M = 40 taps, so
+    // the whole IR is covered and no tail is dropped within the stream).
+    var n: usize = 0;
+    while (n < N) : (n += 1) {
+        try testing.expectApproxEqAbs(ref[n], out[n].ch[0], 1e-3);
+    }
+}
+
+test "PartitionedConvolution: HOP ∤ chunk misalignment drops no input (ring carries remainder)" {
+    // Pulling in odd-sized chunks must equal one whole-stream pull: the internal
+    // block ring carries the sub-HOP remainder across calls. ORACLE: the same
+    // block fed the whole stream at once.
+    const FRAME = 16;
+    const HOP = 8;
+    const NP = 2;
+    var ir: [10]f32 = undefined;
+    var rng = std.Random.DefaultPrng.init(55);
+    for (&ir) |*h| h.* = rng.random().float(f32) * 2 - 1;
+
+    const N = 80;
+    var in: [N]types.Sample(f32) = undefined;
+    for (&in) |*s| s.ch[0] = rng.random().float(f32) * 2 - 1;
+
+    var whole = PartitionedConvolution(f32num, FRAME, HOP, NP){};
+    whole.initialize(&ir);
+    var out_whole: [N]types.Sample(f32) = undefined;
+    _ = whole.pull(&in, N, &out_whole);
+
+    var split = PartitionedConvolution(f32num, FRAME, HOP, NP){};
+    split.initialize(&ir);
+    var out_split: [N]types.Sample(f32) = undefined;
+    // Chunk sizes that are not multiples of HOP (5, 7, 5, …) exercise the remainder
+    // ring. A Rate block under-produces a chunk until enough input accrues to fill a
+    // block, so outputs are appended at the running `done` cursor, not per-chunk.
+    var off: usize = 0; // input consumed
+    var done: usize = 0; // outputs emitted so far
+    const sizes = [_]usize{ 5, 7, 5, 11, 3, 9, 13, 27 };
+    var si: usize = 0;
+    while (off < N) {
+        const want = @min(sizes[si % sizes.len], N - off);
+        si += 1;
+        const g = split.pull(in[off .. off + want], want, out_split[done..N]);
+        try testing.expect(g <= want); // may under-produce; never over-produce
+        off += want;
+        done += g;
+    }
+    // Both paths flushed the same whole blocks; compare those.
+    var n: usize = 0;
+    while (n < done) : (n += 1) try testing.expectApproxEqAbs(out_whole[n].ch[0], out_split[n].ch[0], 1e-5);
+}
+
+// --- SpectralGate -----------------------------------------------------------
+
+test "SpectralGate classifies as a (Spectrum->Spectrum) Map" {
+    const port = @import("port.zig");
+    const Gate = SpectralGate(f32num, 4);
+    try testing.expect(port.classify(Gate) == .Map);
+    try testing.expect(port.MapInElem(Gate) == Spectrum(f32, 4));
+    try testing.expect(port.MapOutElem(Gate) == Spectrum(f32, 4));
+}
+
+test "SpectralGate: bins below threshold zero, bins at/above pass unchanged" {
+    // ORACLE: a hand-classified expectation per bin. With threshold = 5, a bin of
+    // magnitude 5 (|3+4i| = 5) sits exactly at the floor and PASSES; a bin of
+    // magnitude < 5 is ZEROED; a large bin passes verbatim.
+    var gate = SpectralGate(f32num, 4){};
+    gate.setParam(0, 5.0);
+    var in = [_]Spectrum(f32, 4){.{
+        .bin = .{
+            .{ .re = 3, .im = 4 }, // |z| = 5  -> at threshold, passes
+            .{ .re = 1, .im = 0 }, // |z| = 1  -> below, zeroed
+            .{ .re = 0, .im = 4 }, // |z| = 4  -> below, zeroed
+            .{ .re = -10, .im = 0 }, // |z| = 10 -> above, passes
+        },
+    }};
+    var out: [1]Spectrum(f32, 4) = undefined;
+    gate.process(&in, &out);
+    try testing.expectApproxEqAbs(@as(f32, 3), out[0].bin[0].re, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 4), out[0].bin[0].im, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0), out[0].bin[1].re, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0), out[0].bin[1].im, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0), out[0].bin[2].im, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, -10), out[0].bin[3].re, 1e-6);
+}
+
+test "SpectralGate: zero threshold is identity (every bin passes)" {
+    // ORACLE: with threshold 0, |z| >= 0 is always true, so the gate is the
+    // identity — output must equal input bin-for-bin.
+    var gate = SpectralGate(f32num, 3){};
+    // default threshold is already 0; assert that default is pass-through.
+    var in = [_]Spectrum(f32, 3){.{ .bin = .{
+        .{ .re = 0.001, .im = -0.002 },
+        .{ .re = 7, .im = 8 },
+        .{ .re = 0, .im = 0 },
+    } }};
+    var out: [1]Spectrum(f32, 3) = undefined;
+    gate.process(&in, &out);
+    for (out[0].bin, in[0].bin) |o, z| {
+        try testing.expectApproxEqAbs(z.re, o.re, 1e-9);
+        try testing.expectApproxEqAbs(z.im, o.im, 1e-9);
+    }
+}
+
+// --- SpectralEq -------------------------------------------------------------
+
+test "SpectralEq classifies as a (Spectrum->Spectrum) Map" {
+    const port = @import("port.zig");
+    const Eq = SpectralEq(f32num, 4);
+    try testing.expect(port.classify(Eq) == .Map);
+    try testing.expect(port.MapInElem(Eq) == Spectrum(f32, 4));
+    try testing.expect(port.MapOutElem(Eq) == Spectrum(f32, 4));
+}
+
+test "SpectralEq: a known gain curve scales each bin's magnitude exactly" {
+    // ORACLE: a real gain g[b] scales magnitude by g[b] and leaves phase intact, so
+    // each output bin equals the input bin times g[b], component-wise. The
+    // reference is the hand-multiplied (re·g, im·g), independent of the block.
+    var eq = SpectralEq(f32num, 4){};
+    eq.initialize(&[_]f32{ 2.0, 0.0, 0.5, 3.0 });
+    var in = [_]Spectrum(f32, 4){.{ .bin = .{
+        .{ .re = 1, .im = 2 },
+        .{ .re = 5, .im = -5 },
+        .{ .re = -4, .im = 8 },
+        .{ .re = 0, .im = 1 },
+    } }};
+    var out: [1]Spectrum(f32, 4) = undefined;
+    eq.process(&in, &out);
+    const g = [_]f32{ 2.0, 0.0, 0.5, 3.0 };
+    for (out[0].bin, in[0].bin, g) |o, z, gg| {
+        try testing.expectApproxEqAbs(z.re * gg, o.re, 1e-6);
+        try testing.expectApproxEqAbs(z.im * gg, o.im, 1e-6);
+        // Magnitude scales by exactly gg.
+        const mag_in = @sqrt(z.re * z.re + z.im * z.im);
+        const mag_out = @sqrt(o.re * o.re + o.im * o.im);
+        try testing.expectApproxEqAbs(mag_in * gg, mag_out, 1e-5);
+    }
+}
+
+test "SpectralEq: a flat unity curve is the identity" {
+    // ORACLE: the default curve is all-ones; identity output expected.
+    var eq = SpectralEq(f32num, 3){};
+    var in = [_]Spectrum(f32, 3){.{ .bin = .{
+        .{ .re = 1.5, .im = -2.5 },
+        .{ .re = 0, .im = 0 },
+        .{ .re = 9, .im = 9 },
+    } }};
+    var out: [1]Spectrum(f32, 3) = undefined;
+    eq.process(&in, &out);
+    for (out[0].bin, in[0].bin) |o, z| {
+        try testing.expectApproxEqAbs(z.re, o.re, 1e-9);
+        try testing.expectApproxEqAbs(z.im, o.im, 1e-9);
+    }
 }

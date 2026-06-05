@@ -68,6 +68,48 @@
 const std = @import("std");
 const graph = @import("graph.zig");
 const port = @import("port.zig");
+const types = @import("types.zig");
+const spatial = @import("spatial.zig");
+
+/// The registered positional layout pairs whose canonical up/down-mix matrix the
+/// negotiation pass may auto-insert. The coefficients come from ONE source of
+/// truth — the comptime `spatial.canonicalMixMatrix` — so the auto-inserted matrix
+/// is exactly the explicit `Upmix`/`Downmix` block's matrix.
+const RegLayoutPair = struct { from: types.ChannelLayout, to: types.ChannelLayout };
+const registered_layout_pairs = [_]RegLayoutPair{
+    .{ .from = .mono, .to = .stereo },
+    .{ .from = .stereo, .to = .mono },
+    .{ .from = .stereo, .to = .surround_5_1 },
+    .{ .from = .stereo, .to = .surround_7_1 },
+    .{ .from = .surround_5_1, .to = .stereo },
+    .{ .from = .surround_5_1, .to = .surround_7_1 },
+    .{ .from = .surround_7_1, .to = .surround_5_1 },
+};
+
+/// Fill `out` (row-major, `to_ch` rows of `from_ch`) with the canonical up/down-mix
+/// coefficients for the `(from_ch, to_ch)` registered positional pair; returns the
+/// coefficient count (`to_ch·from_ch`), or `null` if the pair is not registered. The
+/// runtime sibling of `spatial.canonicalMixMatrix` (a runtime coercion kernel cannot
+/// take a comptime layout), keyed by channel count — the registered positional
+/// layouts have distinct counts (1/2/6/8) so the count pair is unambiguous.
+pub fn runtimeMixMatrix(from_ch: usize, to_ch: usize, out: []f32) ?usize {
+    inline for (registered_layout_pairs) |pair| {
+        const fc = comptime pair.from.count();
+        const tc = comptime pair.to.count();
+        if (from_ch == fc and to_ch == tc) {
+            const m = comptime spatial.canonicalMixMatrix(pair.from, pair.to).?;
+            var idx: usize = 0;
+            inline for (0..tc) |o| {
+                inline for (0..fc) |i| {
+                    out[idx] = m[o][i];
+                    idx += 1;
+                }
+            }
+            return tc * fc;
+        }
+    }
+    return null;
+}
 
 /// Which buffer-assignment strategy the commit pass uses.
 pub const BufferMode = enum {
@@ -451,15 +493,17 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
                 .is_param = e.is_param,
             };
             const consumer: EdgeFormat = .{
-                .elem_name = e.elem_name,
-                .channels = e.channels,
+                .elem_name = if (e.to_elem_name.len != 0) e.to_elem_name else e.elem_name,
+                // The consumer's channel count: its declared `to_channels` if the
+                // edge carries a registered layout mismatch, else the producer's.
+                .channels = if (e.to_channels == 0) e.channels else e.to_channels,
                 .sample_rate = g.nodes[e.to_node].sample_rate,
                 .is_param = e.is_param,
             };
-            // L2: an incompatible pair with no registered coercion is rejected.
-            // (Cannot fire on a wired edge today — connect proves element identity
-            // and graphs are single-rate — but the reject is wired for the relaxed
-            // future path; the full policy is unit-tested via `coercionFor`.)
+            // L2: an incompatible pair with no registered coercion is rejected. A
+            // same-layout edge (the common case) trivially passes; a registered
+            // channel-layout mismatch yields an up/down-mix coercion (materialized by
+            // `insertCoercions`); an UNregistered layout mismatch is a hard mismatch.
             if (coercionFor(producer, consumer) == .hard_mismatch) return error.LayoutMismatch;
 
             // P2 one-source: a parameter slot fed by a wired edge may not ALSO be
@@ -1281,7 +1325,80 @@ pub fn insertCoercions(g: graph.Graph) graph.Graph {
         };
         g2.edge_count += 1;
     }
+
+    // Channel up/down-mix MATRIX coercions. An edge whose consumer wants a
+    // different (registered) channel layout than the producer emits — recorded as
+    // `to_channels`/`to_elem_*` on the edge — gets a built-in matrix node inserted:
+    // `producer → (chmatrix) → consumer`, where the matrix node emits the consumer's
+    // layout and the runtime engine binds the canonical up/down-mix kernel. The
+    // matrix is rate-1:1 (a `Map`), so it adds no latency. An unregistered pair was
+    // already rejected by the negotiate stage; only registered pairs reach here.
+    const post_rate_edges = g2.edge_count;
+    var ci: usize = 0;
+    while (ci < post_rate_edges) : (ci += 1) {
+        const e = g2.edges[ci];
+        if (e.is_param) continue;
+        if (e.to_channels == 0 or e.to_channels == e.channels) continue; // same layout
+        if (!mixMatrixRegistered(e.channels, e.to_channels)) continue; // unregistered (rejected earlier)
+        if (g2.node_count >= graph.max_nodes or g2.edge_count >= graph.max_edges) continue; // capacity guard
+
+        const cid = g2.node_count;
+        const orig_to = e.to_node;
+        const orig_to_port = e.to_port;
+        g2.nodes[cid] = .{
+            .id = cid,
+            .class = .Map,
+            .type_name = "(chmatrix)",
+            .out_elem_size = e.to_elem_size, // the consumer layout's element size
+            .out_elem_name = e.to_elem_name, // a genuine Frame(Lane,L_to) type name
+            .is_source = false,
+            .is_delay = false,
+            .delay_len = 0,
+            .algorithmic_latency = 0, // rate-1:1, instantaneous
+            .out_per_in_p = 1,
+            .out_per_in_q = 1,
+            .aliasing_safe = false,
+            .state_size = 0,
+            .rate_domain = g2.nodes[orig_to].rate_domain,
+            .sample_rate = g2.nodes[orig_to].sample_rate, // 1:1, same rate
+            .set_param_slots = 0,
+            .is_coercion = true,
+            .is_channel_matrix = true,
+            .bypassed = false,
+        };
+        g2.node_count += 1;
+
+        // Rewire: producer → matrix (this edge, now a same-layout producer edge),
+        // then matrix → consumer (new edge, carrying the consumer's layout).
+        g2.edges[ci].to_node = cid;
+        g2.edges[ci].to_port = 0;
+        g2.edges[ci].to_channels = 0;
+        g2.edges[ci].to_elem_name = "";
+        g2.edges[ci].to_elem_size = 0;
+        g2.edges[g2.edge_count] = .{
+            .from_node = cid,
+            .from_port = 0,
+            .to_node = orig_to,
+            .to_port = orig_to_port,
+            .feedback = false,
+            .elem_size = e.to_elem_size,
+            .elem_name = e.to_elem_name,
+            .is_param = false,
+            .channels = e.to_channels,
+        };
+        g2.edge_count += 1;
+    }
     return g2;
+}
+
+/// Is `(from_ch, to_ch)` a registered up/down-mix pair? Buffer-free (no coefficient
+/// fill), so the comptime-evaluable `insertCoercions` can gate on it without a
+/// mutable scratch. The runtime engine uses `runtimeMixMatrix` to fill the kernel.
+fn mixMatrixRegistered(from_ch: usize, to_ch: usize) bool {
+    inline for (registered_layout_pairs) |pair| {
+        if (from_ch == pair.from.count() and to_ch == pair.to.count()) return true;
+    }
+    return false;
 }
 
 /// The plugin-delay-compensation insertion step (runtime path) — the categorical

@@ -91,6 +91,14 @@ pub const Node = struct {
     /// built-in coercion kernel for it rather than looking it up in the author's
     /// bound-instance set.
     is_coercion: bool = false,
+    /// True iff this coercion node is a channel UP/DOWN-MIX MATRIX (an
+    /// `is_coercion` node whose built-in kernel applies a registered layout matrix,
+    /// `out[o] = Σ_i m[o][i]·in[i]`, changing the channel count). Distinguishes the
+    /// matrix coercion from the sample-rate resampler coercion (the other
+    /// `is_coercion` kind) so the runtime engine binds the matrix kernel, not the
+    /// resampler. The from/to channel counts are recovered from the input edge and
+    /// this node's output element size.
+    is_channel_matrix: bool = false,
     /// True iff this node is BYPASSED. The bypass-preserves-latency law: a bypassed
     /// block with `algorithmic_latency > 0` must still delay its signal by exactly
     /// that latency (else bypassing shifts timing and breaks alignment on parallel
@@ -138,8 +146,25 @@ pub const Edge = struct {
     is_param: bool = false,
     /// Channel count of the carried element (1 for a non-`Frame` element). Lets
     /// the negotiate pass reason about channel up/down-mix coercion without
-    /// re-parsing the element name.
+    /// re-parsing the element name. This is the PRODUCER's channel count.
     channels: u16 = 1,
+    /// The CONSUMER's expected channel count, when it differs from the producer's
+    /// (`channels`) — a registered channel-layout mismatch the negotiate pass
+    /// reconciles by auto-inserting an up/down-mix matrix coercion. `0` is the
+    /// sentinel "unset" meaning "same as `channels`" (no layout coercion), so every
+    /// ordinary same-layout edge (the overwhelming majority, and every hand-built
+    /// edge literal) needs no change. When non-zero and ≠ `channels`, the consumer
+    /// wants a different registered layout and the negotiate/insert pass materializes
+    /// the matrix; an unregistered pair is a hard mismatch.
+    to_channels: u16 = 0,
+    /// The CONSUMER's expected element type name (its `Frame(Lane,L_to)` typeName)
+    /// for a layout-coerced edge — the real type name the inserted matrix node's
+    /// output (and its edge to the consumer) carries, so coloring keys on a genuine
+    /// element class. Empty when `to_channels` is unset.
+    to_elem_name: []const u8 = "",
+    /// The CONSUMER's expected element size (`@sizeOf(Frame(Lane,L_to))`) for a
+    /// layout-coerced edge. 0 when unset.
+    to_elem_size: usize = 0,
 };
 
 /// A declared feedback (back) edge — the z⁻¹ write/read split. Its **write side**
@@ -354,6 +379,56 @@ pub const Graph = struct {
             .elem_name = @typeName(OutPort.Elem),
         };
         self.feedback_count += 1;
+    }
+
+    /// Connect an output to an input whose channel LAYOUT differs but whose lane
+    /// type matches — a registered up/down-mix the negotiation pass reconciles by
+    /// auto-inserting the canonical matrix. Unlike `connect` (which proves full
+    /// element identity), this records the producer's element on the edge AND the
+    /// consumer's expected element as `to_*`, so `insertCoercions` materializes the
+    /// matrix. The lane must match (only the layout may differ); an UNregistered
+    /// layout pair still wires here but the negotiate stage rejects it as a hard
+    /// mismatch (so the relaxation never silently mis-mixes an un-coercible pair).
+    pub fn connectCoerced(
+        self: *Self,
+        comptime OutPort: type,
+        out_node: usize,
+        out_idx: port.PortIndex,
+        comptime InPort: type,
+        in_node: usize,
+        in_idx: port.PortIndex,
+    ) void {
+        typeCheckCoerce(OutPort, InPort);
+        const e = self.edge_count;
+        self.edges[e] = .{
+            .from_node = out_node,
+            .from_port = out_idx,
+            .to_node = in_node,
+            .to_port = in_idx,
+            .feedback = false,
+            .elem_size = @sizeOf(OutPort.Elem),
+            .elem_name = @typeName(OutPort.Elem),
+            .is_param = false,
+            .channels = channelsOf(OutPort.Elem),
+            .to_channels = channelsOf(InPort.Elem),
+            .to_elem_name = @typeName(InPort.Elem),
+            .to_elem_size = @sizeOf(InPort.Elem),
+        };
+        self.edge_count += 1;
+    }
+
+    fn typeCheckCoerce(comptime OutPort: type, comptime InPort: type) void {
+        if (comptime (!port.isPortId(OutPort) or !port.isPortId(InPort)))
+            @compileError("pan: connectCoerced requires two PortId handles");
+        if (OutPort.direction != .out)
+            @compileError("pan: connectCoerced source must be an output PortId");
+        if (InPort.direction != .in)
+            @compileError("pan: connectCoerced destination must be an input PortId");
+        if (comptime (!@hasDecl(OutPort.Elem, "channel_count") or !@hasDecl(InPort.Elem, "channel_count")))
+            @compileError("pan: connectCoerced is for channel-layout (Frame) ports only");
+        if (OutPort.Elem.lane != InPort.Elem.lane)
+            @compileError("pan: connectCoerced reconciles only the channel LAYOUT — the lane type must match; " ++
+                "use an explicit precision cast for a lane change");
     }
 
     fn typeCheckConnect(comptime OutPort: type, comptime InPort: type) void {
