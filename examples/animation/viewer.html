@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>pan · constellation viewer (WebGL)</title>
+<!--
+  A real-time, GPU alternative to the offline Python renderer (examples/render_viz_v2.py).
+
+  It reads the SAME pan feature matrix (the headerless `<base>.f32` + `<base>.json`
+  sidecar that examples/analyze.zig emits) and renders the icy crystalline
+  constellation in the browser with three.js. All the per-point behaviour — feature
+  placement, the recency fade, and the birth pulse — runs in GLSL shaders, so the
+  whole field draws every frame on the GPU at 60 fps and you can orbit/scrub it live,
+  instead of waiting minutes for matplotlib to rasterize each frame on the CPU.
+
+  Run (the page fetch()es the matrix, so it needs a static server — not file://):
+      cd <repo root>
+      python3 -m http.server 8000      # or: .venv/bin/python -m http.server 8000
+      open http://localhost:8000/examples/animation/viewer.html?base=data/work/queen_of_the_night.features
+
+  ?base=<path-without-extension>   the feature matrix base (default below)
+  ?speed=<x>                       playback speed multiplier (default 1)
+  Controls: drag to orbit · scroll to zoom · space = play/pause · the slider scrubs time.
+-->
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden;
+               font-family: ui-monospace, Menlo, Consolas, monospace; color: #9fb6d8; }
+  #hud { position: fixed; left: 14px; bottom: 12px; font-size: 12px; line-height: 1.5;
+         text-shadow: 0 0 6px #0008; pointer-events: none; }
+  #hud .k { color: #54688f; }
+  #title { position: fixed; top: 10px; width: 100%; text-align: center; color: #dfe8fb;
+           font-weight: 700; font-size: 14px; pointer-events: none; }
+  #legend { position: fixed; right: 14px; bottom: 12px; font-size: 11px; color: #9ec3f0; }
+  #bar { position: fixed; left: 0; right: 0; bottom: 0; display: flex; gap: 8px;
+         align-items: center; padding: 6px 12px; background: #0006; }
+  #bar input[type=range] { flex: 1; }
+  #cbar { position: fixed; top: 34px; left: 50%; transform: translateX(-50%);
+          width: 360px; height: 12px; border: 1px solid #223; }
+  #cbar .lab { position: absolute; top: 14px; font-size: 10px; color: #9ec3f0; }
+  #err { position: fixed; left: 50%; top: 50%; transform: translate(-50%,-50%);
+         color: #ff9; max-width: 70%; text-align: center; }
+  button { background: #16213a; color: #cfe0ff; border: 1px solid #2a3550;
+           border-radius: 4px; padding: 3px 10px; cursor: pointer; }
+</style>
+</head>
+<body>
+<div id="title">pan · constellation</div>
+<canvas id="cbar"></canvas>
+<div id="hud"></div>
+<div id="legend">— frequency neighbours</div>
+<div id="bar">
+  <button id="play">⏸</button>
+  <input id="seek" type="range" min="0" max="1000" value="0" />
+  <span id="tlabel" style="font-size:11px;color:#9ec3f0;min-width:84px;text-align:right"></span>
+</div>
+<div id="err" style="display:none"></div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+}}
+</script>
+
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { LineSegments2 } from "three/addons/lines/LineSegments2.js";
+import { LineSegmentsGeometry } from "three/addons/lines/LineSegmentsGeometry.js";
+import { LineMaterial } from "three/addons/lines/LineMaterial.js";
+
+const q = new URLSearchParams(location.search);
+const BASE = q.get("base") || "data/work/queen_of_the_night.features";
+const SPEED = parseFloat(q.get("speed") || "1");
+const TITLE = q.get("title") || "";
+const ICE = [[0.169,0.290,0.471],[0.357,0.561,0.788],[0.663,0.824,0.949],
+             [0.910,0.957,1.0],[1,1,1]];  // matches render_viz_v2.ICE
+
+function fail(m){ const e=document.getElementById("err"); e.style.display="block";
+  e.textContent=m; throw new Error(m); }
+function lerp3(stops,u){ u=Math.min(1,Math.max(0,u)); const x=u*(stops.length-1);
+  const i=Math.min(stops.length-2,Math.floor(x)); const f=x-i;
+  return [0,1,2].map(k=>stops[i][k]+(stops[i+1][k]-stops[i][k])*f); }
+function pctile(arr,p){ const s=Float32Array.from(arr).sort(); const idx=(p/100)*(s.length-1);
+  const lo=Math.floor(idx),hi=Math.ceil(idx); return s[lo]+(s[hi]-s[lo])*(idx-lo); }
+function norm01(arr,p){ const hi=pctile(arr,p)||1; return arr.map(v=>Math.min(1,Math.max(0,v/hi))); }
+
+async function load() {
+  // Resolve `base` against the SERVER ROOT (the page lives in /examples/, so a
+  // bare relative path would wrongly resolve under /examples/). A leading "/" or a
+  // full URL is used as-is.
+  const root = (BASE.startsWith("http") || BASE.startsWith("/")) ? BASE : "/" + BASE;
+  let meta, buf;
+  try {
+    meta = await (await fetch(root + ".json")).json();
+    buf = await (await fetch(root + ".f32")).arrayBuffer();
+  } catch (e) { fail("could not fetch " + root + ".{json,f32} — serve the repo root over http (see the file header)"); }
+  const cols = meta.n_cols, fps = meta.fps, hzpb = meta.hz_per_bin;
+  const m = new Float32Array(buf);
+  const n = Math.floor(m.length / cols);
+  const off = {}; for (const c of meta.columns) off[c.name] = c.offset;
+
+  const get = (name, i) => m[i*cols + off[name]];
+  const dominant=[], amplitude=[], centroid=[], rolloff=[], flux=[];
+  for (let i=0;i<n;i++){ dominant.push(get("dominant",i)); amplitude.push(get("amplitude",i));
+    centroid.push(get("centroid",i)); rolloff.push(get("rolloff",i)); flux.push(get("flux",i)); }
+  const freq = dominant.map(d=>Math.max(d*hzpb,1));
+  let ampN = norm01(amplitude,98); if (Math.max(...ampN)<=0) ampN = norm01(amplitude.map((_,i)=>get("rms",i)),98);
+  const cenN=norm01(centroid,98), rolN=norm01(rolloff,98), fluxN=norm01(flux,97);
+
+  const flo=Math.max(20,pctile(freq,2)), fhi=Math.max(flo*2,pctile(freq,98));
+  const L2=Math.log2, lflo=L2(flo), lfhi=L2(fhi);
+  const GOLDEN=Math.PI*(3-Math.sqrt(5));
+
+  // feature placement (identical to render_viz_v2 / build_particles)
+  const pos=new Float32Array(n*3), col=new Float32Array(n*3),
+        emit=new Float32Array(n), amp=new Float32Array(n);
+  let cdrift=0;
+  for (let i=0;i<n;i++){
+    cdrift += (cenN[i]-0.5);
+    const lf=(L2(Math.min(Math.max(freq[i],flo),fhi))-lflo)/(lfhi-lflo);
+    const az=i*GOLDEN + 0.6*cdrift/fps;
+    const r=1+4.6*ampN[i]+2.2*fluxN[i];
+    pos[i*3]=r*Math.cos(az); pos[i*3+1]=(lf-0.5)*8+0.5*Math.sin(az*0.5); pos[i*3+2]=r*Math.sin(az);
+    const cv=(L2(Math.min(Math.max(freq[i],flo),fhi))-lflo)/(lfhi-lflo);
+    const c=lerp3(ICE,cv); col[i*3]=c[0]; col[i*3+1]=c[1]; col[i*3+2]=c[2];
+    emit[i]=i/fps; amp[i]=ampN[i];
+  }
+  const totalT=n/fps;
+
+  // grid-hash kNN mesh (frequency/feature neighbours), computed once
+  const K=4, edges=[];
+  (function buildMesh(){
+    let mn=[1e9,1e9,1e9], mx=[-1e9,-1e9,-1e9];
+    for(let i=0;i<n;i++)for(let k=0;k<3;k++){mn[k]=Math.min(mn[k],pos[i*3+k]);mx[k]=Math.max(mx[k],pos[i*3+k]);}
+    const ext=Math.max(mx[0]-mn[0],mx[1]-mn[1],mx[2]-mn[2])||1;
+    const cell=ext/Math.cbrt(n)*1.5||1, grid=new Map();
+    const key=(a,b,c)=>a+"_"+b+"_"+c;
+    const ci=i=>[Math.floor((pos[i*3]-mn[0])/cell),Math.floor((pos[i*3+1]-mn[1])/cell),Math.floor((pos[i*3+2]-mn[2])/cell)];
+    for(let i=0;i<n;i++){const[a,b,c]=ci(i);const k=key(a,b,c);(grid.get(k)||grid.set(k,[]).get(k)).push(i);}
+    const seen=new Set();
+    for(let i=0;i<n;i++){const[a,b,c]=ci(i);const cand=[];
+      for(let da=-1;da<=1;da++)for(let db=-1;db<=1;db++)for(let dc=-1;dc<=1;dc++){
+        const g=grid.get(key(a+da,b+db,c+dc)); if(g)for(const j of g) if(j!==i) cand.push(j);}
+      cand.sort((p,j)=>{const dp=(pos[p*3]-pos[i*3])**2+(pos[p*3+1]-pos[i*3+1])**2+(pos[p*3+2]-pos[i*3+2])**2;
+                        const dj=(pos[j*3]-pos[i*3])**2+(pos[j*3+1]-pos[i*3+1])**2+(pos[j*3+2]-pos[i*3+2])**2;return dp-dj;});
+      for(let t=0;t<Math.min(K,cand.length);t++){const j=cand[t];const lo=Math.min(i,j),hi=Math.max(i,j);
+        const ek=lo*n+hi; if(!seen.has(ek)){seen.add(ek);edges.push(lo,hi);}}}
+  })();
+
+  return {meta,n,fps,totalT,pos,col,emit,amp,freq,ampRaw:amplitude,edges,flo,fhi};
+}
+
+const D = await load();
+
+// ---------- three.js scene ----------
+const renderer = new THREE.WebGLRenderer({ canvas: document.createElement("canvas"),
+  antialias: true, preserveDrawingBuffer: true });  // preserve: headless screenshot capture
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(55, innerWidth/innerHeight, 0.1, 200);
+camera.position.set(0, 4, 22);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true; controls.autoRotate = true; controls.autoRotateSpeed = 0.5;
+
+// point pixel-size = sz * uScale / dist. uScale = camera distance × (height/800) so
+// `sz` is pixels-at-centre AND the crystals scale with resolution (stay the same
+// apparent size at 1080p as at 800p instead of shrinking).
+const CAMR = 11.0;  // camera orbit radius (world units) — closer = the structure fills more frame
+const uniforms = { uTime:{value:0}, uTau:{value:3.0}, uTp:{value:0.05}, uScale:{value:CAMR} };
+function updScale(){ uniforms.uScale.value = CAMR * (innerHeight / 800); }
+updScale();
+
+// points
+const pgeo = new THREE.BufferGeometry();
+pgeo.setAttribute("position", new THREE.BufferAttribute(D.pos,3));
+pgeo.setAttribute("aColor", new THREE.BufferAttribute(D.col,3));
+pgeo.setAttribute("aEmit", new THREE.BufferAttribute(D.emit,1));
+pgeo.setAttribute("aAmp", new THREE.BufferAttribute(D.amp,1));
+const pmat = new THREE.ShaderMaterial({
+  uniforms, transparent:true, depthTest:false, blending:THREE.AdditiveBlending,
+  vertexShader:`
+    uniform float uTime,uTau,uTp,uScale; attribute vec3 aColor; attribute float aEmit,aAmp;
+    varying vec3 vCol; varying float vA;
+    void main(){
+      float age=uTime-aEmit;
+      vCol=aColor;
+      if(age<0.0){ gl_Position=vec4(2.0,2.0,2.0,1.0); gl_PointSize=0.0; vA=0.0; return; }
+      float rec=0.10+0.90*exp(-age/uTau);
+      float gb=(age/uTp)*exp(1.0-age/uTp); gb=clamp(gb,0.0,1.0); gb=pow(gb,1.6);
+      float sz=4.5 + 5.0*aAmp + (9.0+22.0*aAmp)*gb;   // pixels at the reference distance
+      vA=clamp(rec*(0.34+0.50*aAmp)+0.52*gb, 0.06, 0.92);
+      vec4 mv=modelViewMatrix*vec4(position,1.0);
+      gl_PointSize=clamp(sz*uScale/(-mv.z), 0.0, 64.0);
+      gl_Position=projectionMatrix*mv;
+    }`,
+  fragmentShader:`
+    varying vec3 vCol; varying float vA;
+    void main(){ vec2 d=gl_PointCoord-0.5; float r=length(d);
+      if(r>0.5) discard; float a=vA*smoothstep(0.5,0.05,r); gl_FragColor=vec4(vCol,a); }`
+});
+scene.add(new THREE.Points(pgeo,pmat));
+
+// edges (frequency neighbours) — real fat lines (quad-based) so the width is
+// actually honoured (gl.LINES is capped at 1px on most GPUs). The mesh grows as the
+// piece plays: edges are sorted by their appear-time (= the later-emitted endpoint),
+// and each frame we draw only the leading prefix whose appear-time <= now.
+const E=D.edges.length/2;
+const eAppear=new Float32Array(E);
+for(let e=0;e<E;e++) eAppear[e]=Math.max(D.emit[D.edges[e*2]], D.emit[D.edges[e*2+1]]);
+const eord=Array.from({length:E},(_,e)=>e).sort((a,b)=>eAppear[a]-eAppear[b]);
+const epos=new Float32Array(E*6);
+const appearSorted=new Float32Array(E);
+for(let o=0;o<E;o++){ const e=eord[o]; const i=D.edges[e*2], j=D.edges[e*2+1];
+  for(let k=0;k<3;k++){ epos[o*6+k]=D.pos[i*3+k]; epos[o*6+3+k]=D.pos[j*3+k]; }
+  appearSorted[o]=eAppear[e]; }
+const lgeo=new LineSegmentsGeometry(); lgeo.setPositions(epos);
+const lmat=new LineMaterial({ color:0x86b4ee, transparent:true, opacity:0.5,
+  blending:THREE.AdditiveBlending, depthTest:false, linewidth:1.8 });  // linewidth in px
+lmat.resolution.set(innerWidth, innerHeight);
+const eseg=new LineSegments2(lgeo,lmat); eseg.frustumCulled=false; scene.add(eseg);
+function countLEQ(arr,t){ let lo=0,hi=arr.length; while(lo<hi){const m=(lo+hi)>>1; if(arr[m]<=t)lo=m+1; else hi=m;} return lo; }
+function updateEdges(tt){ lgeo.instanceCount = countLEQ(appearSorted, tt); }
+
+// colorbar
+(function(){ const c=document.getElementById("cbar"),x=c.getContext("2d");
+  c.width=360;c.height=12; for(let px=0;px<360;px++){ const cc=lerp3(ICE,px/359);
+    x.fillStyle=`rgb(${cc.map(v=>v*255|0).join(",")})`; x.fillRect(px,0,1,12);} })();
+document.getElementById("title").textContent = "pan · " + (TITLE || D.meta.title || BASE.split("/").pop());
+
+// time + UI
+const CAPTURE = q.get("capture")==="1";   // headless frame-stepping mode (no rAF)
+let playing=true, t=0; const seek=document.getElementById("seek"), tlab=document.getElementById("tlabel");
+const hud=document.getElementById("hud");
+document.getElementById("play").onclick=e=>{ playing=!playing; e.target.textContent=playing?"⏸":"▶"; };
+seek.oninput=()=>{ t=(seek.value/1000)*D.totalT; };
+addEventListener("keydown",e=>{ if(e.code==="Space"){ playing=!playing;
+  document.getElementById("play").textContent=playing?"⏸":"▶"; e.preventDefault(); }});
+addEventListener("resize",()=>{ renderer.setSize(innerWidth,innerHeight);
+  camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix(); updScale();
+  lmat.resolution.set(innerWidth,innerHeight); });
+
+// deterministic slow orbit (used in capture mode so frames don't depend on wall clock)
+function camAt(tt){ const ang=tt*0.10; const rad=CAMR, h=2.5+2.0*Math.sin(tt*0.05);
+  camera.position.set(rad*Math.cos(ang), h, rad*Math.sin(ang)); camera.lookAt(0,0,0); }
+function hudFor(tt){ const cur=Math.min(D.n-1, Math.max(0,Math.floor(tt*D.fps)));
+  hud.innerHTML =
+    `<span class="k">current point</span><br>`+
+    `COLOR / FREQUENCY  ${D.freq[cur].toFixed(1).padStart(8)} Hz<br>`+
+    `SIGNAL AMPLITUDE   ${D.ampRaw[cur].toFixed(4).padStart(8)}<br>`+
+    `LIFETIME           ${uniforms.uTau.value.toFixed(2).padStart(8)} s<br>`+
+    `EMISSION TIME      ${(cur/D.fps).toFixed(4).padStart(8)} s`;
+  tlab.textContent=`${tt.toFixed(1)} / ${D.totalT.toFixed(0)} s`; }
+
+// the headless capture API: a driver sets each frame's time and renders one frame.
+function renderAt(tt){ uniforms.uTime.value=tt;
+  camAt(tt); updateEdges(tt); hudFor(tt); renderer.render(scene,camera); }
+window.panViewer = { ready:true, totalT:D.totalT, fps:D.fps, n:D.n, renderAt };
+
+const last0=performance.now();
+let last=last0;
+function frame(now){
+  const dt=Math.min(0.05,(now-last)/1000); last=now;
+  if(playing){ t+=dt*SPEED; if(t>D.totalT) t=0; seek.value=(t/D.totalT)*1000|0; }
+  uniforms.uTime.value=t; updateEdges(t); hudFor(t);
+  controls.update();
+  renderer.render(scene,camera);
+  requestAnimationFrame(frame);
+}
+if(CAPTURE){ controls.enabled=false; controls.autoRotate=false; renderAt(0); }
+else { requestAnimationFrame(frame); }
+</script>
+</body>
+</html>

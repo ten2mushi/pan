@@ -9,9 +9,28 @@ zig-out/
 /tests/vectors/**/*.pcm
 /tests/vectors/**/*.npy
 
-# Local audio test inputs (large binary media). Not committed — the brief's
-# disk-minimal requirement; supply your own clips under data/input/.
-/data/
+# --- data/ ---------------------------------------------------------------
+# Inputs ARE committed (data/input/<source>/<source>_lpcm.wav + metadata), EXCEPT:
+#  - source video containers (.mkv) — large, redundant with the decoded LPCM;
+#  - files that exceed GitHub's 100 MB per-file limit (the Nature Sounds clip's
+#    1.6 GB .webm and 513 MB .wav — a push would be rejected). Use Git LFS if you
+#    really need them tracked.
+/data/input/**/*.mkv
+/data/input/Nature Sounds – European Birds Singing/*.webm
+/data/input/Nature Sounds – European Birds Singing/*_lpcm.wav
+# Intermediates (decoded mono LPCM, feature matrices) — regenerated on demand.
+/data/work/
+# Staging area for outputs not (yet) chosen for commit.
+/data/output/ignore/
+
+# Project docs / specs kept local (not tracked).
+/specifications/
+/notes/
+/research/
+/dev-notes/
+/archive/
+/CLAUDE.md
+/CONTRIBUTING.md
 
 # Python
 __pycache__/
@@ -25,3 +44,7 @@ venv/
 
 # Local Claude Code agent state (session locks, not project content)
 .claude/
+
+# Node (puppeteer capture tooling)
+node_modules/
+package-lock.json

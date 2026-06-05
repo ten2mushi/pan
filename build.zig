@@ -111,6 +111,7 @@ pub fn build(b: *std.Build) void {
         "tests/feat_yoneda_test.zig",
         "tests/analysis_yoneda_test.zig",
         "tests/analysis_buildout_test.zig",
+        "tests/examples_analysis_smoke_test.zig",
         "tests/feat_spectral_shape_yoneda_test.zig",
         "tests/feat_chroma_contrast_yoneda_test.zig",
         "tests/feat_timedomain_yoneda_test.zig",
@@ -237,7 +238,7 @@ pub fn build(b: *std.Build) void {
     docs_step.dependOn(&docs.step);
 
     // ---- Formatting gate -----------------------------------------------
-    const fmt = b.addFmt(.{ .paths = &.{ "src", "build.zig", "tests", "bench" }, .check = true });
+    const fmt = b.addFmt(.{ .paths = &.{ "src", "build.zig", "tests", "bench", "examples" }, .check = true });
     const fmt_step = b.step("fmt-check", "Verify formatting (CI gate)");
     fmt_step.dependOn(&fmt.step);
 
@@ -258,6 +259,33 @@ pub fn build(b: *std.Build) void {
     const linux_lib = b.addLibrary(.{ .name = "pan-linux", .root_module = linux_mod, .linkage = .static });
     const cross_step = b.step("cross-linux", "Cross-compile the pan lib for x86_64-linux-gnu (ALSA seam gate)");
     cross_step.dependOn(&linux_lib.step);
+
+    // ---- Examples (Phase 17 — the brief's end-to-end demonstrators) ----
+    // Each examples/*.zig is an executable importing pan. The Analyzer example
+    // takes a decoded LPCM file and emits the feature matrix the Python renderer
+    // draws. They are BUILT by the `examples` step (and installed so the Python
+    // pipeline driver can invoke the binary); they are not auto-run here because
+    // they take a file path argument.
+    const examples_step = b.step("examples", "Build the Phase-17 example executables");
+    const examples = [_][]const u8{
+        "examples/animation/analyze.zig",
+        "examples/spectrogram/spectrogram.zig",
+    };
+    for (examples) |path| {
+        const ex_mod = b.createModule(.{
+            .root_source_file = b.path(path),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "pan", .module = pan_mod }},
+        });
+        linkPlatformAudio(target, ex_mod);
+        const ex_exe = b.addExecutable(.{
+            .name = b.fmt("example-{s}", .{std.fs.path.stem(path)}),
+            .root_module = ex_mod,
+        });
+        const ex_install = b.addInstallArtifact(ex_exe, .{});
+        examples_step.dependOn(&ex_install.step);
+    }
 
     // ---- Benchmarks (measurement, not correctness) --------------------
     // Each bench/*.zig is a ReleaseFast executable importing pan. Benches MEASURE
