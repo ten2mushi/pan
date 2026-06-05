@@ -12,6 +12,56 @@
 
 ---
 
+## 0. Session 15 addendum — Tier-B cost model, calibration, throughput characterization
+
+A follow-up session deepened the Tier-B executor (still P15 territory; P16 is unstarted).
+Commits: `50ae14c` (checkpoint) · `ef666cc` (fail-loud node cap + realistic-kernel bench) ·
+`8893552` (per-kernel cost model + calibration) · `2e376bc` (calibrate feedback fix +
+no-workgroup spin bound + FFT/vDSP bench). All green:
+`Debug/ReleaseSafe/ReleaseFast/cross-linux/fmt` exit 0, TSan-clean on the 3 thread-spawning
+suites.
+
+**What shipped:**
+- **Per-kernel cost model.** A block may declare `pub const cost_hint: f32` (relative compute
+  per output sample, default 1.0); it flows `GraphNode.cost_hint` → `RenderOp.cost_hint` →
+  `CostModel.fromPlan` (`cost = (1+bytes)·hint`). Fixes the byte-volume model that weighed a
+  cheap adder == a heavy biquad and so under-sized the worker count. **Effect (quiesced M3
+  Max): the gate sizes workers 5→8 (`par` 4.6→8.0), ~30–40% more density; HEFT 4.53×@8.**
+- **Profile-guided calibration.** `Engine.calibrate(k)` renders `k` warm-up blocks under a
+  sequential replay (in schedule order — the colored plan's reuse anti-deps require it),
+  times each op via a monotonic tick source, and rebuilds the schedule from measured cost.
+  It is **state-neutral**: byte-snapshots every block instance, measures, rebinds, then
+  restores the instances and zeros the per-edge pool, so the warm-up's state advance is fully
+  rolled back (`BoundNode.instance_bytes` backs the snapshot). Off the RT path.
+- **Fail-loud node cap.** `builder.add` returns `error.GraphFull` and core `graph.add` panics
+  at `max_nodes` instead of a silent over-run (was a bench segfault).
+- **No-workgroup spin is now bounded.** The cross-worker/join/barrier spins **yield past a
+  threshold** (never reached under a real workgroup → zero steady-state cost; a backstop for
+  the degraded dev/CI mode), and the parallel test suites are **chained to run one at a time**
+  in `build.zig` so they don't oversubscribe (P1a sizing P higher exposed this).
+
+**Yoneda (Rule 14), 2 writers, +7 tests, 1 real bug found & fixed:** `calibrate(k≥1)` on a
+pool-resident `z⁻¹` feedback graph corrupted the feedback state (the rebind's recolor rebased
+the persistent tail without carrying the values). Fixed by the state-neutral calibrate above;
+the gated regression is un-gated and passes (TSan-clean). The cost_hint tests include an
+extreme-1e6-hint bit-exact differential.
+
+**Throughput characterization — the load-bearing finding** (`dev-notes/tier-b-cost-model-
+throughput-assessment.md`; `zig build bench-vdsp`):
+- **pan is first-principles / from-scratch — no external DSP library (no vDSP/FFTW/CMSIS).**
+  vDSP is a *yardstick only* (the comparison bench links Accelerate; the shipped core does
+  not). Closing any gap means writing pan's *own* faster kernels.
+- **Biquad: pan/vDSP ≈3.5×, FLAT** — pure *abstraction overhead*, not a kernel deficit
+  (`pan ≡ bare`, and a bare Zig loop *beats* vDSP). The lever is **fusion** (already
+  3.8×-measured on the feedback bench / the comptime Executor inlines a whole chain).
+- **FFT: pan/vDSP 10.7×→15.6×, GROWS with N** — the *one genuine per-core kernel gap*
+  (algorithmic: radix-2 vs split-radix + vectorized butterflies). Closing it is real Zig
+  kernel work (a from-scratch split-radix / real FFT), the biggest single-core win.
+- The Compute HAL already gives **iOS NEON for free** (aarch64, same as M3); the only
+  iOS-*specific* work is the I/O backend (RemoteIO/AVAudioSession), a transport, not a kernel.
+
+---
+
 ## 1. Ownership statement (honest, Rule 12)
 
 The P15 **gate** (plan §15 success criteria):
