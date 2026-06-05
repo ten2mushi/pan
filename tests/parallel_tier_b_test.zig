@@ -76,6 +76,41 @@ const Add2 = struct {
     }
 };
 
+/// A heavily-hinted affine voice: its rendered output is the SAME affine map as
+/// `Affine`, but it advertises a large `cost_hint`. The hint must change only the
+/// Tier-B schedule (worker sizing / op placement), never the samples — exactly the
+/// load-bearing invariant the differential below proves. The kernel is identical to
+/// the unhinted `Affine` so a byte-for-byte comparison against an unhinted graph of
+/// the same shape is well-defined.
+const HeavyVoice = struct {
+    const Self = @This();
+    /// ~16× the per-sample intensity of a plain copy/add — a stand-in for a biquad
+    /// cascade or short FFT voice. Pure scheduler metadata; the math below is cheap.
+    pub const cost_hint: f32 = 16.0;
+    a: f32 = 1.0,
+    b: f32 = 0.0,
+    pub fn process(self: *Self, in: []const Sample(f32), out: []Sample(f32)) void {
+        for (in, out) |x, *o| o.ch[0] = x.ch[0] * self.a + self.b;
+    }
+};
+
+/// The SAME affine kernel as `Affine`/`HeavyVoice`, but advertising a pathologically
+/// large `cost_hint`. The invariant must hold at extreme hint magnitudes too: a buggy
+/// scheduler that let a huge cost overflow to NaN/Inf and reorder ops would diverge
+/// from the sequential reference, whereas a correct one ignores the hint for the
+/// samples entirely. Same coefficients ⇒ byte-identical to `Affine` of the same shape.
+const ExtremeVoice = struct {
+    const Self = @This();
+    /// A hint far beyond any realistic kernel — stresses the cost arithmetic without
+    /// touching the rendered math.
+    pub const cost_hint: f32 = 1.0e6;
+    a: f32 = 1.0,
+    b: f32 = 0.0,
+    pub fn process(self: *Self, in: []const Sample(f32), out: []Sample(f32)) void {
+        for (in, out) |x, *o| o.ch[0] = x.ch[0] * self.a + self.b;
+    }
+};
+
 fn cfg(comptime N: usize) pan.Config {
     return .{ .precision = .f32, .channels = .mono, .block_size = N };
 }
@@ -101,6 +136,49 @@ fn buildWide(alloc: std.mem.Allocator, comptime N: usize, input: *const [N]Sampl
     const a2 = try bg.add(Affine, .{ .a = -0.5, .b = 0.21 });
     const g3 = try bg.add(Gain, .{ .gain = 0.3001 });
     const a3 = try bg.add(Affine, .{ .a = 1.07, .b = -0.001 });
+    const s01 = try bg.add(Add2, .{});
+    const s23 = try bg.add(Add2, .{});
+    const stop = try bg.add(Add2, .{});
+    const sink = try bg.add(BufSink, .{ .dest = @as([*]Sample(f32), out) });
+
+    try bg.connect(src, g0);
+    try bg.connect(src, g1);
+    try bg.connect(src, g2);
+    try bg.connect(src, g3);
+    try bg.connect(g0, a0);
+    try bg.connect(g1, a1);
+    try bg.connect(g2, a2);
+    try bg.connect(g3, a3);
+    try bg.connect(a0, s01.in.x);
+    try bg.connect(a1, s01.in.y);
+    try bg.connect(a2, s23.in.x);
+    try bg.connect(a3, s23.in.y);
+    try bg.connect(s01, stop.in.x);
+    try bg.connect(s23, stop.in.y);
+    try bg.connect(stop, sink);
+
+    return bg.commitWith(opts);
+}
+
+/// Build the SAME wide fan-out shape as `buildWide`, but the four arms' affine stages
+/// are the compile-time block type `Aff` — either the unhinted `Affine` or the
+/// `HeavyVoice` (which renders the identical affine map but advertises a large
+/// `cost_hint`). The coefficients are chosen so that `HeavyVoice{ .a, .b }` and
+/// `Affine{ .a, .b }` with the same coefficients render bit-identically; only the
+/// scheduler-visible hint differs. This lets a hinted graph be compared byte-for-byte
+/// against an unhinted graph of the same shape AND against its own sequential render.
+fn buildWideAff(comptime Aff: type, alloc: std.mem.Allocator, comptime N: usize, input: *const [N]Sample(f32), out: *[N]Sample(f32), opts: engine.EngineOptions) !engine.Engine {
+    var bg = pan.Graph.init(alloc, cfg(N));
+    errdefer bg.deinit();
+    const src = try bg.add(BufSource, .{ .data = @as([*]const Sample(f32), input) });
+    const g0 = try bg.add(Gain, .{ .gain = 0.5012 });
+    const a0 = try bg.add(Aff, .{ .a = 1.31, .b = -0.07 });
+    const g1 = try bg.add(Gain, .{ .gain = 0.7734 });
+    const a1 = try bg.add(Aff, .{ .a = 0.92, .b = 0.013 });
+    const g2 = try bg.add(Gain, .{ .gain = 1.211 });
+    const a2 = try bg.add(Aff, .{ .a = -0.5, .b = 0.21 });
+    const g3 = try bg.add(Gain, .{ .gain = 0.3001 });
+    const a3 = try bg.add(Aff, .{ .a = 1.07, .b = -0.001 });
     const s01 = try bg.add(Add2, .{});
     const s23 = try bg.add(Add2, .{});
     const stop = try bg.add(Add2, .{});
@@ -644,4 +722,173 @@ test "op-DAG: a wide fan-in is bit-exact under the level barrier and HEFT (no to
         if (dag.preds[op] != 0) non_root += 1;
     }
     try std.testing.expect(non_root >= dag.n - 1); // only the single source is a root
+}
+
+// ===========================================================================
+// 11. cost_hint — the per-kernel compute-intensity multiplier. It must (a) LIFT the
+//     gate's achievable-parallelism estimate / worker sizing for a bank of heavy
+//     voices vs the same shape with cheap plumbing, and (b) NEVER change the rendered
+//     samples: a Tier-B parallel render of a heavily-hinted graph is BIT-EXACT to the
+//     Tier-A sequential render of the same graph, AND to an unhinted graph of the same
+//     shape. The hint is scheduler-only metadata — a wrong hint costs throughput,
+//     never correctness.
+// ===========================================================================
+
+test "cost_hint: heavy voices lift the gate's parallelism estimate vs cheap plumbing" {
+    // The hint's PURPOSE: a wide bank of compute-heavy voices is more worth
+    // parallelising than the same topology made of trivial copies. With the heavy
+    // hint the per-op work of each arm dominates the (light) reduction/plumbing, so
+    // the work/span ratio — and thus the gate's achievable-parallelism estimate —
+    // must be strictly higher than for the identical shape with default-1.0 arms.
+    const N = 32;
+    const alloc = std.testing.allocator;
+    var input: [N]Sample(f32) = undefined;
+    fillNoise(&input, 0x600D11);
+    var out_cheap: [N]Sample(f32) = undefined;
+    var out_heavy: [N]Sample(f32) = undefined;
+
+    // Same shape, same coefficients; the ONLY difference is the arms' cost_hint
+    // (1.0 default vs 16.0). Both forced through the workgroup so promotion is decided
+    // purely by the gate's W/S verdict, not workgroup availability.
+    var cheap = try buildWideAff(Affine, alloc, N, &input, &out_cheap, .{ .cores = 4, .force_workgroup = true });
+    defer cheap.deinit();
+    var heavy = try buildWideAff(HeavyVoice, alloc, N, &input, &out_heavy, .{ .cores = 4, .force_workgroup = true });
+    defer heavy.deinit();
+
+    // Both promote (the wide shape is parallel either way) ...
+    try std.testing.expect(cheap.tierBActive());
+    try std.testing.expect(heavy.tierBActive());
+    // ... but the heavy-hinted bank exposes MORE achievable parallelism: the heavy arms
+    // outweigh the light reduction tree, lifting the work/span ratio. This is the hint
+    // doing its job — it lifts the worker-count sizing for compute-heavy graphs.
+    try std.testing.expect(heavy.tierBParallelism() > cheap.tierBParallelism());
+    // And the lift is enough to size at least as many workers as the cheap version
+    // (the hint never SHRINKS the achievable parallelism).
+    try std.testing.expect(heavy.tierBWorkers() >= cheap.tierBWorkers());
+}
+
+test "cost_hint INVARIANCE: a heavily-hinted Tier-B render is BIT-EXACT to Tier-A sequential" {
+    // THE LOAD-BEARING INVARIANT. The hint must change ONLY the schedule, never the
+    // samples. We render the SAME heavily-hinted graph two ways — Tier-A sequential and
+    // Tier-B parallel (both executors, several worker counts) — and require byte-for-
+    // byte equality across many blocks (the feedback-free state still must match every
+    // callback).
+    const N = 64;
+    const alloc = std.testing.allocator;
+    var input: [N]Sample(f32) = undefined;
+    fillNoise(&input, 0xC0571117);
+
+    const token = engine.enterRealtimeThread();
+    defer token.leave();
+
+    inline for (.{ pan.TierBExecutor.level_barrier, pan.TierBExecutor.heft }) |exe| {
+        var p: usize = 2;
+        while (p <= 8) : (p += 1) {
+            var out_a: [N]Sample(f32) = undefined;
+            var out_b: [N]Sample(f32) = undefined;
+            // Tier A: sequential reference of the HEAVILY-HINTED graph.
+            var eng_a = try buildWideAff(HeavyVoice, alloc, N, &input, &out_a, .{});
+            defer eng_a.deinit();
+            // Tier B: parallel render of the SAME hinted graph.
+            var eng_b = try buildWideAff(HeavyVoice, alloc, N, &input, &out_b, .{ .cores = p, .force_workgroup = true, .tier_b_executor = exe });
+            defer eng_b.deinit();
+            try std.testing.expect(eng_b.tierBActive()); // must actually parallelise
+            try std.testing.expect(eng_b.tierBWorkers() >= 2);
+
+            var block: usize = 0;
+            while (block < 8) : (block += 1) {
+                eng_a.renderInto(token);
+                eng_b.renderInto(token);
+                // Bit-exact: the hint touched the schedule, not a single sample.
+                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(out_a[0..]), std.mem.sliceAsBytes(out_b[0..]));
+            }
+            try std.testing.expect(!eng_a.telemetry().fault);
+            try std.testing.expect(!eng_b.telemetry().fault);
+        }
+    }
+}
+
+test "cost_hint INVARIANCE: hinted vs unhinted graphs of the same shape render identically" {
+    // The complementary half of the invariant: because the hint is pure scheduler
+    // metadata, a graph with heavily-hinted arms must render byte-for-byte the same as
+    // the identical-shape graph with default (1.0) arms — the two differ ONLY in the
+    // schedule the gate picks, not in the samples. Tier-A-vs-Tier-A and Tier-B-vs-
+    // Tier-B are both pinned.
+    const N = 64;
+    const alloc = std.testing.allocator;
+    var input: [N]Sample(f32) = undefined;
+    fillNoise(&input, 0x5A4E54AE);
+
+    const token = engine.enterRealtimeThread();
+    defer token.leave();
+
+    var out_cheap_seq: [N]Sample(f32) = undefined;
+    var out_heavy_seq: [N]Sample(f32) = undefined;
+    var out_cheap_par: [N]Sample(f32) = undefined;
+    var out_heavy_par: [N]Sample(f32) = undefined;
+
+    var cheap_seq = try buildWideAff(Affine, alloc, N, &input, &out_cheap_seq, .{});
+    defer cheap_seq.deinit();
+    var heavy_seq = try buildWideAff(HeavyVoice, alloc, N, &input, &out_heavy_seq, .{});
+    defer heavy_seq.deinit();
+    var cheap_par = try buildWideAff(Affine, alloc, N, &input, &out_cheap_par, .{ .cores = 4, .force_workgroup = true, .tier_b_executor = .heft });
+    defer cheap_par.deinit();
+    var heavy_par = try buildWideAff(HeavyVoice, alloc, N, &input, &out_heavy_par, .{ .cores = 4, .force_workgroup = true, .tier_b_executor = .heft });
+    defer heavy_par.deinit();
+    try std.testing.expect(heavy_par.tierBActive());
+
+    var block: usize = 0;
+    while (block < 8) : (block += 1) {
+        cheap_seq.renderInto(token);
+        heavy_seq.renderInto(token);
+        cheap_par.renderInto(token);
+        heavy_par.renderInto(token);
+        const c_seq = std.mem.sliceAsBytes(out_cheap_seq[0..]);
+        // Sequential: hinting an arm cannot move a sample.
+        try std.testing.expectEqualSlices(u8, c_seq, std.mem.sliceAsBytes(out_heavy_seq[0..]));
+        // Parallel: same — and the parallel renders also match the sequential one, so
+        // all four outputs are byte-identical every block.
+        try std.testing.expectEqualSlices(u8, c_seq, std.mem.sliceAsBytes(out_cheap_par[0..]));
+        try std.testing.expectEqualSlices(u8, c_seq, std.mem.sliceAsBytes(out_heavy_par[0..]));
+    }
+}
+
+test "cost_hint INVARIANCE: an EXTREME (1e6) hint still renders bit-exact to Tier-A sequential" {
+    // The invariant must not depend on the hint's magnitude. With a 1e6 hint the
+    // per-op cost is enormous, yet the rendered samples are untouched: a Tier-B
+    // parallel render of the extreme-hinted graph stays byte-for-byte equal to the
+    // Tier-A sequential render of the SAME graph (across both executors and several
+    // worker counts). A scheduler that overflowed the cost into NaN/Inf and reordered
+    // would break this; a correct one keeps the samples independent of the hint.
+    const N = 64;
+    const alloc = std.testing.allocator;
+    var input: [N]Sample(f32) = undefined;
+    fillNoise(&input, 0xE47A3E);
+
+    const token = engine.enterRealtimeThread();
+    defer token.leave();
+
+    inline for (.{ pan.TierBExecutor.level_barrier, pan.TierBExecutor.heft }) |exe| {
+        var p: usize = 2;
+        while (p <= 8) : (p += 1) {
+            var out_a: [N]Sample(f32) = undefined;
+            var out_b: [N]Sample(f32) = undefined;
+            var eng_a = try buildWideAff(ExtremeVoice, alloc, N, &input, &out_a, .{});
+            defer eng_a.deinit();
+            var eng_b = try buildWideAff(ExtremeVoice, alloc, N, &input, &out_b, .{ .cores = p, .force_workgroup = true, .tier_b_executor = exe });
+            defer eng_b.deinit();
+            try std.testing.expect(eng_b.tierBActive());
+
+            var block: usize = 0;
+            while (block < 6) : (block += 1) {
+                eng_a.renderInto(token);
+                eng_b.renderInto(token);
+                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(out_a[0..]), std.mem.sliceAsBytes(out_b[0..]));
+                // No NaN/Inf escapes to the sink despite the enormous hint.
+                for (out_b) |s| try std.testing.expect(std.math.isFinite(s.ch[0]));
+            }
+            try std.testing.expect(!eng_a.telemetry().fault);
+            try std.testing.expect(!eng_b.telemetry().fault);
+        }
+    }
 }

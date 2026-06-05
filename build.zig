@@ -132,6 +132,13 @@ pub fn build(b: *std.Build) void {
         "tests/parallel_concurrent_yoneda_test.zig",
         "tests/parallel_ratparam_yoneda_test.zig",
     };
+    // The Tier-B suites (`parallel_*`) each spawn up to `ncores` workers that bounded-spin
+    // on cross-worker ready-flags. Running several at once oversubscribes the cores, and
+    // without a real render workgroup the descheduled workers thrash (the same pathology
+    // the workgroup HAL exists to bound). So the parallel suites are CHAINED to run one at
+    // a time — each gets the whole machine — while the single-threaded suites still run
+    // concurrently. (The runtime also yields past a spin threshold as a backstop.)
+    var prev_parallel: ?*std.Build.Step = null;
     for (harnesses) |path| {
         const h_mod = b.createModule(.{
             .root_source_file = b.path(path),
@@ -141,7 +148,12 @@ pub fn build(b: *std.Build) void {
         });
         linkPlatformAudio(target, h_mod);
         const h_test = b.addTest(.{ .root_module = h_mod });
-        test_step.dependOn(&b.addRunArtifact(h_test).step);
+        const h_run = b.addRunArtifact(h_test);
+        test_step.dependOn(&h_run.step);
+        if (std.mem.startsWith(u8, std.fs.path.basename(path), "parallel_")) {
+            if (prev_parallel) |pp| h_run.step.dependOn(pp);
+            prev_parallel = &h_run.step;
+        }
     }
 
     // ---- Negative-compile gate: the P8 "missing Rate declaration" build error
@@ -290,7 +302,12 @@ pub fn build(b: *std.Build) void {
         linkPlatformAudio(target, vdsp_mod); // libc + pan's CoreAudio externs
         vdsp_mod.linkFramework("Accelerate", .{});
         const vdsp_exe = b.addExecutable(.{ .name = "bench-vdsp-compare", .root_module = vdsp_mod });
-        bench_step.dependOn(&b.addRunArtifact(vdsp_exe).step);
+        const vdsp_run = b.addRunArtifact(vdsp_exe);
+        bench_step.dependOn(&vdsp_run.step);
+        // A dedicated step to run ONLY the vDSP comparison (biquad + real-FFT), so it
+        // can be measured without the full bench suite.
+        const vdsp_step = b.step("bench-vdsp", "Run only the pan-vs-Apple-vDSP comparison bench (macOS)");
+        vdsp_step.dependOn(&vdsp_run.step);
     }
 }
 

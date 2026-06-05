@@ -85,6 +85,21 @@ const Add2 = struct {
     }
 };
 
+/// A block whose RENDERED behavior is a trivial pass-through, but which advertises a
+/// large per-output-sample compute intensity via `pub const cost_hint`. The hint is a
+/// scheduler-only annotation: a wrong hint costs throughput, never correctness, so the
+/// kernel here is deliberately cheap to prove the hint is independent of the samples.
+const HeavyKernel = struct {
+    const Self = @This();
+    /// Declares this kernel ~12× heavier per output sample than a plain copy/add, so
+    /// the parallel cost model weights a bank of these as the dominant work.
+    pub const cost_hint: f32 = 12.0;
+    pub fn process(self: *Self, in: []const Sample(f32), out: []Sample(f32)) void {
+        _ = self;
+        @memcpy(out, in);
+    }
+};
+
 fn cfg(comptime N: usize) pan.Config {
     return .{ .precision = .f32, .channels = .mono, .block_size = N };
 }
@@ -727,6 +742,231 @@ test "CostModel.fromPlan: a zero-output, zero-input op still carries the per-op 
     plan.ops[0] = .{}; // no inputs, no outputs
     const m = parallel.CostModel.fromPlan(plan);
     try std.testing.expectEqual(@as(f32, 1.0), m.cost[0]); // the 1.0 floor
+}
+
+// ---------------------------------------------------------------------------
+// 4b. cost_hint — the per-kernel compute-intensity multiplier flows
+//     GraphNode → RenderOp → CostModel, scales the per-op cost EXACTLY, defaults
+//     to a no-op (1.0), and is monotone. The hint changes ONLY the cost model
+//     (hence the schedule); the rendered samples are pinned bit-exact by the
+//     differential in parallel_tier_b_test.zig.
+//
+// The CostModel formula it must obey, restated in plain prose so this file stands
+// alone: per-op cost = (1.0 + output_bytes) × cost_hint, where output_bytes is the
+// summed byte length of the op's output buffers (or, for a sink with no outputs,
+// its input buffers). The "+1.0" is a per-op floor so nothing is free; cost_hint is
+// a pure multiplier on the whole (floor + volume) term.
+// ---------------------------------------------------------------------------
+
+test "cost_hint: a hint of H scales the WHOLE per-op cost (floor + volume) by exactly H" {
+    // op0 writes buffer 3 (40 bytes) with a hint of 5.0; op1 is a sink reading
+    // buffer 3 with the default hint. The producer's cost must be (1.0 + 40)·5 = 205;
+    // the unhinted sink stays (1.0 + 40)·1 = 41. The hint multiplies the per-op floor
+    // too, not just the data volume — it is a pure scalar on the whole term.
+    var plan: DummyPlan = .{ .op_count = 2 };
+    plan.buffer_byte_len[3] = 40;
+    plan.ops[0] = .{ .output_buffer_ids = .{ 3, 0, 0, 0, 0, 0, 0, 0 }, .output_count = 1, .cost_hint = 5.0 };
+    plan.ops[1] = .{ .input_buffer_ids = .{ 3, 0, 0, 0, 0, 0, 0, 0 }, .input_count = 1 };
+    const m = parallel.CostModel.fromPlan(plan);
+    try std.testing.expectEqual(@as(f32, 205.0), m.cost[0]); // (1+40)·5
+    try std.testing.expectEqual(@as(f32, 41.0), m.cost[1]); // default 1.0 ⇒ unchanged
+}
+
+test "cost_hint: the default 1.0 reproduces the prior byte-proportional cost EXACTLY" {
+    // An unannotated plan (every op's hint at the struct default 1.0) must yield the
+    // identical cost the byte-only model produced. We build two plans differing ONLY
+    // in that one explicitly sets each hint to 1.0; their cost vectors are bit-equal.
+    var implicit: DummyPlan = .{ .op_count = 3 };
+    implicit.buffer_byte_len[1] = 16;
+    implicit.buffer_byte_len[2] = 64;
+    implicit.ops[0] = .{ .output_buffer_ids = .{ 1, 0, 0, 0, 0, 0, 0, 0 }, .output_count = 1 };
+    implicit.ops[1] = .{ .input_buffer_ids = .{ 1, 0, 0, 0, 0, 0, 0, 0 }, .input_count = 1, .output_buffer_ids = .{ 2, 0, 0, 0, 0, 0, 0, 0 }, .output_count = 1 };
+    implicit.ops[2] = .{ .input_buffer_ids = .{ 2, 0, 0, 0, 0, 0, 0, 0 }, .input_count = 1 };
+
+    var explicit = implicit;
+    explicit.ops[0].cost_hint = 1.0;
+    explicit.ops[1].cost_hint = 1.0;
+    explicit.ops[2].cost_hint = 1.0;
+
+    const mi = parallel.CostModel.fromPlan(implicit);
+    const me = parallel.CostModel.fromPlan(explicit);
+    // Bit-exact: an explicit 1.0 is indistinguishable from the absent (defaulted) hint.
+    try std.testing.expectEqualSlices(f32, mi.cost[0..mi.n], me.cost[0..me.n]);
+    // And the values are the bare byte-proportional figures (no hidden scaling).
+    try std.testing.expectEqual(@as(f32, 17.0), mi.cost[0]); // 1 + 16
+    try std.testing.expectEqual(@as(f32, 65.0), mi.cost[1]); // 1 + 64
+    try std.testing.expectEqual(@as(f32, 65.0), mi.cost[2]); // sink weighted by its input (b2)
+}
+
+test "cost_hint: fromPlan cost is STRICTLY monotone in the hint for fixed data volume" {
+    // The law the gate's parallelism estimate rests on: a higher hint ⇒ a strictly
+    // higher per-op cost when the byte volume is held constant. Sweep the hint upward
+    // on a single fixed-volume op; the cost must increase at every step.
+    var prev: f32 = -1.0;
+    var hint: f32 = 0.5;
+    while (hint <= 8.0) : (hint += 0.5) {
+        var plan: DummyPlan = .{ .op_count = 1 };
+        plan.buffer_byte_len[1] = 32; // fixed data volume
+        plan.ops[0] = .{ .output_buffer_ids = .{ 1, 0, 0, 0, 0, 0, 0, 0 }, .output_count = 1, .cost_hint = hint };
+        const m = parallel.CostModel.fromPlan(plan);
+        // cost = (1 + 32)·hint = 33·hint — strictly increasing in the hint.
+        try std.testing.expectApproxEqAbs(33.0 * hint, m.cost[0], 1e-3);
+        try std.testing.expect(m.cost[0] > prev); // strictly greater than the prior hint
+        prev = m.cost[0];
+    }
+}
+
+test "cost_hint: a hint below 1.0 makes a kernel CHEAPER (cheap plumbing under-weighted)" {
+    // The hint is two-sided: a value < 1.0 marks a kernel cheaper than its byte volume
+    // suggests (a trivial pass-through). op with 100 bytes and hint 0.25 ⇒ cost ¼ of
+    // the byte-proportional figure.
+    var plan: DummyPlan = .{ .op_count = 1 };
+    plan.buffer_byte_len[1] = 99; // (1 + 99) = 100 byte-proportional
+    plan.ops[0] = .{ .output_buffer_ids = .{ 1, 0, 0, 0, 0, 0, 0, 0 }, .output_count = 1, .cost_hint = 0.25 };
+    const m = parallel.CostModel.fromPlan(plan);
+    try std.testing.expectEqual(@as(f32, 25.0), m.cost[0]); // 100 · 0.25
+}
+
+test "cost_hint: a zero hint zeroes the op's cost (the multiplier is total)" {
+    // A degenerate but well-defined boundary: hint 0 ⇒ the op contributes nothing to
+    // work or span. (Not a sane production value, but the formula is a pure product, so
+    // it must hold — proving the hint multiplies the floor, not just the volume.)
+    var plan: DummyPlan = .{ .op_count = 1 };
+    plan.buffer_byte_len[1] = 40;
+    plan.ops[0] = .{ .output_buffer_ids = .{ 1, 0, 0, 0, 0, 0, 0, 0 }, .output_count = 1, .cost_hint = 0.0 };
+    const m = parallel.CostModel.fromPlan(plan);
+    try std.testing.expectEqual(@as(f32, 0.0), m.cost[0]);
+}
+
+test "cost_hint: distinct per-op hints are independent — each op scales by ITS OWN hint" {
+    // The hint is a PER-OP field, not a graph-wide constant. Three ops with three
+    // different hints and the SAME data volume must each scale by their own multiplier,
+    // with no cross-contamination — a global/shared-hint bug would make them equal.
+    var plan: DummyPlan = .{ .op_count = 3 };
+    plan.buffer_byte_len[1] = 9; // every op writes a 9-byte buffer ⇒ base = 1+9 = 10
+    plan.buffer_byte_len[2] = 9;
+    plan.buffer_byte_len[3] = 9;
+    plan.ops[0] = .{ .output_buffer_ids = .{ 1, 0, 0, 0, 0, 0, 0, 0 }, .output_count = 1, .cost_hint = 2.0 };
+    plan.ops[1] = .{ .output_buffer_ids = .{ 2, 0, 0, 0, 0, 0, 0, 0 }, .output_count = 1, .cost_hint = 7.0 };
+    plan.ops[2] = .{ .output_buffer_ids = .{ 3, 0, 0, 0, 0, 0, 0, 0 }, .output_count = 1, .cost_hint = 0.5 };
+    const m = parallel.CostModel.fromPlan(plan);
+    // base 10 × {2, 7, 0.5} = {20, 70, 5}: each op carries exactly its own hint.
+    try std.testing.expectEqual(@as(f32, 20.0), m.cost[0]);
+    try std.testing.expectEqual(@as(f32, 70.0), m.cost[1]);
+    try std.testing.expectEqual(@as(f32, 5.0), m.cost[2]);
+}
+
+test "cost_hint: a measured refine() supersedes the hinted seed (the hint is a seed, not a floor)" {
+    // The hint only SEEDS the cost estimate; live telemetry must be free to move the
+    // estimate ABOVE or BELOW the hinted figure. A correct EWMA folds the measurement
+    // toward it, so a heavy hint does not pin the cost at a floor — it is overwritten.
+    var plan: DummyPlan = .{ .op_count = 1 };
+    plan.buffer_byte_len[1] = 9; // base 10
+    plan.ops[0] = .{ .output_buffer_ids = .{ 1, 0, 0, 0, 0, 0, 0, 0 }, .output_count = 1, .cost_hint = 10.0 };
+    var m = parallel.CostModel.fromPlan(plan);
+    try std.testing.expectEqual(@as(f32, 100.0), m.cost[0]); // seed = 10·10
+    // A measurement well BELOW the hinted seed pulls the estimate down (α=1 snaps to it):
+    // the hint is not a floor.
+    m.refine(0, 4.0, 1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), m.cost[0], 1e-5);
+    // And a measurement above the (now-low) estimate pulls it back up by half (α=0.5).
+    m.refine(0, 20.0, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 12.0), m.cost[0], 1e-5); // 0.5·4 + 0.5·20
+}
+
+test "cost_hint: a NEGATIVE hint is a raw multiplier (no defensive clamp at zero)" {
+    // The formula is a pure product `(1+bytes)·hint`, NOT `@max(0, …)`: a negative hint
+    // yields a negative cost. This is not a sane production value, but pinning it proves
+    // the code does no hidden clamping — a defensively-clamped reimplementation (which
+    // would silently change the schedule) fails this. (Documents the contract's edge.)
+    var plan: DummyPlan = .{ .op_count = 1 };
+    plan.buffer_byte_len[1] = 19; // base = 1 + 19 = 20
+    plan.ops[0] = .{ .output_buffer_ids = .{ 1, 0, 0, 0, 0, 0, 0, 0 }, .output_count = 1, .cost_hint = -2.0 };
+    const m = parallel.CostModel.fromPlan(plan);
+    try std.testing.expectEqual(@as(f32, -40.0), m.cost[0]); // 20 · (-2) — unclamped
+}
+
+test "cost_hint: the EWMA estimate cost_e is seeded from the hinted cost, not the raw bytes" {
+    // fromPlan seeds the P-core EWMA estimate (cost_e) equal to the static cost — which
+    // already includes the hint. A heavy-hinted op must therefore start its telemetry
+    // estimate heavy, not at the byte-only figure.
+    var plan: DummyPlan = .{ .op_count = 1 };
+    plan.buffer_byte_len[2] = 20;
+    plan.ops[0] = .{ .output_buffer_ids = .{ 2, 0, 0, 0, 0, 0, 0, 0 }, .output_count = 1, .cost_hint = 3.0 };
+    const m = parallel.CostModel.fromPlan(plan);
+    const hinted = (1.0 + 20.0) * 3.0; // 63
+    try std.testing.expectEqual(@as(f32, hinted), m.cost[0]);
+    try std.testing.expectEqual(m.cost[0], m.cost_e[0]); // EWMA seeded from the hinted cost
+}
+
+test "cost_hint: a heavy hint lifts totalWork and span proportionally on a real path" {
+    // The hint must propagate through the aggregate functions, not just per-op cost.
+    // A 3-op chain where the middle op carries a 10× hint: totalWork and span (the
+    // chain IS its own critical path) both rise by exactly the extra (hint-1)·base of
+    // that one op. We compare a hinted plan against its default-hint twin.
+    var base: DummyPlan = .{ .op_count = 3 };
+    base.buffer_byte_len[1] = 0; // op0 out → 1.0
+    base.buffer_byte_len[2] = 9; // op1 out → 10.0 base
+    base.buffer_byte_len[3] = 0; // op2 out → 1.0
+    base.ops[0] = .{ .output_buffer_ids = .{ 1, 0, 0, 0, 0, 0, 0, 0 }, .output_count = 1 };
+    base.ops[1] = .{ .input_buffer_ids = .{ 1, 0, 0, 0, 0, 0, 0, 0 }, .input_count = 1, .output_buffer_ids = .{ 2, 0, 0, 0, 0, 0, 0, 0 }, .output_count = 1 };
+    base.ops[2] = .{ .input_buffer_ids = .{ 2, 0, 0, 0, 0, 0, 0, 0 }, .input_count = 1, .output_buffer_ids = .{ 3, 0, 0, 0, 0, 0, 0, 0 }, .output_count = 1 };
+
+    var hinted = base;
+    hinted.ops[1].cost_hint = 10.0; // the middle op is 10× heavier
+
+    const dag = parallel.buildDag(base); // topology identical in both plans
+    var mb = parallel.CostModel.fromPlan(base);
+    var mh = parallel.CostModel.fromPlan(hinted);
+
+    // base: work = 1 + 10 + 1 = 12; hinted: 1 + 100 + 1 = 102.
+    try std.testing.expectEqual(@as(f32, 12.0), parallel.totalWork(&dag, &mb));
+    try std.testing.expectEqual(@as(f32, 102.0), parallel.totalWork(&dag, &mh));
+    // A chain is its own critical path ⇒ span tracks the same rise.
+    try std.testing.expectApproxEqAbs(@as(f32, 12.0), parallel.span(&dag, &mb), 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 102.0), parallel.span(&dag, &mh), 1e-3);
+}
+
+test "cost_hint: GraphNode → RenderOp flow — a block's pub const cost_hint reaches the committed op" {
+    // The wiring law end-to-end through the REAL commit pass (not a hand-built plan):
+    // a block declaring `pub const cost_hint` must surface that exact value on its
+    // RenderOp in the committed plan, and an unannotated block must surface 1.0. This
+    // is the GraphNode.cost_hint → RenderOp.cost_hint half of the field's journey
+    // (the RenderOp → CostModel half is pinned by the fromPlan tests above).
+    const N = 8;
+    const alloc = std.testing.allocator;
+    var input: [N]Sample(f32) = undefined;
+    var out: [N]Sample(f32) = undefined;
+
+    var bg = pan.Graph.init(alloc, cfg(N));
+    errdefer bg.deinit();
+    const s = try bg.add(BufSource, .{ .data = @as([*]const Sample(f32), &input) });
+    const heavy = try bg.add(HeavyKernel, .{}); // declares pub const cost_hint = 12.0
+    const sk = try bg.add(BufSink, .{ .dest = @as([*]Sample(f32), &out) });
+    try bg.connect(s, heavy);
+    try bg.connect(heavy, sk);
+    var eng = try bg.commitWith(.{ .cores = 4, .force_workgroup = true });
+    defer eng.deinit();
+
+    const plan = eng.currentPlan();
+    // Find the op rendering the HeavyKernel node and assert its carried hint is 12.0,
+    // while the plumbing ops (source/sink) keep the default 1.0.
+    var saw_heavy = false;
+    var saw_default = false;
+    var i: usize = 0;
+    while (i < plan.op_count) : (i += 1) {
+        const op = &plan.ops[i];
+        if (op.node_id == heavy.id) {
+            try std.testing.expectEqual(@as(f32, 12.0), op.cost_hint);
+            saw_heavy = true;
+        } else {
+            // Every other op is unannotated plumbing ⇒ the default 1.0 survives commit.
+            try std.testing.expectEqual(@as(f32, 1.0), op.cost_hint);
+            saw_default = true;
+        }
+    }
+    try std.testing.expect(saw_heavy); // the heavy node's op is present and hinted
+    try std.testing.expect(saw_default); // and the unannotated ops kept the default
 }
 
 test "CostModel.refine: folds a measured sample by EWMA, ignores out-of-range ops" {

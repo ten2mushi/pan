@@ -517,6 +517,12 @@ pub const BoundNode = struct {
     set: ?SetThunk = null,
     /// The exhaustion probe, or null if the block is not an exhaustible source.
     exhausted: ?ExhaustThunk = null,
+    /// `@sizeOf` of the block instance, so a non-mutating pass (profile-guided
+    /// calibration) can byte-snapshot and restore the instance's state. Exact for a
+    /// block whose state is inline (the common case — a delay ring, biquad z⁻¹, ramp
+    /// counters); a block holding a pointer to heap state has only its pointer snapped
+    /// (safe, but the heap contents are not rolled back).
+    instance_bytes: usize = 0,
 };
 
 /// Build the optional exhaustion probe for `Block` (null unless it declares
@@ -1412,6 +1418,7 @@ pub const Edit = struct {
             .render = renderThunk(Block),
             .destroy = destroyThunk(Block),
             .set = setThunkFor(Block),
+            .instance_bytes = @sizeOf(Block),
         };
         self.bound_count = self.ir.node_count;
         return id;
@@ -1783,9 +1790,39 @@ pub const Engine = struct {
     /// freshly-built engine during bring-up, not mid-stream on live audio.
     pub fn calibrate(self: *Self, k_blocks: usize) void {
         const tb = self.tb orelse return;
+        // Calibration is a TIMING measurement and must leave audio state untouched. The
+        // warm-up renders advance every block's internal state (a delay ring, a biquad
+        // z⁻¹) and the per-edge pool's persistent feedback tail, so snapshot the block
+        // instances first to roll that advance back afterward. If the snapshot can't be
+        // allocated, skip calibration rather than risk corrupting state (the static cost
+        // hints stand).
+        var total: usize = 0;
+        for (self.bound) |b| total += b.instance_bytes;
+        const snap = self.alloc.alloc(u8, total) catch return;
+        defer self.alloc.free(snap);
+        var off: usize = 0;
+        for (self.bound) |b| {
+            const src: [*]const u8 = @ptrCast(b.self_ptr);
+            @memcpy(snap[off .. off + b.instance_bytes], src[0..b.instance_bytes]);
+            off += b.instance_bytes;
+        }
+
         tb.measure(k_blocks, &EventDispatch.none);
-        if (!tb.calibrated) return; // no tick source — the static hints stand
+        if (!tb.calibrated) return; // no tick source / k==0 — the static hints stand
         tb.rebind(self.ir, self.bound, self.cfg) catch return;
+
+        // Roll back: restore each instance to its pre-measure state, and re-zero the
+        // per-edge pool so the recolored persistent feedback tail starts clean. The
+        // post-calibration render is then bit-identical to a never-calibrated engine —
+        // calibration changed only the schedule, never the carried state. (Call before
+        // the first live render; mid-stream it would reset the feedback to silence.)
+        off = 0;
+        for (self.bound) |b| {
+            const dst: [*]u8 = @ptrCast(b.self_ptr);
+            @memcpy(dst[0..b.instance_bytes], snap[off .. off + b.instance_bytes]);
+            off += b.instance_bytes;
+        }
+        @memset(tb.edge_pool, 0);
         tb.active.store(tb.decision.enable, .release);
     }
 

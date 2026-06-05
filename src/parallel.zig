@@ -1049,6 +1049,28 @@ pub fn computePoison(plan: anytype, sched: *const Schedule) PoisonPlan {
 /// owns that op), so a plain store suffices — no CAS anywhere. The generation
 /// disambiguates callbacks without clearing the array: a flag still holding `g−1`
 /// reads as "not ready," so there is no per-callback memset.
+/// Spin count after which a cross-worker wait YIELDS instead of pure-spinning. Without a
+/// real render workgroup co-scheduling the workers, a producer can be descheduled — e.g.
+/// under core oversubscription (several Tier-B graphs running at once) — and an unbounded
+/// spin would livelock the core, never letting the producer finish. Yielding past the
+/// threshold lets it run. Under a real workgroup the producer is co-scheduled and a
+/// cross-worker wait resolves in a few hundred spins, far below this, so the steady-state
+/// path stays a pure spin. ~16k spins ≈ tens of microseconds — well inside a callback.
+const spin_yield_threshold: u32 = 1 << 14;
+
+/// One iteration of a bounded spin: a spin-loop hint until `local` crosses the threshold,
+/// then a yield (so a descheduled peer can run) and reset. The slow (yield) branch is
+/// reached only when no workgroup bounds the wait.
+fn spinOrYield(local: *u32) void {
+    local.* += 1;
+    if (local.* < spin_yield_threshold) {
+        std.atomic.spinLoopHint();
+    } else {
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+        local.* = 0;
+    }
+}
+
 pub const ReadyFlags = struct {
     flags: [max_ops]std.atomic.Value(usize) = blk: {
         var a: [max_ops]std.atomic.Value(usize) = undefined;
@@ -1066,9 +1088,10 @@ pub const ReadyFlags = struct {
     /// budget breach is what trips auto-demote). Bounded only while the workgroup
     /// co-schedules the producer; that bound is ▷/≈, not ⊢.
     pub fn wait(self: *ReadyFlags, p: usize, g: usize, spins: *u64) void {
+        var local: u32 = 0;
         while (self.flags[p].load(.acquire) != g) {
             spins.* += 1;
-            std.atomic.spinLoopHint();
+            spinOrYield(&local);
         }
     }
 };
@@ -1264,7 +1287,8 @@ pub const WorkerPool = struct {
         self.gen.store(g, .release); // publish user/task/done-reset and wake spinners
         self.wakeWorkers(); // and unpark any cold workers (no syscall if none parked)
         task(user, 0, g); // worker 0 = the caller
-        while (self.done.load(.acquire) != self.p - 1) std.atomic.spinLoopHint();
+        var jspin: u32 = 0;
+        while (self.done.load(.acquire) != self.p - 1) spinOrYield(&jspin);
         return g;
     }
 
@@ -1302,7 +1326,8 @@ pub const Barrier = struct {
             self.arrived.store(0, .monotonic);
             _ = self.gen.fetchAdd(1, .release);
         } else {
-            while (self.gen.load(.acquire) == g) std.atomic.spinLoopHint();
+            var bspin: u32 = 0;
+            while (self.gen.load(.acquire) == g) spinOrYield(&bspin);
         }
     }
 };

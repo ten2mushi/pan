@@ -287,6 +287,7 @@ pub const Graph = struct {
             .destroy = engine.destroyThunk(Block),
             .set = engine.setThunkFor(Block),
             .exhausted = engine.exhaustThunkFor(Block),
+            .instance_bytes = @sizeOf(Block),
         };
 
         var h: NodeHandle(Block) = undefined;

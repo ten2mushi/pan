@@ -1048,3 +1048,593 @@ test "STRESS: wide graph, P=2..ncores, 64 blocks each, bit-exact (flush scheduli
         }
     }
 }
+
+// ===========================================================================
+// L8 — PROFILE-GUIDED CALIBRATION of the Tier-B schedule (`Engine.calibrate`,
+// `TierB.measure`). Calibration renders `k` warm-up blocks under a SEQUENTIAL
+// replay, times each op, and rebuilds the schedule from the measured cost. The
+// load-bearing law it must preserve: measured costs change ONLY the schedule
+// (worker assignment / op placement), NEVER the per-op reduction order — so a
+// post-calibration Tier-B render is STILL bit-identical to a Tier-A render of the
+// same graph. Calibration is therefore a no-op on the observable audio.
+//
+// Laws pinned here:
+//   (L8a) calibrate(k>0) on a PROMOTING Tier-B engine flips tierBCalibrated()
+//         false→true (this host — macOS/Linux — has a monotonic tick source).
+//   (L8b) calibrate(0) is a NO-OP: tierBCalibrated() stays false and the engine
+//         still renders bit-exact (the static cost hints stand untouched).
+//   (L8c) THE SPINE: after calibrate, the Tier-B parallel render is byte-exact to a
+//         Tier-A sequential render of the same graph, over many blocks and many P.
+//   (L8d) calibration preserves correctness on a STATEFUL graph (pool-resident z⁻¹
+//         feedback): `measure` advances the per-edge pool's feedback tail by `k`
+//         blocks during warm-up, so a Tier-A reference driven `k` warm-up blocks
+//         realigns, and every subsequent block matches bit-exact. A torn-pool bug in
+//         the schedule-order replay would corrupt that warm-up feedback state and
+//         surface here as a post-calibration divergence.
+//   (L8e) calibration is IDEMPOTENT in the observable: a second calibrate (or a
+//         no-op calibrate(0) after a real one) keeps the render bit-exact.
+//
+// Why bit-exact and not allclose: Tier B replays its own per-edge plan over its own
+// pool with the SAME kernels and the SAME reduction order as Tier A; calibration
+// only reshuffles which worker runs which op. Any divergence is a scheduling/torn-
+// pool bug, never numerics.
+// ===========================================================================
+
+/// A two-input feedback summer: out = dry + g·wet, where "wet" is a z⁻¹ feedback tap.
+/// The pool-resident persistent tail (the DelayLine's z⁻¹ buffer) is what makes the
+/// comb bank STATEFUL across callbacks — and what `measure`'s warm-up advances.
+const Summer = struct {
+    const Self = @This();
+    g: f32 = 0.5,
+    pub const inputs = .{ .dry = Sample(f32), .wet = Sample(f32) };
+    pub fn process(self: *Self, dry: []const Sample(f32), wet: []const Sample(f32), out: []Sample(f32)) void {
+        for (dry, wet, out) |d, w, *y| y.ch[0] = d.ch[0] + self.g * w.ch[0];
+    }
+};
+
+/// A WIDE bank of `W` independent comb-filter voices (src → Summer → DelayLine, the
+/// delay fed back into the Summer's wet port) summed by a balanced adder tree into a
+/// sink. Wide (promotes Tier B) AND every voice carries a pool-resident z⁻¹ — the
+/// stateful shape that exercises `measure`'s warm-up writing the per-edge pool's
+/// persistent feedback tail, and the reconvergent adder tree gives the colorer room
+/// to reuse buffers so the schedule order genuinely differs from op-index order.
+fn buildCombBank(
+    comptime W: usize,
+    alloc: std.mem.Allocator,
+    comptime N: usize,
+    input: [*]const Sample(f32),
+    out: [*]Sample(f32),
+    opts: engine.EngineOptions,
+) !engine.Engine {
+    comptime std.debug.assert(W >= 2 and (W & (W - 1)) == 0);
+    const Delay = pan.DelayLine(Sample(f32), 3);
+    var bg = pan.Graph.init(alloc, cfg(N));
+    errdefer bg.deinit();
+    const src = try bg.add(BufSource, .{ .data = input });
+    const Summerh = @TypeOf(try bg.add(Summer, .{}));
+    const Adder = @TypeOf(try bg.add(Add2, .{}));
+
+    var voices: [W]Summerh = undefined;
+    var v: usize = 0;
+    while (v < W) : (v += 1) {
+        const sum = try bg.add(Summer, .{ .g = 0.3 + 0.1 * @as(f32, @floatFromInt(v)) });
+        const dl = try bg.add(Delay, .{});
+        try bg.connect(src, sum.in.dry);
+        try bg.connect(sum, dl);
+        try bg.connectFeedback(dl, sum.in.wet);
+        voices[v] = sum;
+    }
+
+    var nodes: [W]Adder = undefined;
+    var cnt: usize = 0;
+    var p: usize = 0;
+    while (p < W / 2) : (p += 1) {
+        const add = try bg.add(Add2, .{});
+        try bg.connect(voices[2 * p], add.in.x);
+        try bg.connect(voices[2 * p + 1], add.in.y);
+        nodes[cnt] = add;
+        cnt += 1;
+    }
+    while (cnt > 1) {
+        var nx: [W]Adder = undefined;
+        var w: usize = 0;
+        var j: usize = 0;
+        while (j + 1 < cnt) : (j += 2) {
+            const add = try bg.add(Add2, .{});
+            try bg.connect(nodes[j], add.in.x);
+            try bg.connect(nodes[j + 1], add.in.y);
+            nx[w] = add;
+            w += 1;
+        }
+        nodes = nx;
+        cnt = w;
+    }
+    const sink = try bg.add(BufSink, .{ .dest = out });
+    try bg.connect(nodes[0], sink);
+    return bg.commitWith(opts);
+}
+
+test "L8a calibrate(k>0) flips tierBCalibrated false→true on a promoting Tier-B engine" {
+    const N = 64;
+    const alloc = std.testing.allocator;
+    var input: [N]Sample(f32) = undefined;
+    fillNoise(&input, 0xCA11B);
+    var out: [N]Sample(f32) = undefined;
+
+    for (executors) |exec| {
+        var eng = try buildWide(8, alloc, N, &input, &out, .{ .cores = 4, .force_workgroup = true, .tier_b_executor = exec });
+        defer eng.deinit();
+        // A real Tier-B overlay must be present (the differential premise) and not yet
+        // calibrated — the static byte×hint cost model is in force at commit.
+        try std.testing.expect(eng.tierBActive());
+        try std.testing.expect(!eng.tierBCalibrated());
+
+        // One warm-up block is enough to populate the measured costs and flip the flag.
+        // This host (macOS/Linux) has a monotonic tick source, so calibration succeeds.
+        eng.calibrate(1);
+        if (!eng.tierBCalibrated()) {
+            std.debug.print("FAIL: calibrate(1) did not set tierBCalibrated (exec={s})\n", .{@tagName(exec)});
+            return error.CalibrateDidNotFlip;
+        }
+        // The overlay re-promoted across the calibrate→rebind (identical graph, so the
+        // gate verdict is unchanged) — calibration did not accidentally demote it.
+        try std.testing.expect(eng.tierBActive());
+    }
+}
+
+test "L8b calibrate(0) is a NO-OP: tierBCalibrated stays false, render stays bit-exact" {
+    const N = 64;
+    const alloc = std.testing.allocator;
+    var input: [N]Sample(f32) = undefined;
+    fillNoise(&input, 0x0CA10);
+
+    const token = engine.enterRealtimeThread();
+    defer token.leave();
+
+    var out_a: [N]Sample(f32) = undefined;
+    var out_b: [N]Sample(f32) = undefined;
+    var eng_a = try buildWide(8, alloc, N, &input, &out_a, .{});
+    defer eng_a.deinit();
+    var eng_b = try buildWide(8, alloc, N, &input, &out_b, .{ .cores = 4, .force_workgroup = true, .tier_b_executor = .heft });
+    defer eng_b.deinit();
+    try std.testing.expect(eng_b.tierBActive());
+    try std.testing.expect(!eng_b.tierBCalibrated());
+
+    // calibrate(0) renders zero warm-up blocks: it must not measure, must not flip the
+    // flag, and must not touch the schedule — the static hints stand.
+    eng_b.calibrate(0);
+    try std.testing.expect(!eng_b.tierBCalibrated());
+
+    // And the engine still renders bit-exact to Tier A (the no-op left it sound).
+    var block: usize = 0;
+    while (block < 6) : (block += 1) {
+        eng_a.renderInto(token);
+        eng_b.renderInto(token);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(out_a[0..]), std.mem.sliceAsBytes(out_b[0..]));
+    }
+    try std.testing.expect(!eng_b.telemetry().fault);
+}
+
+test "L8c spine: post-calibration Tier B ≡ Tier A bit-exact (stateless wide, both executors, P=2..ncores)" {
+    const N = 64;
+    const alloc = std.testing.allocator;
+    var input: [N]Sample(f32) = undefined;
+    fillNoise(&input, 0xCA11C);
+
+    const token = engine.enterRealtimeThread();
+    defer token.leave();
+
+    const pmax = hostCores();
+    for (executors) |exec| {
+        var p: usize = 2;
+        while (p <= pmax) : (p += 1) {
+            var out_a: [N]Sample(f32) = undefined;
+            var out_b: [N]Sample(f32) = undefined;
+            var eng_a = try buildWide(8, alloc, N, &input, &out_a, .{});
+            defer eng_a.deinit();
+            var eng_b = try buildWide(8, alloc, N, &input, &out_b, .{ .cores = p, .force_workgroup = true, .tier_b_executor = exec });
+            defer eng_b.deinit();
+            try std.testing.expect(eng_b.tierBActive());
+
+            // Calibrate with several warm-up blocks (exercises the timed sequential
+            // replay and the schedule rebuild). The wide graph is STATELESS — its only
+            // input is the fixed buffer and every kernel is memoryless — so the warm-up
+            // blocks `measure` runs leave no residue; no reference realignment needed.
+            eng_b.calibrate(5);
+            try std.testing.expect(eng_b.tierBCalibrated());
+            try std.testing.expect(eng_b.tierBActive()); // still promoted post-rebind
+
+            // The schedule may now place ops on different workers, but the rendered
+            // values are unchanged: byte-exact to a fresh Tier-A render each block.
+            var block: usize = 0;
+            while (block < 8) : (block += 1) {
+                eng_a.renderInto(token);
+                eng_b.renderInto(token);
+                try std.testing.expectEqualSlices(
+                    u8,
+                    std.mem.sliceAsBytes(out_a[0..]),
+                    std.mem.sliceAsBytes(out_b[0..]),
+                );
+            }
+            try std.testing.expect(!eng_b.telemetry().fault);
+        }
+    }
+}
+
+test "L8c spine: post-calibration diamond ≡ Tier A bit-exact (both executors)" {
+    const N = 32;
+    const alloc = std.testing.allocator;
+    var input: [N]Sample(f32) = undefined;
+    fillNoise(&input, 0xCA11D);
+
+    const token = engine.enterRealtimeThread();
+    defer token.leave();
+
+    for (executors) |exec| {
+        var out_a: [N]Sample(f32) = undefined;
+        var out_b: [N]Sample(f32) = undefined;
+        var eng_a = try buildDiamond(alloc, N, &input, &out_a, .{});
+        defer eng_a.deinit();
+        var eng_b = try buildDiamond(alloc, N, &input, &out_b, .{ .cores = 4, .force_workgroup = true, .tier_b_executor = exec });
+        defer eng_b.deinit();
+
+        // The diamond is configured for Tier B; whether or not the gate promotes it,
+        // calibrate must keep it bit-exact. Calibrate, then compare each block.
+        eng_b.calibrate(4);
+
+        var block: usize = 0;
+        while (block < 8) : (block += 1) {
+            eng_a.renderInto(token);
+            eng_b.renderInto(token);
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(out_a[0..]), std.mem.sliceAsBytes(out_b[0..]));
+        }
+        try std.testing.expect(!eng_b.telemetry().fault);
+    }
+}
+
+test "L8d stateful CONTROL: uncalibrated feedback comb bank IS bit-exact, and calibrate(0) preserves it" {
+    // The positive control that frames the bug below. TWO facts that MUST hold and DO:
+    //   (1) a fresh (uncalibrated) Tier-B comb bank is bit-exact to a fresh Tier-A comb
+    //       bank over many blocks — the stateful parallel≡sequential invariant works
+    //       when calibration is NOT involved (the z⁻¹ tail is carried correctly).
+    //   (2) calibrate(0) is a true no-op even on a stateful graph: it does not run
+    //       `measure`/rebind, so the feedback state is untouched and the differential
+    //       still holds. (calibrate(k≥1) does NOT — see the gated regression below.)
+    const N = 64;
+    const alloc = std.testing.allocator;
+    var input: [N]Sample(f32) = undefined;
+    fillNoise(&input, 0xCA11E);
+
+    const token = engine.enterRealtimeThread();
+    defer token.leave();
+
+    for (executors) |exec| {
+        var out_a: [N]Sample(f32) = undefined;
+        var out_b: [N]Sample(f32) = undefined;
+        var eng_a = try buildCombBank(4, alloc, N, &input, &out_a, .{});
+        defer eng_a.deinit();
+        var eng_b = try buildCombBank(4, alloc, N, &input, &out_b, .{ .cores = 4, .force_workgroup = true, .tier_b_executor = exec });
+        defer eng_b.deinit();
+        try std.testing.expect(eng_b.tierBActive());
+
+        // calibrate(0): no measure, no rebuild — the stateful per-edge pool is untouched.
+        eng_b.calibrate(0);
+        try std.testing.expect(!eng_b.tierBCalibrated());
+
+        var block: usize = 0;
+        while (block < 16) : (block += 1) {
+            eng_a.renderInto(token);
+            eng_b.renderInto(token);
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(out_a[0..]), std.mem.sliceAsBytes(out_b[0..]));
+            for (out_b) |s| try std.testing.expect(std.math.isFinite(s.ch[0]));
+        }
+        try std.testing.expect(!eng_b.telemetry().fault);
+    }
+}
+
+// BUG DETECTED (state corruption) — `Engine.calibrate(k)` with k≥1 on a STATEFUL
+// graph whose z⁻¹ feedback is POOL-RESIDENT (a comb-filter / DelayLine-feedback bank
+// — exactly the wide-and-stateful shape Tier B promotes).
+//   Repro (deterministic; see the standalone probe distilled into this test): build a
+//   wide feedback comb bank with `commitWith(.{ .cores = 4, .force_workgroup = true })`
+//   (Tier B promotes), call `calibrate(k>=1)`, then render. Compare against an
+//   otherwise-identical comb bank that was NOT calibrated (or against a fresh Tier-A
+//   bank): block 0 happens to match (both read a zeroed feedback tail), but EVERY
+//   subsequent block diverges — 31/32 blocks differ — and the calibrated engine's
+//   per-block outputs are SCRAMBLED (block 1 emits a value a clean run only reaches
+//   ~6 blocks in), i.e. the feedback z⁻¹ state is corrupt, not merely time-shifted.
+//   Mechanism: `Engine.calibrate` → `TierB.measure` renders `k` warm-up blocks into
+//   the per-edge pool, WRITING the persistent feedback buffers at the create-time
+//   coloring's offsets; then `calibrate` → `tb.rebind` → `buildBoundPlanMode` (a NEW
+//   per-edge plan) → `buildFor` → `concurrencyColor` RECOLORS the plan. The rebuilt
+//   schedule (now sized from the measured costs) yields a DIFFERENT buffer layout, so
+//   the live render reads each feedback z⁻¹ from a new offset that holds the previous
+//   layout's residue (and the per-edge pool is not re-zeroed for an identical-size
+//   graph — `rebind` only reallocates when `need > pool_cap`). The feedback tail is
+//   thus left inconsistent with the new layout, scrambling every block after the
+//   first.
+//   Scope: the STATELESS Tier-B path is unaffected — calibrate(k) on a wide gain/
+//   affine/adder graph stays bit-exact to Tier A (proven green by the L8c spine
+//   tests). calibrate(0) is a no-op on every graph (proven by the CONTROL above). The
+//   defect is specific to calibrate(k≥1) interacting with pool-resident feedback.
+//   Expected: after calibrate(k), a stateful Tier-B render is still bit-identical to
+//   the SAME render with no calibration (calibration changes only the schedule, never
+//   the per-op reduction order NOR the carried z⁻¹ state) — and bit-identical to a
+//   fresh Tier-A bank started from the same (zero) feedback state.
+//   Actual: 31/32 blocks diverge; the feedback state is corrupt from block 1 on.
+//   Suggested fix (for the orchestrator, NOT applied here): on a calibrate→rebind,
+//   either (a) re-zero the per-edge pool's persistent feedback tail so the post-
+//   calibration render restarts from clean (zero) feedback — consistent with measure
+//   being a throwaway warm-up; or (b) preserve the feedback z⁻¹ across the recolor by
+//   remapping the persistent buffers from their old offsets to the new layout before
+//   the next render. (a) matches calibrate's "startup warm-up" intent and is simplest.
+// This test is left SKIPPED (a runtime gate, so the body still type-checks as the
+// regression guard) so the deterministic divergence does not abort the whole runner.
+// Flip `bug_fixed` to true once `calibrate` no longer corrupts pool-resident feedback.
+var bug_fixed_calibrate_feedback: bool = true; // FIXED: calibrate snapshots/restores block instances + re-zeros the per-edge pool, so the warm-up advance is rolled back
+test "BUG: L8d calibrate(k>=1) must not corrupt pool-resident z⁻¹ feedback (stateful comb bank)" {
+    if (!@atomicLoad(bool, &bug_fixed_calibrate_feedback, .seq_cst)) return error.SkipZigTest;
+    const N = 64;
+    const alloc = std.testing.allocator;
+    var input: [N]Sample(f32) = undefined;
+    fillNoise(&input, 0xCA11E);
+
+    const token = engine.enterRealtimeThread();
+    defer token.leave();
+
+    for (executors) |exec| {
+        // `ref` is the contract oracle: a fresh Tier-B comb bank that is NEVER
+        // calibrated. `cal` is the same graph WITH calibrate(k). Calibration must touch
+        // only the schedule, so post-calibration `cal` must render bit-identically to
+        // `ref` from the first block onward (both start with zeroed feedback state).
+        const k = 5;
+        var out_ref: [N]Sample(f32) = undefined;
+        var out_cal: [N]Sample(f32) = undefined;
+        var eng_ref = try buildCombBank(4, alloc, N, &input, &out_ref, .{ .cores = 4, .force_workgroup = true, .tier_b_executor = exec });
+        defer eng_ref.deinit();
+        var eng_cal = try buildCombBank(4, alloc, N, &input, &out_cal, .{ .cores = 4, .force_workgroup = true, .tier_b_executor = exec });
+        defer eng_cal.deinit();
+        try std.testing.expect(eng_cal.tierBActive());
+
+        eng_cal.calibrate(k);
+        try std.testing.expect(eng_cal.tierBCalibrated());
+        try std.testing.expect(eng_cal.tierBActive());
+
+        var block: usize = 0;
+        while (block < 32) : (block += 1) {
+            eng_ref.renderInto(token);
+            eng_cal.renderInto(token);
+            if (!std.mem.eql(u8, std.mem.sliceAsBytes(out_ref[0..]), std.mem.sliceAsBytes(out_cal[0..]))) {
+                std.debug.print("BUG: calibrate corrupted feedback at block {d} exec={s} ref0={d} cal0={d}\n", .{ block, @tagName(exec), out_ref[0].ch[0], out_cal[0].ch[0] });
+                return error.CalibrateCorruptedFeedback;
+            }
+        }
+    }
+}
+
+test "L8e idempotent: re-calibration and a calibrate(0) after a real one keep the render bit-exact" {
+    const N = 64;
+    const alloc = std.testing.allocator;
+    var input: [N]Sample(f32) = undefined;
+    fillNoise(&input, 0xCA120);
+
+    const token = engine.enterRealtimeThread();
+    defer token.leave();
+
+    var out_a: [N]Sample(f32) = undefined;
+    var out_b: [N]Sample(f32) = undefined;
+    var eng_a = try buildWide(8, alloc, N, &input, &out_a, .{});
+    defer eng_a.deinit();
+    var eng_b = try buildWide(8, alloc, N, &input, &out_b, .{ .cores = 4, .force_workgroup = true, .tier_b_executor = .heft });
+    defer eng_b.deinit();
+    try std.testing.expect(eng_b.tierBActive());
+
+    // First calibration.
+    eng_b.calibrate(3);
+    try std.testing.expect(eng_b.tierBCalibrated());
+
+    // A no-op calibrate(0) AFTER a real calibration must not un-calibrate or change the
+    // schedule (k==0 short-circuits before measuring).
+    eng_b.calibrate(0);
+    try std.testing.expect(eng_b.tierBCalibrated());
+
+    // A SECOND real calibration re-measures and rebuilds; still bit-exact.
+    eng_b.calibrate(2);
+    try std.testing.expect(eng_b.tierBCalibrated());
+    try std.testing.expect(eng_b.tierBActive());
+
+    // Stateless wide graph ⇒ no warm-up residue ⇒ compare each block directly.
+    var block: usize = 0;
+    while (block < 8) : (block += 1) {
+        eng_a.renderInto(token);
+        eng_b.renderInto(token);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(out_a[0..]), std.mem.sliceAsBytes(out_b[0..]));
+    }
+    try std.testing.expect(!eng_b.telemetry().fault);
+}
+
+test "L8: a calibrated, non-promoting chain stays correct (calibrate is sound even Tier-A-resident)" {
+    // A near-linear chain configured for Tier B but kept on Tier A by the gate. calibrate
+    // still runs `measure` + rebuild on the present overlay; the gate verdict is unchanged
+    // (still parallelism < threshold ⇒ not promoted), and the Tier-A render stays bit-exact.
+    const N = 32;
+    const alloc = std.testing.allocator;
+    var input: [N]Sample(f32) = undefined;
+    fillNoise(&input, 0xCA121);
+
+    const token = engine.enterRealtimeThread();
+    defer token.leave();
+
+    var out_a: [N]Sample(f32) = undefined;
+    var out_b: [N]Sample(f32) = undefined;
+    var eng_a = try buildChain(alloc, N, &input, &out_a, .{});
+    defer eng_a.deinit();
+    var eng_b = try buildChain(alloc, N, &input, &out_b, .{ .cores = 8, .force_workgroup = true, .tier_b_executor = .heft });
+    defer eng_b.deinit();
+    try std.testing.expect(!eng_b.tierBActive()); // the gate kept the chain on Tier A
+
+    eng_b.calibrate(4); // measures + rebuilds the (demoted) overlay; must not promote it
+    try std.testing.expect(eng_b.tierBCalibrated());
+    try std.testing.expect(!eng_b.tierBActive()); // calibration did not wrongly promote
+
+    var block: usize = 0;
+    while (block < 6) : (block += 1) {
+        eng_a.renderInto(token);
+        eng_b.renderInto(token);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(out_a[0..]), std.mem.sliceAsBytes(out_b[0..]));
+    }
+    try std.testing.expect(!eng_b.telemetry().fault);
+}
+
+// ---------------------------------------------------------------------------
+// L8f — TORN-POOL WITNESS: the timed warm-up replay in `measure` walks ops in
+// SCHEDULE order (the concurrency-colored plan advances a reused scratch buffer's
+// value-sequence in schedule order), NOT op-index order — index order could read a
+// buffer that a later-indexed-but-earlier-scheduled op has already overwritten.
+//
+// A 16-voice reconvergent fan-out (gain→affine lanes recombined through a balanced
+// adder tree) is deliberately WIDE and reconvergent, so concurrency coloring reuses
+// scratch buffers across non-overlapping lanes and the schedule order genuinely
+// diverges from op-index order. If `measure` replayed in op-index order it would
+// corrupt those reused buffers DURING the timed warm-up; on a stateless graph that
+// corruption is confined to the throwaway warm-up blocks, but it would also poison
+// the measured costs and (more tellingly) any schedule-order bug that survives the
+// rebuild surfaces as a post-calibration divergence from Tier A. We calibrate with a
+// LARGE k (the timed schedule-order loop runs k×op_count times) and then assert the
+// live render is byte-exact to a fresh Tier-A render over many blocks. A torn-pool
+// replay would show up here; a correct schedule-order replay stays bit-exact.
+// (Stateless graph: no warm-up residue, so no reference realignment is needed.)
+test "L8f torn-pool witness: wide reconvergent graph, large-k calibration stays bit-exact to Tier A" {
+    const N = 64;
+    const alloc = std.testing.allocator;
+    var input: [N]Sample(f32) = undefined;
+    fillNoise(&input, 0xCA11F);
+
+    const token = engine.enterRealtimeThread();
+    defer token.leave();
+
+    for (executors) |exec| {
+        var out_a: [N]Sample(f32) = undefined;
+        var out_b: [N]Sample(f32) = undefined;
+        var eng_a = try buildWide(16, alloc, N, &input, &out_a, .{});
+        defer eng_a.deinit();
+        var eng_b = try buildWide(16, alloc, N, &input, &out_b, .{ .cores = hostCores(), .force_workgroup = true, .tier_b_executor = exec });
+        defer eng_b.deinit();
+        try std.testing.expect(eng_b.tierBActive());
+        // A wide reconvergent shape with real parallelism — the colorer has room to
+        // reuse scratch across lanes, which is exactly what makes schedule order differ
+        // from op-index order (the premise of the schedule-order replay).
+        try std.testing.expect(eng_b.tierBWorkers() >= 2);
+
+        // Large k: the timed SCHEDULE-order replay runs k×op_count op invocations into
+        // the per-edge pool. A torn-pool replay corrupts the warm-up and skews costs.
+        eng_b.calibrate(20);
+        try std.testing.expect(eng_b.tierBCalibrated());
+        try std.testing.expect(eng_b.tierBActive());
+
+        var block: usize = 0;
+        while (block < 12) : (block += 1) {
+            eng_a.renderInto(token);
+            eng_b.renderInto(token);
+            try std.testing.expectEqualSlices(
+                u8,
+                std.mem.sliceAsBytes(out_a[0..]),
+                std.mem.sliceAsBytes(out_b[0..]),
+            );
+            for (out_b) |s| try std.testing.expect(std.math.isFinite(s.ch[0]));
+        }
+        try std.testing.expect(!eng_b.telemetry().fault);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// L8g — CALIBRATION IS OBSERVABLY INVISIBLE on the stateless path: an engine that
+// was calibrated and one that never was render byte-identically to each other (and
+// both to Tier A) on a stateless graph. This pins the law DIRECTLY — calibration
+// changes only worker assignment / op placement, never the per-op reduction order —
+// rather than only against the Tier-A oracle. (The stateful analogue is the SKIPPED
+// `BUG:` regression above: this same parity is what FAILS there, isolating the defect
+// to pool-resident feedback, not calibration in general.)
+test "L8g stateless parity: a calibrated engine renders bit-identically to an uncalibrated twin" {
+    const N = 64;
+    const alloc = std.testing.allocator;
+    var input: [N]Sample(f32) = undefined;
+    fillNoise(&input, 0xCA122);
+
+    const token = engine.enterRealtimeThread();
+    defer token.leave();
+
+    for (executors) |exec| {
+        var out_cal: [N]Sample(f32) = undefined;
+        var out_unc: [N]Sample(f32) = undefined;
+        var out_ref: [N]Sample(f32) = undefined;
+        var eng_cal = try buildWide(8, alloc, N, &input, &out_cal, .{ .cores = 4, .force_workgroup = true, .tier_b_executor = exec });
+        defer eng_cal.deinit();
+        var eng_unc = try buildWide(8, alloc, N, &input, &out_unc, .{ .cores = 4, .force_workgroup = true, .tier_b_executor = exec });
+        defer eng_unc.deinit();
+        var eng_ref = try buildWide(8, alloc, N, &input, &out_ref, .{}); // Tier A
+        defer eng_ref.deinit();
+        try std.testing.expect(eng_cal.tierBActive());
+        try std.testing.expect(eng_unc.tierBActive());
+
+        // Only `eng_cal` is calibrated. Its schedule may now differ from the
+        // uncalibrated twin's, but the rendered samples must be identical — the
+        // stateless graph carries no state for a schedule change to disturb.
+        eng_cal.calibrate(6);
+        try std.testing.expect(eng_cal.tierBCalibrated());
+        try std.testing.expect(!eng_unc.tierBCalibrated());
+
+        var block: usize = 0;
+        while (block < 10) : (block += 1) {
+            eng_cal.renderInto(token);
+            eng_unc.renderInto(token);
+            eng_ref.renderInto(token);
+            // calibrated ≡ uncalibrated (the direct law) AND both ≡ Tier A (the oracle).
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(out_unc[0..]), std.mem.sliceAsBytes(out_cal[0..]));
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(out_ref[0..]), std.mem.sliceAsBytes(out_cal[0..]));
+        }
+        try std.testing.expect(!eng_cal.telemetry().fault);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// L8h — REPEATED CALIBRATION stress on the stateless path: many `calibrate` calls
+// with growing k, each re-measuring and rebuilding the schedule, must keep the flag
+// latched, keep the overlay promoted (identical graph ⇒ unchanged gate verdict), and
+// keep the render bit-exact to Tier A. This flushes any leak/state drift across the
+// repeated measure→rebind→recolor cycle (each rebind frees the old plan + inserted
+// state and reallocates), under `std.testing.allocator`'s leak detector.
+test "L8h repeated calibration: many measure→rebuild cycles stay latched, promoted, and bit-exact" {
+    const N = 64;
+    const alloc = std.testing.allocator;
+    var input: [N]Sample(f32) = undefined;
+    fillNoise(&input, 0xCA123);
+
+    const token = engine.enterRealtimeThread();
+    defer token.leave();
+
+    var out_a: [N]Sample(f32) = undefined;
+    var out_b: [N]Sample(f32) = undefined;
+    var eng_a = try buildWide(8, alloc, N, &input, &out_a, .{});
+    defer eng_a.deinit();
+    var eng_b = try buildWide(8, alloc, N, &input, &out_b, .{ .cores = 4, .force_workgroup = true, .tier_b_executor = .heft });
+    defer eng_b.deinit();
+    try std.testing.expect(eng_b.tierBActive());
+
+    var round: usize = 0;
+    while (round < 8) : (round += 1) {
+        // Growing warm-up depth each round; k>0 always re-measures + rebuilds.
+        eng_b.calibrate(round + 1);
+        try std.testing.expect(eng_b.tierBCalibrated()); // stays latched across cycles
+        try std.testing.expect(eng_b.tierBActive()); // identical graph ⇒ still promoted
+
+        // Bit-exact to a fresh Tier-A render after every rebuild (stateless ⇒ no residue).
+        var block: usize = 0;
+        while (block < 3) : (block += 1) {
+            eng_a.renderInto(token);
+            eng_b.renderInto(token);
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(out_a[0..]), std.mem.sliceAsBytes(out_b[0..]));
+        }
+    }
+    try std.testing.expect(!eng_b.telemetry().fault);
+}
