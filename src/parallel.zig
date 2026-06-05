@@ -436,7 +436,12 @@ pub const CostModel = struct {
                     if (b < graph.max_buffers) bytes += plan.buffer_byte_len[b];
                 }
             }
-            m.cost[i] = 1.0 + @as(f32, @floatFromInt(bytes));
+            // Per-kernel cost = data volume × the block's relative compute intensity
+            // (`cost_hint`, 1.0 by default). Without it every op writing N samples
+            // weighs the same, so a cheap adder inflates the critical path and the gate
+            // under-estimates a compute-heavy graph's parallelism; the hint restores the
+            // true work ratio (a biquad/FFT voice ≫ an adder) so P sizes correctly.
+            m.cost[i] = (1.0 + @as(f32, @floatFromInt(bytes))) * op.cost_hint;
             m.cost_e[i] = m.cost[i];
         }
         return m;

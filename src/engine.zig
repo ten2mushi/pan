@@ -827,6 +827,27 @@ fn replayBound(plan: *const RuntimePlan, pool: []u8, events: *const EventDispatc
 // Tier B — the static-parallel multicore overlay bound to a runtime plan
 // ===========================================================================
 
+// Off-RT monotonic tick source for profile-guided calibration (`TierB.measure`). The
+// cost model uses only RATIOS of per-op timings, so the unit need not be uniform across
+// targets — mach ticks on Darwin, nanoseconds on Linux. Returns 0 where no source is
+// wired (the calibration then no-ops and the static cost hints stand — fail-safe). Used
+// only off the realtime path, so the tiny extern overhead is irrelevant.
+extern "c" fn mach_absolute_time() u64;
+const CalTimespec = extern struct { sec: isize, nsec: isize };
+extern "c" fn clock_gettime(clk_id: c_int, tp: *CalTimespec) c_int;
+fn monoTicks() u64 {
+    return switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos => mach_absolute_time(),
+        .linux => blk: {
+            var ts: CalTimespec = undefined;
+            const CLOCK_MONOTONIC: c_int = 1;
+            if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) break :blk 0;
+            break :blk @as(u64, @intCast(ts.sec)) *% 1_000_000_000 +% @as(u64, @intCast(ts.nsec));
+        },
+        else => 0,
+    };
+}
+
 /// The per-callback context the Tier-B per-op runner casts back to. Built fresh on
 /// the caller's stack each render; the workers read it through the type-erased user
 /// pointer the worker pool publishes with its generation bump.
@@ -965,6 +986,13 @@ const TierB = struct {
     /// Count of NaN-poison fills in the last paranoid callback (a witness that the
     /// safety net is ACTIVE, not a silent no-op). Zero in a release build.
     poison_fills: std.atomic.Value(u64) = .init(0),
+    /// Profile-guided per-op cost (target-native ticks) captured by `measure`. When
+    /// `calibrated`, `buildFor` replaces the static byte×cost-hint estimate with these
+    /// measured costs, so the worker count and op placement track REAL measured work
+    /// rather than a guess. Affects only the schedule, never the rendered values (the
+    /// re-costed schedule is still bit-exact to the sequential replay).
+    measured: [parallel.max_ops]f32 = [_]f32{0} ** parallel.max_ops,
+    calibrated: bool = false,
 
     /// Allocate and fully build the Tier-B overlay: its per-edge bound plan + pool,
     /// the worker pool, and the schedule. Heap-allocated so the worker pool's stable
@@ -1052,6 +1080,11 @@ const TierB = struct {
     fn buildFor(self: *TierB, plan: *RuntimePlan) void {
         const dag0 = parallel.buildDag(plan.*);
         var costs0 = parallel.CostModel.fromPlan(plan.*);
+        // Profile-guided: once calibrated, the measured per-op CPU REPLACES the static
+        // byte×hint estimate (same op order across a rebuild, so `measured[i]` aligns),
+        // so the gate sizes P and HEFT places ops by real work. α=1 fully trusts the
+        // (already K-averaged) measurement.
+        if (self.calibrated) costs0.refineAll(self.measured[0..plan.op_count], 1.0);
         const w = parallel.totalWork(&dag0, &costs0);
         const s = parallel.span(&dag0, &costs0);
         // Engine-side promotion uses the deadline-FREE structural condition: the graph
@@ -1086,6 +1119,7 @@ const TierB = struct {
         // final schedule honouring them.
         self.dag = parallel.buildDagOrdered(plan.*, sched0.global_order[0..plan.op_count]);
         self.costs = parallel.CostModel.fromPlan(plan.*);
+        if (self.calibrated) self.costs.refineAll(self.measured[0..plan.op_count], 1.0);
         self.sched = switch (self.executor) {
             .level_barrier => parallel.levelSchedule(&self.dag, &self.costs, p),
             .heft => parallel.heftSchedule(&self.dag, &self.costs, p),
@@ -1104,6 +1138,54 @@ const TierB = struct {
         if (self.spawned) return;
         try self.pool.spawn();
         self.spawned = true;
+    }
+
+    /// Profile-guided calibration (OFF the realtime path). Render `k` warm-up blocks of
+    /// the per-edge plan SEQUENTIALLY — a single-threaded in-order replay, the Tier-A
+    /// ground-truth execution, so it is bit-exact and needs no cross-worker sync or
+    /// poison — timing each op, and store the per-op average in `measured`. A later
+    /// `buildFor` (via the engine's `calibrate`→`rebind`) then sizes the schedule from
+    /// real measured work rather than the static byte×hint seed. No-op where `monoTicks`
+    /// has no source (the static hints stand). The op order is the plan's op-index order,
+    /// which is forward-topo (every dependency points to a higher index), so the replay
+    /// is valid and the block state advances exactly as a real callback would.
+    fn measure(self: *TierB, k: usize, dispatch: *const EventDispatch) void {
+        if (k == 0 or monoTicks() == 0) return;
+        const plan = self.plan;
+        var n_dyn: [graph.max_nodes]usize = undefined;
+        Engine.dynamicCounts(plan, n_dyn[0..plan.op_count]);
+        const base: [*]u8 = if (self.edge_pool.len == 0) undefined else self.edge_pool.ptr;
+        var fault = false;
+        var rc = RunCtx{
+            .plan = plan,
+            .base = base,
+            .n_dyn = &n_dyn,
+            .events = dispatch,
+            .guards = false, // sequential replay: no poison net needed
+            .fault = &fault,
+        };
+        var total = [_]u64{0} ** parallel.max_ops;
+        var it: usize = 0;
+        while (it < k) : (it += 1) {
+            // Replay in SCHEDULE order (`global_order`), the valid sequential order for
+            // the concurrency-colored plan: a reused scratch buffer's value-sequence
+            // advances in schedule order, so op-index order could read a buffer a
+            // later-indexed-but-earlier-scheduled op has already overwritten (a torn
+            // pool). `total` stays indexed by op index.
+            for (self.sched.global_order[0..plan.op_count]) |i| {
+                const t0 = monoTicks();
+                runOneOp(i, &rc);
+                total[i] +%= monoTicks() -% t0;
+            }
+        }
+        const kf: f32 = @floatFromInt(k);
+        var i: usize = 0;
+        while (i < plan.op_count) : (i += 1) {
+            // A unit floor (mirrors fromPlan's per-op floor) so a sub-tick op still
+            // carries weight and the ratios stay finite.
+            self.measured[i] = 1.0 + @as(f32, @floatFromInt(total[i])) / kf;
+        }
+        self.calibrated = true;
     }
 
     fn deinit(self: *TierB, alloc: std.mem.Allocator) void {
@@ -1690,6 +1772,23 @@ pub const Engine = struct {
         }, renderCallback, self);
     }
 
+    /// Profile-guided re-cost (OFF the realtime path). Render `k_blocks` warm-up blocks
+    /// under a sequential Tier-A-equivalent replay, measure each op's real CPU cost, then
+    /// rebuild the Tier-B schedule so the worker count and op placement track measured
+    /// work instead of the static byte×cost-hint estimate. Call once before `start` (or
+    /// between callbacks, never during one). No-op without a Tier-B overlay or a monotonic
+    /// tick source; the rebuilt schedule is still bit-exact to the sequential replay
+    /// (measured costs change only the schedule, never the rendered values).
+    /// WARN: it renders (and consumes input from) `k_blocks` blocks — call it on a
+    /// freshly-built engine during bring-up, not mid-stream on live audio.
+    pub fn calibrate(self: *Self, k_blocks: usize) void {
+        const tb = self.tb orelse return;
+        tb.measure(k_blocks, &EventDispatch.none);
+        if (!tb.calibrated) return; // no tick source — the static hints stand
+        tb.rebind(self.ir, self.bound, self.cfg) catch return;
+        tb.active.store(tb.decision.enable, .release);
+    }
+
     pub fn stop(self: *Self) void {
         self.running.store(false, .release);
         if (self.backend) |b| b.stop();
@@ -2179,6 +2278,13 @@ pub const Engine = struct {
     /// when Tier B did not run.
     pub fn tierBPoisonFills(self: *Self) u64 {
         return if (self.tb) |tb| tb.poison_fills.load(.monotonic) else 0;
+    }
+
+    /// Whether profile-guided calibration has run and its measured per-op costs are
+    /// driving the Tier-B schedule (false until `calibrate` succeeds; false where no
+    /// monotonic tick source is available, in which case the static hints stand).
+    pub fn tierBCalibrated(self: *Self) bool {
+        return if (self.tb) |tb| tb.calibrated else false;
     }
 };
 

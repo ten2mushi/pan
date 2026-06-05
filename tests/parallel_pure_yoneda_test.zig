@@ -627,6 +627,9 @@ const DummyOp = struct {
     output_count: usize = 0,
     param_input_buffer_ids: [PORTS]usize = [_]usize{0} ** PORTS,
     param_input_count: usize = 0,
+    // Mirrors RenderOp.cost_hint (the per-kernel cost multiplier the CostModel reads);
+    // 1.0 ⇒ data-volume-proportional, so the "cost ∝ output bytes" law is unchanged.
+    cost_hint: f32 = 1.0,
 };
 const DummyPlan = struct {
     op_count: usize = 0,

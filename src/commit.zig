@@ -144,6 +144,11 @@ pub const RenderOp = struct {
     /// op index ≠ node id; the executor keys off this to recover the node's
     /// monomorphized kernel and instance from the parallel block-type tuple.
     node_id: usize,
+    /// Relative compute cost per output sample (the node's `cost_hint`), carried
+    /// per-op for the parallel scheduler's cost model. 1.0 ⇒ data-volume-proportional
+    /// (the default); higher for compute-heavy kernels (filters, transforms). Affects
+    /// only Tier-B worker sizing / op placement, never the rendered values.
+    cost_hint: f32 = 1.0,
     /// Monomorphized Map/Rate kernel entry (erased). Null in the comptime IR: the
     /// op-list topology + buffer ids are fixed by the commit pass; the runnable
     /// kernel pointer is bound by the executor when it monomorphizes over the
@@ -1062,6 +1067,7 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
             const in_n: usize = if (max_in_port < 0) 0 else @intCast(max_in_port + 1);
             ops[i] = .{
                 .node_id = v,
+                .cost_hint = g.nodes[v].cost_hint,
                 .fn_ptr = null,
                 .self_ptr = null,
                 .input_buffer_ids = in_ids,

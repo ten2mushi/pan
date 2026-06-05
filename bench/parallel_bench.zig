@@ -43,6 +43,9 @@ const Reps = 5;
 fn BiquadCascade(comptime stages: usize) type {
     return struct {
         const Self = @This();
+        // Compute intensity per sample ≈ 5 mul-adds per stage — far above the cheap
+        // adder/Pass plumbing, so the parallel cost model sizes P from the real work.
+        pub const cost_hint: f32 = 5.0 * @as(f32, @floatFromInt(stages));
         // 2nd-order Butterworth LP, fc = 0.1·Fs (textbook-stable).
         const b0: f32 = 0.0675;
         const b1: f32 = 0.1349;
@@ -73,6 +76,8 @@ fn BiquadCascade(comptime stages: usize) type {
 fn Fir(comptime taps: usize) type {
     return struct {
         const Self = @This();
+        // ≈ one mul-add per tap per sample — the per-kernel intensity the cost model needs.
+        pub const cost_hint: f32 = 0.5 * @as(f32, @floatFromInt(taps));
         z: [taps]f32 = [_]f32{0} ** taps,
         pos: usize = 0,
         const coeff: f32 = 1.0 / @as(f32, @floatFromInt(taps));
@@ -98,6 +103,8 @@ fn Fir(comptime taps: usize) type {
 fn Heavy(comptime iters: usize) type {
     return struct {
         const Self = @This();
+        // ≈ 3 ops per iteration per sample.
+        pub const cost_hint: f32 = 3.0 * @as(f32, @floatFromInt(iters));
         k: f32 = 0.5,
         pub fn process(self: *Self, in: []const Sample(f32), out: []Sample(f32)) void {
             for (in, out) |x, *o| {
@@ -339,6 +346,31 @@ pub fn main() !void {
     //    under-estimates a compute-heavy graph's parallelism, so the worker count caps
     //    below the available cores until per-kernel costs / live telemetry refine it.
     std.debug.print("(min-of-{d} reps; real biquad/FIR kernels; no real workgroup; worker count is gate-capped — see notes)\n", .{Reps});
+
+    // Profile-guided calibration. Build one biquad bank, show the gate's worker sizing
+    // from the static cost hint, then re-cost it from MEASURED per-op CPU and show the
+    // result (the schedule stays bit-exact to Tier A — measured costs change only the
+    // worker count and op placement, never the rendered values). Run first so it is
+    // captured even if a later wide sweep stalls on the unbounded cross-worker spin a
+    // real device workgroup would bound.
+    {
+        const N = 512;
+        var input: [N]Sample(f32) = undefined;
+        fillNoise(&input, 0xCA11B);
+        var out: [N]Sample(f32) = undefined;
+        const token = engine.enterRealtimeThread();
+        defer token.leave();
+        var eng = try buildWide(16, BiquadCascade(4), N, gpa, &input, &out, .{ .cores = 8, .force_workgroup = true, .tier_b_executor = .heft });
+        defer eng.deinit();
+        std.debug.print("\n--- profile-guided calibration (16 biquad voices, cores=8) ---\n", .{});
+        std.debug.print("  static hint : workers={d:>2}  par={d:>4.1}  calibrated={}\n", .{ eng.tierBWorkers(), eng.tierBParallelism(), eng.tierBCalibrated() });
+        eng.calibrate(16); // 16 warm-up blocks, off the RT path
+        std.debug.print("  measured    : workers={d:>2}  par={d:>4.1}  calibrated={}\n", .{ eng.tierBWorkers(), eng.tierBParallelism(), eng.tierBCalibrated() });
+        // A few live renders to confirm the re-costed Tier-B schedule still runs.
+        renderN(&eng, token, 8);
+        h.consume(out[0]);
+        std.debug.print("  post-calibration render OK; tierBActive={}\n", .{eng.tierBActive()});
+    }
 
     // Real-kernel flagships: a wide bank of independent IIR / FIR voices feeding a mix
     // — the shape where work/span ≫ 1 and parallelism pays.

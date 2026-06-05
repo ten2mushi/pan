@@ -64,6 +64,14 @@ pub const Node = struct {
     /// Per-block persistent state bytes (coefficients, window tables, …) — the
     /// per-block term of the footprint. 0 unless the block declares it.
     state_size: usize,
+    /// Relative compute cost PER OUTPUT SAMPLE, as a multiplier on the data volume
+    /// the static scheduler's cost model would otherwise assume (a cheap copy/add is
+    /// 1.0; a biquad cascade or FFT is many times that). A block declares it with
+    /// `pub const cost_hint: f32`; absent ⇒ 1.0. It changes ONLY the parallel
+    /// scheduler's worker-count and op-placement choices, never the rendered values,
+    /// so a wrong hint costs throughput, never correctness. Defaults to 1.0 so an
+    /// unannotated graph behaves exactly as before.
+    cost_hint: f32 = 1.0,
     /// Which clock grid this node's I/O lives on. A single audio domain (0) for
     /// every graph until rate-elastic blocks introduce a second grid; carried so
     /// the per-rate-domain delay pass has it.
@@ -280,6 +288,7 @@ pub const Graph = struct {
             .out_per_in_q = ratio.q,
             .aliasing_safe = comptime @hasDecl(Block, "aliasing_safe") and Block.aliasing_safe,
             .state_size = comptime if (@hasDecl(Block, "state_size")) Block.state_size else 0,
+            .cost_hint = comptime if (@hasDecl(Block, "cost_hint")) Block.cost_hint else 1.0,
             .rate_domain = 0,
             .sample_rate = self.sample_rate,
             .set_param_slots = 0,
