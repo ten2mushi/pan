@@ -1,30 +1,27 @@
 #!/usr/bin/env node
 // Headless-GPU frame capture for the WebGL constellation viewer
-// (examples/animation/viewer.html).
+// (examples/animation/viewer.html). DEPENDENCY-FREE: it talks to Chrome's DevTools
+// Protocol directly over Node's built-in WebSocket/fetch (Node ≥ 22) — no puppeteer,
+// no node_modules. It drives the SAME viewer.html in headless Chrome (scene drawn by
+// the GPU), steps it frame-by-frame, screenshots each composited frame, pipes the
+// PNGs into ffmpeg, and muxes the matching audio.
 //
-// The offline Python renderers rasterize each frame on the CPU (~0.2 s/frame). This
-// drives the SAME viewer.html in headless Chrome — so the scene is drawn by the GPU
-// (WebGL) — steps it frame-by-frame deterministically, screenshots each composited
-// frame (3-D scene + HUD overlays), pipes the PNGs straight into ffmpeg, and muxes
-// the matching audio. No matplotlib, no temp PNGs on disk.
-//
-// Usage (run from the repo root):
-//   node examples/animation/capture_webgl.mjs --base data/work/<name>.features \
-//        --audio "<source audio>" [--out PATH] [--fps 30] [--start 0] [--seconds 0] \
-//        [--width 1920] [--height 1080] [--title STR]
+// Usage (run from the repo root; needs only `node`, a Chrome/Chromium, and ffmpeg):
+//   node examples/animation/capture_webgl.mjs --base data/work/<source>.features \
+//        --audio "data/input/<source>/<source>_lpcm.wav" [--out PATH] [--fps 30] \
+//        [--start 0] [--seconds 0] [--width 1920] [--height 1080] [--title STR] [--chrome PATH]
 //   --out defaults to data/output/animation_<source>/<source>.constellation.mp4
-//
-// Requires: a Chrome/Chromium executable (auto-detected or --chrome PATH) and ffmpeg.
 
 import http from "node:http";
 import fs from "node:fs";
+import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import puppeteer from "puppeteer-core";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
-const EXPERIMENT = "animation";  // output dir: data/output/<EXPERIMENT>_<source>/
+const EXPERIMENT = "animation";
 
 function arg(name, def) {
   const i = process.argv.indexOf("--" + name);
@@ -39,17 +36,26 @@ const SECONDS = parseFloat(arg("seconds", "0"));
 const W = parseInt(arg("width", "1920"));
 const H = parseInt(arg("height", "1080"));
 const TITLE = arg("title", "");
-// Default output: data/output/animation_<source>/<source>.constellation.mp4
 const SRC = path.basename(BASE).replace(/\.features$/, "");
 const OUT = arg("out", path.join(REPO, "data", "output", `${EXPERIMENT}_${SRC}`,
   `${SRC}.constellation.mp4`));
 fs.mkdirSync(path.dirname(OUT), { recursive: true });
 
-const CHROME = arg("chrome",
-  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+const CHROME = arg("chrome", findChrome());
+
+function findChrome() {
+  const cands = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser",
+  ];
+  for (const c of cands) if (fs.existsSync(c)) return c;
+  return "google-chrome";
+}
 
 const MIME = { ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript",
   ".json": "application/json", ".f32": "application/octet-stream" };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function startServer() {
   return new Promise((resolve) => {
@@ -65,12 +71,16 @@ function startServer() {
     srv.listen(0, "127.0.0.1", () => resolve(srv));
   });
 }
-
+function freePort() {
+  return new Promise((res) => {
+    const s = net.createServer();
+    s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => res(p)); });
+  });
+}
 function ffmpegPipe(silent) {
-  const a = ["-y", "-f", "image2pipe", "-framerate", String(FPS), "-i", "-",
-             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", silent];
-  const p = spawn("ffmpeg", ["-v", "error", ...a], { stdio: ["pipe", "inherit", "inherit"] });
-  return p;
+  return spawn("ffmpeg", ["-v", "error", "-y", "-f", "image2pipe", "-framerate", String(FPS),
+    "-i", "-", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", silent],
+    { stdio: ["pipe", "inherit", "inherit"] });
 }
 function run(cmd, a) {
   return new Promise((res, rej) => {
@@ -78,46 +88,99 @@ function run(cmd, a) {
     p.on("close", (c) => (c === 0 ? res() : rej(new Error(cmd + " exit " + c))));
   });
 }
-function write(stream, buf) {
+function writeChunk(stream, buf) {
   return new Promise((res) => { stream.write(buf) ? res() : stream.once("drain", res); });
+}
+
+// --- a tiny CDP (Chrome DevTools Protocol) client over the built-in WebSocket ---
+function connectCDP(wsUrl) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(wsUrl);
+    const pending = new Map();
+    let nextId = 0;
+    ws.onmessage = (ev) => {
+      const m = JSON.parse(ev.data);
+      if (m.id && pending.has(m.id)) {
+        const { res, rej } = pending.get(m.id); pending.delete(m.id);
+        m.error ? rej(new Error(JSON.stringify(m.error))) : res(m.result);
+      }
+    };
+    ws.onerror = (e) => reject(e.error || new Error("ws error"));
+    ws.onopen = () => resolve({
+      send: (method, params = {}) => new Promise((res, rej) => {
+        const id = ++nextId; pending.set(id, { res, rej });
+        ws.send(JSON.stringify({ id, method, params }));
+      }),
+      close: () => ws.close(),
+    });
+  });
 }
 
 const srv = await startServer();
 const port = srv.address().port;
-const browser = await puppeteer.launch({
-  executablePath: CHROME,
-  headless: "new",
-  args: ["--no-sandbox", "--hide-scrollbars", "--mute-audio",
-         "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist",
-         `--window-size=${W},${H}`],
-});
-try {
-  const page = await browser.newPage();
-  await page.setViewport({ width: W, height: H, deviceScaleFactor: 1 });
-  const params = new URLSearchParams({ base: BASE, capture: "1" });
-  if (TITLE) params.set("title", TITLE);
-  const url = `http://127.0.0.1:${port}/examples/animation/viewer.html?${params}`;
-  await page.goto(url, { waitUntil: "load", timeout: 60000 });
-  await page.waitForFunction("window.panViewer && window.panViewer.ready", { timeout: 60000 });
+const cdpPort = await freePort();
+const userDir = fs.mkdtempSync(path.join(os.tmpdir(), "pancap-"));
+const params = new URLSearchParams({ base: BASE, capture: "1" });
+if (TITLE) params.set("title", TITLE);
+const pageUrl = `http://127.0.0.1:${port}/examples/animation/viewer.html?${params}`;
 
-  const info = await page.evaluate(() => ({ totalT: window.panViewer.totalT, fps: window.panViewer.fps }));
+const chrome = spawn(CHROME, [
+  "--headless=new", "--no-sandbox", "--hide-scrollbars", "--mute-audio",
+  "--disable-extensions", "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist",
+  `--remote-debugging-port=${cdpPort}`, `--window-size=${W},${H}`,
+  "--force-device-scale-factor=1", `--user-data-dir=${userDir}`, pageUrl,
+], { stdio: "ignore" });
+
+let cdp;
+try {
+  // wait for the DevTools endpoint, then find the viewer page target
+  let target = null;
+  for (let i = 0; i < 100 && !target; i++) {
+    try {
+      const list = await (await fetch(`http://127.0.0.1:${cdpPort}/json/list`)).json();
+      target = list.find((t) => t.type === "page" && t.url.includes("viewer.html"));
+    } catch { /* not up yet */ }
+    if (!target) await sleep(100);
+  }
+  if (!target) throw new Error("Chrome DevTools page target not found (is Chrome installed?)");
+  cdp = await connectCDP(target.webSocketDebuggerUrl);
+
+  await cdp.send("Page.enable");
+  await cdp.send("Runtime.enable");
+  await cdp.send("Emulation.setDeviceMetricsOverride",
+    { width: W, height: H, deviceScaleFactor: 1, mobile: false });
+
+  // wait for the viewer module to finish loading (fetch matrix + build scene)
+  let ready = false;
+  for (let i = 0; i < 300 && !ready; i++) {
+    const r = await cdp.send("Runtime.evaluate",
+      { expression: "!!(window.panViewer && window.panViewer.ready)", returnByValue: true });
+    ready = r.result.value === true;
+    if (!ready) await sleep(100);
+  }
+  if (!ready) throw new Error("viewer.html never became ready (check the matrix path / console)");
+
+  const info = JSON.parse((await cdp.send("Runtime.evaluate", {
+    expression: "JSON.stringify({totalT:window.panViewer.totalT,fps:window.panViewer.fps})",
+    returnByValue: true,
+  })).result.value);
   const dur = SECONDS > 0 ? Math.min(SECONDS, info.totalT - START) : (info.totalT - START);
   const N = Math.max(1, Math.round(dur * FPS));
-  console.error(`capture: ${N} frames @ ${FPS}fps (${dur.toFixed(1)}s, start ${START}s) via headless Chrome`);
+  console.error(`capture: ${N} frames @ ${FPS}fps (${dur.toFixed(1)}s, start ${START}s) via headless Chrome (CDP, no deps)`);
 
   const silent = OUT.replace(/\.mp4$/, "") + ".silent.mp4";
   const ff = ffmpegPipe(silent);
   const t0 = Date.now();
   for (let f = 0; f < N; f++) {
     const t = START + f / FPS;
-    await page.evaluate((tt) => window.panViewer.renderAt(tt), t);
-    const png = await page.screenshot({ type: "png" });
-    await write(ff.stdin, png);
-    if (f % 120 === 0) console.error(`  frame ${f}/${N}  (${((Date.now()-t0)/Math.max(1,f)).toFixed(0)} ms/frame)`);
+    await cdp.send("Runtime.evaluate", { expression: `window.panViewer.renderAt(${t})`, returnByValue: true });
+    const shot = await cdp.send("Page.captureScreenshot", { format: "png", captureBeyondViewport: false });
+    await writeChunk(ff.stdin, Buffer.from(shot.data, "base64"));
+    if (f % 120 === 0) console.error(`  frame ${f}/${N}  (${((Date.now() - t0) / Math.max(1, f)).toFixed(0)} ms/frame)`);
   }
   ff.stdin.end();
   await new Promise((r) => ff.on("close", r));
-  console.error(`capture: ${((Date.now()-t0)/N).toFixed(1)} ms/frame avg -> ${silent}`);
+  console.error(`capture: ${((Date.now() - t0) / N).toFixed(1)} ms/frame avg -> ${silent}`);
 
   if (AUDIO) {
     await run("ffmpeg", ["-v", "error", "-y", "-i", silent, "-ss", String(START), "-i", AUDIO,
@@ -128,6 +191,8 @@ try {
     fs.copyFileSync(silent, OUT);
   }
 } finally {
-  await browser.close();
+  try { cdp && cdp.close(); } catch { /* ignore */ }
+  chrome.kill();
   srv.close();
+  try { fs.rmSync(userDir, { recursive: true, force: true }); } catch { /* ignore */ }
 }

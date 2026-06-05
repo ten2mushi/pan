@@ -44,7 +44,3 @@ venv/
 
 # Local Claude Code agent state (session locks, not project content)
 .claude/
-
-# Node (puppeteer capture tooling)
-node_modules/
-package-lock.json

@@ -1,68 +1,65 @@
-# examples/animation — audio-reactive 3-D particle visualization
+# examples/animation — audio-reactive 3-D constellation visualization
 
 Turns a recording into the `notes/1.md` generative 3-D point-cloud animation, using
-the **pan library** for all feature extraction. Two visual styles share one feature
-matrix, and there are two render backends (offline CPU, or real-time GPU).
+the **pan library** for all feature extraction and **WebGL** for rendering. No Python
+and no npm dependencies — just the pan binary, a browser/Chrome, and ffmpeg.
 
 ```
-audio ─(scripts/decode_audio.py)─► mono f32 LPCM ─(example-analyze, pan)─► features.f32
+audio ─(scripts/decode_audio.py)─► mono f32 LPCM ─(example-analyze, pan)─► <source>.features.f32
                                                                               │
-                              ┌───────────────────────────────────────────────┤
-                              ▼                                                 ▼
-                   render_viz.py / render_viz_v2.py                       viewer.html
-                   (matplotlib, offline file)                       (three.js, real-time GPU)
-                                                                          │
-                                                                  capture_webgl.mjs
-                                                                  (headless-GPU → mp4 file)
+                                              ┌────────────────────────────────┤
+                                              ▼                                 ▼
+                                       viewer.html                       capture_webgl.mjs
+                                  (three.js, real-time GPU,           (headless Chrome via the
+                                   interactive orbit/scrub)            DevTools Protocol → mp4)
 ```
 
 ## Files
 | file | role |
 |---|---|
 | `analyze.zig` | the pan Phase-9 Analyzer graph (`LpcmSource → Stft → PowerSpectrum → {dominant band, RMS, centroid, rolloff, flux, flatness, contrast}` + `Framer → BallisticEnvelope` → `Concat → FeatureCollectorSink`). Built by `zig build examples` → `zig-out/bin/example-analyze`. Emits `<base>.features.f32` (row-major f32, one row per 60 fps hop) + `.json` sidecar. |
-| `render_viz.py` | **classic** style — soft rainbow particle field (matplotlib, offline). |
-| `render_viz_v2.py` | **constellation** style — icy crystalline neural-web (matplotlib, offline). |
-| `run_pipeline.py` | one-command driver: decode → analyze → render, with audio muxed and a numeric shape-check. |
-| `viewer.html` | real-time WebGL viewer of the feature matrix (interactive orbit + scrub). |
-| `capture_webgl.mjs` | headless-Chrome capture of `viewer.html` → mp4 (GPU, ~3–5× faster than matplotlib). |
+| `viewer.html` | self-contained three.js/WebGL viewer of the feature matrix: an icy crystalline neural-web that grows as the piece plays, real-time on the GPU, with interactive orbit + a scrub bar. All per-point behaviour (recency fade, birth pulse) runs in GLSL. |
+| `capture_webgl.mjs` | renders `viewer.html` to an mp4 by driving headless Chrome over the **DevTools Protocol** using Node's built-in `WebSocket`/`fetch` — **zero npm dependencies** — then muxes the audio. |
 
 ## Run (from the repo root)
 
-End-to-end (decode + analyze + render + mux), constellation style:
+1. Decode the source to mono LPCM:
 ```
-.venv/bin/python examples/animation/run_pipeline.py \
-    "data/input/<source>/<source>_lpcm.wav" --style constellation --fps 30
-# --style classic for the rainbow particle field; --seconds N / --start S to excerpt
+.venv/bin/python scripts/decode_audio.py \
+    "data/input/<source>/<source>_lpcm.wav" data/work/<source>
 ```
-
-Real-time GPU render to a file (reuses a cached `data/work/<source>.features`):
+2. Run the pan analysis (build the binary first with `zig build examples`):
+```
+./zig-out/bin/example-analyze data/work/<source>.mono.f32 44100 data/work/<source>.features
+```
+3a. Render to a file (GPU, headless):
 ```
 node examples/animation/capture_webgl.mjs \
     --base data/work/<source>.features \
     --audio "data/input/<source>/<source>_lpcm.wav" --fps 30 --title "<Source>"
 ```
-
-Interactive viewer:
+3b. …or explore it live in a browser:
 ```
 python3 -m http.server 8000
 # open http://localhost:8000/examples/animation/viewer.html?base=data/work/<source>.features
 ```
 
 ## Output
-Each run writes to its own folder: **`data/output/animation_<source>/<source>.constellation.mp4`**
-(or `.mp4` for classic), with the source audio muxed in. 1920×1080 @ 30 fps.
+`capture_webgl.mjs` writes to **`data/output/animation_<source>/<source>.constellation.mp4`**
+(auto-created), 1920×1080 @ 30 fps, with the source audio muxed in. `--out PATH` overrides.
 
 ## What you see (notes/1.md schema)
 - **colour** = the most-active frequency band at emission (icy blue→white ramp);
 - **node size/brightness** = the 0–1 signal amplitude;
-- a node is born small, pulses (grow-then-shrink), then settles into the accumulating
-  trail; the **current point** is whichever node is mid-pulse;
-- thin lines link each point to its nearest neighbours **in frequency/feature space**
-  (a constellation that grows as the piece plays);
-- the bottom-left readout tracks the current point (frequency, amplitude, lifetime,
-  emission time); a slow camera orbits the structure.
+- each node is born small, pulses (a tight grow-then-shrink), then settles into the
+  accumulating trail — the **current point** is whichever node is mid-pulse;
+- hair-thin lines link each point to its nearest neighbours **in frequency/feature
+  space**, a constellation that grows as the piece plays;
+- bottom-left readout tracks the current point (frequency, amplitude, lifetime,
+  emission time); the camera drifts slowly around the structure.
 
 ## Dependencies
-`scripts/decode_audio.py` (numpy/scipy, ffmpeg for compressed inputs) · the venv
-(`numpy scipy matplotlib`) for the Python renderers · `zig build examples` for the
-analyzer · node + `puppeteer-core` + a system Chrome + ffmpeg for `capture_webgl.mjs`.
+`scripts/decode_audio.py` (numpy/scipy, ffmpeg for compressed inputs) · `zig build
+examples` for the analyzer · **node ≥ 22** + a Chrome/Chromium + **ffmpeg** for
+`capture_webgl.mjs` (auto-detects Chrome; override with `--chrome PATH`). No `npm
+install` needed.
