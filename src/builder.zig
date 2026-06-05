@@ -262,6 +262,10 @@ pub const Graph = struct {
     /// here and its render/destroy/set thunks captured, so commit binds them into
     /// the op-list with no further reflection.
     pub fn add(self: *Self, comptime Block: type, params: anytype) !NodeHandle(Block) {
+        // Fail loud at the graph-capacity ceiling instead of overrunning the fixed
+        // node/bound arrays (a silent out-of-bounds write → torn memory / segfault).
+        // The caller already `try`s, so this surfaces as a recoverable error.
+        if (self.ir.node_count >= graph.max_nodes) return error.GraphFull;
         const id = self.ir.add(Block);
         const inst = try self.alloc.create(Block);
         errdefer self.alloc.destroy(inst);

@@ -245,6 +245,13 @@ pub const Graph = struct {
         const out_size = comptime if (hasOutput(Block)) @sizeOf(outElemOf(Block)) else 0;
         const out_name = comptime if (hasOutput(Block)) @typeName(outElemOf(Block)) else "(sink)";
         const ratio = comptime ratioOf(Block);
+        // Defense in depth: the public builder surface returns `error.GraphFull` at
+        // this ceiling, but a direct core caller (commit-pass fixtures, the comptime
+        // embedded construction) reaches here too — fail loud rather than overrun the
+        // fixed `nodes` array. At comptime this becomes a compile error (loud); at
+        // runtime, a panic instead of a silent out-of-bounds write.
+        if (self.node_count >= max_nodes)
+            @panic("pan graph: node capacity (graph.max_nodes) exceeded — raise max_nodes or split the graph");
         const id = self.node_count;
         self.nodes[id] = .{
             .id = id,
