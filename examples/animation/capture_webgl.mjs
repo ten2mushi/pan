@@ -3,8 +3,14 @@
 // (examples/animation/viewer.html). DEPENDENCY-FREE: it talks to Chrome's DevTools
 // Protocol directly over Node's built-in WebSocket/fetch (Node ≥ 22) — no puppeteer,
 // no node_modules. It drives the SAME viewer.html in headless Chrome (scene drawn by
-// the GPU), steps it frame-by-frame, screenshots each composited frame, pipes the
-// PNGs into ffmpeg, and muxes the matching audio.
+// the GPU), steps it frame-by-frame, reads each frame via canvas.toDataURL (JPEG,
+// direct WebGL framebuffer — no compositor screenshot), pipes JPEGs into ffmpeg as
+// mjpeg, and muxes the matching audio.
+//
+// Speed vs the old Page.captureScreenshot path:
+//   • JPEG instead of PNG → skips deflate, ~3× smaller payload over CDP WS
+//   • canvas.toDataURL reads the GPU framebuffer directly, skips the compositor
+//   • 1-frame lookahead: next frame evaluated while current frame is written to ffmpeg
 //
 // Usage (run from the repo root; needs only `node`, a Chrome/Chromium, and ffmpeg):
 //   node examples/animation/capture_webgl.mjs --base data/work/<source>.features \
@@ -36,6 +42,38 @@ const SECONDS = parseFloat(arg("seconds", "0"));
 const W = parseInt(arg("width", "1920"));
 const H = parseInt(arg("height", "1080"));
 const TITLE = arg("title", "");
+
+// Camera: spherical Lissajous orbit. The polar wobble frequencies are derived
+// from cam-speed via the golden ratio (always incommensurate → quasi-periodic).
+// --cam-speed   azimuthal angular velocity (rad/s). 0.10 → one orbit ~63s.
+// --cam-radius  orbital distance in world units. Smaller = tighter framing.
+// --cam-polar1  primary polar wobble amplitude (radians). 0 = flat orbit.
+// --cam-polar2  secondary polar wobble amplitude; adds organic texture.
+const CAM_SPEED  = arg("cam-speed",  "0.10");
+const CAM_RADIUS = arg("cam-radius", "11");
+const CAM_POLAR1 = arg("cam-polar1", "0.90");
+const CAM_POLAR2 = arg("cam-polar2", "0.25");
+
+// Edge recency: soft exponential fade over this many seconds.
+// --edge-life  0 = no fade, all edges persist (original behaviour).
+//              30 (default) → edges reach ~5% opacity at 30s, culled at 90s.
+const EDGE_LIFE = arg("edge-life", "30");
+
+// Colour: time-based hue progression across the piece.
+// --hue-shift  fraction of the colour wheel (0–1). 0 = original ICE blue→white.
+//              0.50 (default) = 180° rotation: blue→teal→green→violet→rose.
+const HUE_SHIFT = arg("hue-shift", "0.50");
+
+// kNN clustering mode for the constellation edge mesh.
+// --knn         "spatial" (default) = K nearest in 3D position space.
+//               "temporal" = K nearest in emission time (ribbon/thread).
+//               "spectro-temporal" = spatial kNN with ±knn-window time constraint.
+// --knn-k       neighbours per point (default 4). For temporal: 1=thread, 2=ribbon.
+// --knn-window  time window in seconds for spectro-temporal mode (default 5).
+const KNN_MODE   = arg("knn",        "spatial");
+const KNN_K      = arg("knn-k",      "4");
+const KNN_WINDOW = arg("knn-window", "5");
+
 const SRC = path.basename(BASE).replace(/\.features$/, "");
 const OUT = arg("out", path.join(REPO, "data", "output", `${EXPERIMENT}_${SRC}`,
   `${SRC}.constellation.mp4`));
@@ -78,7 +116,9 @@ function freePort() {
   });
 }
 function ffmpegPipe(silent) {
-  return spawn("ffmpeg", ["-v", "error", "-y", "-f", "image2pipe", "-framerate", String(FPS),
+  // Input is MJPEG (JPEG frames) — matches canvas.toDataURL("image/jpeg") output.
+  // ffmpeg decodes each JPEG and re-encodes to H.264; no extra transcode overhead.
+  return spawn("ffmpeg", ["-v", "error", "-y", "-f", "mjpeg", "-framerate", String(FPS),
     "-i", "-", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", silent],
     { stdio: ["pipe", "inherit", "inherit"] });
 }
@@ -122,6 +162,16 @@ const cdpPort = await freePort();
 const userDir = fs.mkdtempSync(path.join(os.tmpdir(), "pancap-"));
 const params = new URLSearchParams({ base: BASE, capture: "1" });
 if (TITLE) params.set("title", TITLE);
+// Forward all viewer params as URL query strings
+params.set("cam_speed",  CAM_SPEED);
+params.set("cam_radius", CAM_RADIUS);
+params.set("cam_polar1", CAM_POLAR1);
+params.set("cam_polar2", CAM_POLAR2);
+params.set("edge_life",  EDGE_LIFE);
+params.set("hue_shift",  HUE_SHIFT);
+params.set("knn",        KNN_MODE);
+params.set("knn_k",      KNN_K);
+params.set("knn_window", KNN_WINDOW);
 const pageUrl = `http://127.0.0.1:${port}/examples/animation/viewer.html?${params}`;
 
 const chrome = spawn(CHROME, [
@@ -151,14 +201,26 @@ try {
     { width: W, height: H, deviceScaleFactor: 1, mobile: false });
 
   // wait for the viewer module to finish loading (fetch matrix + build scene)
+  // 1200 polls × 100 ms = 120 s; large .f32 files (9+ MB) can take 5–10 s to fetch
+  // and the kNN mesh build for 180k nodes takes another few seconds.
   let ready = false;
-  for (let i = 0; i < 300 && !ready; i++) {
+  for (let i = 0; i < 1200 && !ready; i++) {
     const r = await cdp.send("Runtime.evaluate",
       { expression: "!!(window.panViewer && window.panViewer.ready)", returnByValue: true });
     ready = r.result.value === true;
     if (!ready) await sleep(100);
+    if (i > 0 && i % 100 === 0) console.error(`  still waiting for viewer… (${i / 10}s)`);
   }
-  if (!ready) throw new Error("viewer.html never became ready (check the matrix path / console)");
+  if (!ready) {
+    // try to surface the JS error from the page
+    const errR = await cdp.send("Runtime.evaluate",
+      { expression: "document.getElementById('err')?.textContent || '(no error element)'", returnByValue: true });
+    const consoleErrs = await cdp.send("Runtime.evaluate",
+      { expression: "window._panErr || ''", returnByValue: true });
+    console.error("page error element:", errR.result.value);
+    console.error("window._panErr:", consoleErrs.result.value);
+    throw new Error("viewer.html never became ready (check the matrix path / console)");
+  }
 
   const info = JSON.parse((await cdp.send("Runtime.evaluate", {
     expression: "JSON.stringify({totalT:window.panViewer.totalT,fps:window.panViewer.fps})",
@@ -171,12 +233,26 @@ try {
   const silent = OUT.replace(/\.mp4$/, "") + ".silent.mp4";
   const ff = ffmpegPipe(silent);
   const t0 = Date.now();
+
+  // captureFrame(tt) — reads the WebGL framebuffer via canvas.toDataURL (JPEG),
+  // bypassing the CDP compositor screenshot path entirely.
+  const JPEG_Q = 0.92;
+  const captureExpr = (tt) =>
+    `(()=>{ const d=window.panViewer.captureFrame(${tt},${JPEG_Q}); return d.slice(d.indexOf(",")+1); })()`;
+
+  // 1-frame lookahead: fire the JS evaluation for frame f+1 while we write frame f
+  // to ffmpeg stdin — hides most of the serialization latency.
+  let pendingB64 = cdp.send("Runtime.evaluate", { expression: captureExpr(START), returnByValue: true });
   for (let f = 0; f < N; f++) {
-    const t = START + f / FPS;
-    await cdp.send("Runtime.evaluate", { expression: `window.panViewer.renderAt(${t})`, returnByValue: true });
-    const shot = await cdp.send("Page.captureScreenshot", { format: "png", captureBeyondViewport: false });
-    await writeChunk(ff.stdin, Buffer.from(shot.data, "base64"));
-    if (f % 120 === 0) console.error(`  frame ${f}/${N}  (${((Date.now() - t0) / Math.max(1, f)).toFixed(0)} ms/frame)`);
+    const nextT = START + (f + 1) / FPS;
+    // kick off next frame evaluation before we block on writing current frame
+    const nextB64 = f + 1 < N
+      ? cdp.send("Runtime.evaluate", { expression: captureExpr(nextT), returnByValue: true })
+      : null;
+    const cur = await pendingB64;
+    await writeChunk(ff.stdin, Buffer.from(cur.result.value, "base64"));
+    if (f % 60 === 0) console.error(`  frame ${f}/${N}  (${((Date.now() - t0) / Math.max(1, f + 1)).toFixed(0)} ms/frame)`);
+    pendingB64 = nextB64;
   }
   ff.stdin.end();
   await new Promise((r) => ff.on("close", r));

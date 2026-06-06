@@ -66,17 +66,48 @@
 <script type="module">
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import { LineSegments2 } from "three/addons/lines/LineSegments2.js";
-import { LineSegmentsGeometry } from "three/addons/lines/LineSegmentsGeometry.js";
-import { LineMaterial } from "three/addons/lines/LineMaterial.js";
 
+// ---------------------------------------------------------------------------
+// URL parameters (all settable via capture_webgl.mjs CLI args)
+// ---------------------------------------------------------------------------
 const q = new URLSearchParams(location.search);
-const BASE = q.get("base") || "data/work/queen_of_the_night.features";
+const BASE  = q.get("base") || "data/work/queen_of_the_night.features";
 const SPEED = parseFloat(q.get("speed") || "1");
 const TITLE = q.get("title") || "";
+
+// Camera: spherical Lissajous orbit with golden-ratio incommensurate wobble
+// cam_speed  — azimuthal angular velocity (rad/s); one orbit ≈ 2π/ω
+// cam_radius — orbital radius (world units); smaller = tighter framing
+// cam_polar1 — primary polar wobble amplitude (rad); 0 = flat equatorial orbit
+// cam_polar2 — secondary polar wobble amplitude; adds organic texture
+const CAM_SPEED  = parseFloat(q.get("cam_speed")  || "0.10");
+const CAM_RADIUS = parseFloat(q.get("cam_radius") || "11");
+const CAM_POLAR1 = parseFloat(q.get("cam_polar1") || "0.90");
+const CAM_POLAR2 = parseFloat(q.get("cam_polar2") || "0.25");
+const PHI = (1 + Math.sqrt(5)) / 2;  // golden ratio ≈ 1.618
+
+// Edge recency: soft exponential fade over this lifetime (seconds).
+// 0 = no recency — all edges persist at fixed opacity (original behaviour).
+const EDGE_LIFE = parseFloat(q.get("edge_life") || "30");
+
+// Hue shift: total hue rotation over the piece duration (0–1 = fraction of
+// colour wheel). 0 = original ICE blue→white. 0.50 = 180° blue→teal→rose.
+const HUE_SHIFT = parseFloat(q.get("hue_shift") || "0.50");
+
+// kNN clustering mode for the constellation edge mesh:
+//   "spatial"          — K nearest in 3D position space (original)
+//   "temporal"         — K nearest in emission time (ribbon/thread)
+//   "spectro-temporal" — K nearest spatial within ±knn_window seconds
+const KNN_MODE   = q.get("knn") || "spatial";
+const KNN_K      = parseInt(q.get("knn_k") || "4");
+const KNN_WINDOW = parseFloat(q.get("knn_window") || "5");
+
 const ICE = [[0.169,0.290,0.471],[0.357,0.561,0.788],[0.663,0.824,0.949],
              [0.910,0.957,1.0],[1,1,1]];  // matches render_viz_v2.ICE
 
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
 function fail(m){ const e=document.getElementById("err"); e.style.display="block";
   e.textContent=m; throw new Error(m); }
 function lerp3(stops,u){ u=Math.min(1,Math.max(0,u)); const x=u*(stops.length-1);
@@ -85,6 +116,24 @@ function lerp3(stops,u){ u=Math.min(1,Math.max(0,u)); const x=u*(stops.length-1)
 function pctile(arr,p){ const s=Float32Array.from(arr).sort(); const idx=(p/100)*(s.length-1);
   const lo=Math.floor(idx),hi=Math.ceil(idx); return s[lo]+(s[hi]-s[lo])*(idx-lo); }
 function norm01(arr,p){ const hi=pctile(arr,p)||1; return arr.map(v=>Math.min(1,Math.max(0,v/hi))); }
+
+// HSL ↔ RGB for time-based hue progression
+function rgb2hsl(r,g,b){
+  const mx=Math.max(r,g,b),mn=Math.min(r,g,b),l=(mx+mn)/2;
+  if(mx===mn) return [0,0,l];
+  const d=mx-mn, s=l>0.5?d/(2-mx-mn):d/(mx+mn);
+  let h; if(mx===r) h=((g-b)/d+(g<b?6:0))/6;
+  else if(mx===g) h=((b-r)/d+2)/6; else h=((r-g)/d+4)/6;
+  return [h,s,l];
+}
+function hsl2rgb(h,s,l){
+  if(s===0) return [l,l,l];
+  const Q=l<0.5?l*(1+s):l+s-l*s, P=2*l-Q;
+  const f=t=>{ if(t<0)t+=1;if(t>1)t-=1;
+    if(t<1/6)return P+(Q-P)*6*t; if(t<1/2)return Q;
+    if(t<2/3)return P+(Q-P)*(2/3-t)*6; return P; };
+  return [f(h+1/3),f(h),f(h-1/3)];
+}
 
 async function load() {
   // Resolve `base` against the SERVER ROOT (the page lives in /examples/, so a
@@ -124,14 +173,37 @@ async function load() {
     const r=1+4.6*ampN[i]+2.2*fluxN[i];
     pos[i*3]=r*Math.cos(az); pos[i*3+1]=(lf-0.5)*8+0.5*Math.sin(az*0.5); pos[i*3+2]=r*Math.sin(az);
     const cv=(L2(Math.min(Math.max(freq[i],flo),fhi))-lflo)/(lfhi-lflo);
-    const c=lerp3(ICE,cv); col[i*3]=c[0]; col[i*3+1]=c[1]; col[i*3+2]=c[2];
+    const c=lerp3(ICE,cv);
+    // Time-based hue progression: rotate hue by (i/n)*HUE_SHIFT across the piece.
+    // At HUE_SHIFT=0.50 (180°): start=blue→white, mid=teal→cyan, end=rose→pink.
+    if (HUE_SHIFT > 0) {
+      const [h,s,l]=rgb2hsl(c[0],c[1],c[2]);
+      const [r2,g2,b2]=hsl2rgb((h+(i/n)*HUE_SHIFT)%1.0,s,l);
+      col[i*3]=r2; col[i*3+1]=g2; col[i*3+2]=b2;
+    } else {
+      col[i*3]=c[0]; col[i*3+1]=c[1]; col[i*3+2]=c[2];
+    }
     emit[i]=i/fps; amp[i]=ampN[i];
   }
   const totalT=n/fps;
 
-  // grid-hash kNN mesh (frequency/feature neighbours), computed once
-  const K=4, edges=[];
-  (function buildMesh(){
+  // -----------------------------------------------------------------------
+  // kNN mesh — mode-dispatched edge construction
+  // -----------------------------------------------------------------------
+  const edges=[];
+
+  if (KNN_MODE === "temporal") {
+    // Pure temporal: connect each point to its K forward time-neighbours.
+    // K=1 → single thread, K=2 → thin ribbon, K=4 → thicker braid.
+    for (let i=0;i<n;i++)
+      for (let d=1;d<=KNN_K && i+d<n;d++)
+        edges.push(i, i+d);
+
+  } else {
+    // Spatial or spectro-temporal: grid-hash kNN in 3D position space.
+    // spectro-temporal adds a time-window constraint: only points emitted
+    // within ±KNN_WINDOW seconds of each other can be connected.
+    const useTimeConstraint = (KNN_MODE === "spectro-temporal");
     let mn=[1e9,1e9,1e9], mx=[-1e9,-1e9,-1e9];
     for(let i=0;i<n;i++)for(let k=0;k<3;k++){mn[k]=Math.min(mn[k],pos[i*3+k]);mx[k]=Math.max(mx[k],pos[i*3+k]);}
     const ext=Math.max(mx[0]-mn[0],mx[1]-mn[1],mx[2]-mn[2])||1;
@@ -142,12 +214,16 @@ async function load() {
     const seen=new Set();
     for(let i=0;i<n;i++){const[a,b,c]=ci(i);const cand=[];
       for(let da=-1;da<=1;da++)for(let db=-1;db<=1;db++)for(let dc=-1;dc<=1;dc++){
-        const g=grid.get(key(a+da,b+db,c+dc)); if(g)for(const j of g) if(j!==i) cand.push(j);}
+        const g=grid.get(key(a+da,b+db,c+dc)); if(g)for(const j of g){
+          if(j===i) continue;
+          if(useTimeConstraint && Math.abs(emit[j]-emit[i])>KNN_WINDOW) continue;
+          cand.push(j);
+        }}
       cand.sort((p,j)=>{const dp=(pos[p*3]-pos[i*3])**2+(pos[p*3+1]-pos[i*3+1])**2+(pos[p*3+2]-pos[i*3+2])**2;
                         const dj=(pos[j*3]-pos[i*3])**2+(pos[j*3+1]-pos[i*3+1])**2+(pos[j*3+2]-pos[i*3+2])**2;return dp-dj;});
-      for(let t=0;t<Math.min(K,cand.length);t++){const j=cand[t];const lo=Math.min(i,j),hi=Math.max(i,j);
+      for(let t=0;t<Math.min(KNN_K,cand.length);t++){const j=cand[t];const lo=Math.min(i,j),hi=Math.max(i,j);
         const ek=lo*n+hi; if(!seen.has(ek)){seen.add(ek);edges.push(lo,hi);}}}
-  })();
+  }
 
   return {meta,n,fps,totalT,pos,col,emit,amp,freq,ampRaw:amplitude,edges,flo,fhi};
 }
@@ -166,12 +242,10 @@ camera.position.set(0, 4, 22);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true; controls.autoRotate = true; controls.autoRotateSpeed = 0.5;
 
-// point pixel-size = sz * uScale / dist. uScale = camera distance × (height/800) so
-// `sz` is pixels-at-centre AND the crystals scale with resolution (stay the same
-// apparent size at 1080p as at 800p instead of shrinking).
-const CAMR = 11.0;  // camera orbit radius (world units) — closer = the structure fills more frame
-const uniforms = { uTime:{value:0}, uTau:{value:3.0}, uTp:{value:0.05}, uScale:{value:CAMR} };
-function updScale(){ uniforms.uScale.value = CAMR * (innerHeight / 800); }
+// point pixel-size = sz * uScale / dist. uScale scales with camera distance
+// and viewport height so point sizes stay perceptually constant across resolutions.
+const uniforms = { uTime:{value:0}, uTau:{value:3.0}, uTp:{value:0.05}, uScale:{value:CAM_RADIUS} };
+function updScale(){ uniforms.uScale.value = CAM_RADIUS * (innerHeight / 800); }
 updScale();
 
 // points
@@ -204,26 +278,72 @@ const pmat = new THREE.ShaderMaterial({
 });
 scene.add(new THREE.Points(pgeo,pmat));
 
-// edges (frequency neighbours) — real fat lines (quad-based) so the width is
-// actually honoured (gl.LINES is capped at 1px on most GPUs). The mesh grows as the
-// piece plays: edges are sorted by their appear-time (= the later-emitted endpoint),
-// and each frame we draw only the leading prefix whose appear-time <= now.
+// ---------------------------------------------------------------------------
+// Edges — custom ShaderMaterial on THREE.LineSegments (1px lines) with
+// per-edge soft exponential fade. Each edge vertex carries a static aAppear
+// attribute (emission time); the GPU computes opacity from uTime − aAppear.
+// When uEdgeLife = 0, all edges get fixed opacity (original behaviour).
+// ---------------------------------------------------------------------------
 const E=D.edges.length/2;
 const eAppear=new Float32Array(E);
 for(let e=0;e<E;e++) eAppear[e]=Math.max(D.emit[D.edges[e*2]], D.emit[D.edges[e*2+1]]);
 const eord=Array.from({length:E},(_,e)=>e).sort((a,b)=>eAppear[a]-eAppear[b]);
-const epos=new Float32Array(E*6);
+const epos=new Float32Array(E*6);         // 2 vertices × 3 coords per edge
+const eAp =new Float32Array(E*2);         // appear-time per vertex
+const eCol=new Float32Array(E*6);         // per-vertex RGB (inherits hue shift)
 const appearSorted=new Float32Array(E);
-for(let o=0;o<E;o++){ const e=eord[o]; const i=D.edges[e*2], j=D.edges[e*2+1];
-  for(let k=0;k<3;k++){ epos[o*6+k]=D.pos[i*3+k]; epos[o*6+3+k]=D.pos[j*3+k]; }
-  appearSorted[o]=eAppear[e]; }
-const lgeo=new LineSegmentsGeometry(); lgeo.setPositions(epos);
-const lmat=new LineMaterial({ color:0x86b4ee, transparent:true, opacity:0.5,
-  blending:THREE.AdditiveBlending, depthTest:false, linewidth:1.8 });  // linewidth in px
-lmat.resolution.set(innerWidth, innerHeight);
-const eseg=new LineSegments2(lgeo,lmat); eseg.frustumCulled=false; scene.add(eseg);
+for(let o=0;o<E;o++){
+  const e=eord[o]; const i=D.edges[e*2], j=D.edges[e*2+1];
+  for(let k=0;k<3;k++){
+    epos[o*6+k]=D.pos[i*3+k]; epos[o*6+3+k]=D.pos[j*3+k];
+    eCol[o*6+k]=D.col[i*3+k]; eCol[o*6+3+k]=D.col[j*3+k];
+  }
+  eAp[o*2]=eAp[o*2+1]=eAppear[eord[o]];
+  appearSorted[o]=eAppear[eord[o]];
+}
+
+const edgeUniforms = { uTime:{value:0}, uEdgeLife:{value:EDGE_LIFE} };
+const edgeMat = new THREE.ShaderMaterial({
+  uniforms: edgeUniforms, transparent:true, depthTest:false,
+  blending: THREE.AdditiveBlending,
+  vertexShader:`
+    attribute float aAppear;
+    attribute vec3  aEdgeColor;
+    uniform float uTime, uEdgeLife;
+    varying float vAlpha;
+    varying vec3  vCol;
+    void main(){
+      float age = uTime - aAppear;
+      vCol = aEdgeColor;
+      // not born yet → cull
+      if(age < 0.0){ gl_Position=vec4(2.,2.,2.,1.); vAlpha=0.; return; }
+      // exponential fade: time constant = edgeLife × 0.33 → ~5% at age=edgeLife
+      // uEdgeLife=0 disables fade → fixed 0.5 opacity (original behaviour)
+      if(uEdgeLife > 0.0){
+        vAlpha = 0.5 * exp(-age / (uEdgeLife * 0.33));
+        if(age > uEdgeLife * 3.0){ gl_Position=vec4(2.,2.,2.,1.); vAlpha=0.; return; }
+      } else { vAlpha = 0.5; }
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }`,
+  fragmentShader:`
+    varying float vAlpha; varying vec3 vCol;
+    void main(){ gl_FragColor = vec4(vCol, vAlpha); }`
+});
+
+const egeo = new THREE.BufferGeometry();
+egeo.setAttribute("position",   new THREE.BufferAttribute(epos, 3));
+egeo.setAttribute("aAppear",    new THREE.BufferAttribute(eAp, 1));
+egeo.setAttribute("aEdgeColor", new THREE.BufferAttribute(eCol, 3));
+const eseg = new THREE.LineSegments(egeo, edgeMat);
+eseg.frustumCulled = false;
+scene.add(eseg);
+
 function countLEQ(arr,t){ let lo=0,hi=arr.length; while(lo<hi){const m=(lo+hi)>>1; if(arr[m]<=t)lo=m+1; else hi=m;} return lo; }
-function updateEdges(tt){ lgeo.instanceCount = countLEQ(appearSorted, tt); }
+function updateEdges(tt){
+  edgeUniforms.uTime.value = tt;
+  // Only process edges born before now (skip future ones to save GPU).
+  egeo.setDrawRange(0, countLEQ(appearSorted, tt) * 2);
+}
 
 // colorbar
 (function(){ const c=document.getElementById("cbar"),x=c.getContext("2d");
@@ -240,12 +360,25 @@ seek.oninput=()=>{ t=(seek.value/1000)*D.totalT; };
 addEventListener("keydown",e=>{ if(e.code==="Space"){ playing=!playing;
   document.getElementById("play").textContent=playing?"⏸":"▶"; e.preventDefault(); }});
 addEventListener("resize",()=>{ renderer.setSize(innerWidth,innerHeight);
-  camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix(); updScale();
-  lmat.resolution.set(innerWidth,innerHeight); });
+  camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix(); updScale(); });
 
-// deterministic slow orbit (used in capture mode so frames don't depend on wall clock)
-function camAt(tt){ const ang=tt*0.10; const rad=CAMR, h=2.5+2.0*Math.sin(tt*0.05);
-  camera.position.set(rad*Math.cos(ang), h, rad*Math.sin(ang)); camera.lookAt(0,0,0); }
+// Spherical Lissajous orbit — quasi-periodic path on a sphere using two
+// golden-ratio-incommensurate polar wobble frequencies. The camera visits
+// equatorial, near-overhead, and near-underside views without ever repeating.
+// cam_polar1/2 = 0 → flat equatorial orbit (original behaviour).
+function camAt(tt){
+  const theta = tt * CAM_SPEED;
+  const phi   = Math.PI / 2
+              + CAM_POLAR1 * Math.sin(tt * CAM_SPEED / PHI)
+              + CAM_POLAR2 * Math.sin(tt * CAM_SPEED * PHI);
+  const sp = Math.sin(phi);
+  camera.position.set(
+    CAM_RADIUS * sp * Math.cos(theta),
+    CAM_RADIUS * Math.cos(phi),
+    CAM_RADIUS * sp * Math.sin(theta)
+  );
+  camera.lookAt(0, 0, 0);
+}
 function hudFor(tt){ const cur=Math.min(D.n-1, Math.max(0,Math.floor(tt*D.fps)));
   hud.innerHTML =
     `<span class="k">current point</span><br>`+
@@ -258,7 +391,13 @@ function hudFor(tt){ const cur=Math.min(D.n-1, Math.max(0,Math.floor(tt*D.fps)))
 // the headless capture API: a driver sets each frame's time and renders one frame.
 function renderAt(tt){ uniforms.uTime.value=tt;
   camAt(tt); updateEdges(tt); hudFor(tt); renderer.render(scene,camera); }
-window.panViewer = { ready:true, totalT:D.totalT, fps:D.fps, n:D.n, renderAt };
+// captureFrame: renders tt then returns a JPEG data-URL from the WebGL framebuffer
+// directly — avoids the full-compositor CDP screenshot round-trip entirely.
+function captureFrame(tt, quality=0.92){
+  renderAt(tt);
+  return renderer.domElement.toDataURL("image/jpeg", quality);
+}
+window.panViewer = { ready:true, totalT:D.totalT, fps:D.fps, n:D.n, renderAt, captureFrame };
 
 const last0=performance.now();
 let last=last0;
