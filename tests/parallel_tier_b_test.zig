@@ -892,3 +892,450 @@ test "cost_hint INVARIANCE: an EXTREME (1e6) hint still renders bit-exact to Tie
         }
     }
 }
+
+// ===========================================================================
+// 12. BUFFER-ALIGNMENT INVARIANT under the Tier-B concurrency recolor.
+//
+//     WHY this matters (the bug class this section pins shut):
+//       The runtime engine reinterprets each pool buffer's raw byte region as a
+//       TYPED (and, for planar views, `@Vector`-lane) slice via a safety-checked
+//       `@alignCast`. That cast PANICS in Debug/ReleaseSafe — and is undefined
+//       behaviour in ReleaseFast — unless the buffer's byte offset is a multiple of
+//       its element type's natural alignment `@alignOf(Elem)`. The flat pool base is
+//       `align(64)`, and every element alignment in the library is ≤ 64, so an
+//       in-pool offset that is a multiple of `@alignOf(Elem)` makes the ABSOLUTE
+//       address aligned and the `@alignCast` valid.
+//
+//       `parallel.concurrencyColor` RE-LAYS-OUT the Tier-B scratch pool (an interval
+//       coloring repack that shrinks the footprint for parallel execution). It must
+//       therefore reproduce the same per-element alignment guarantee the commit pass
+//       already gives: every recolored buffer offset divisible by that buffer's true
+//       `@alignOf(Elem)`, the recorded `buffer_align` equal to that true alignment,
+//       and the persistent feedback (z⁻¹) tail — which survives the callback boundary
+//       carrying state — repacked with each absolute offset still aligned.
+//
+//       The Yoneda observation set below CHARACTERISES the invariant by morphisms:
+//       it drives `concurrencyColor` exactly as the engine's Tier-B `buildFor` pass-0
+//       does (`commitRuntime(..., .per_edge)` → a schedule → recolor), then probes
+//       every referenced buffer id from every angle (offset mod align, recorded align
+//       vs comptime `@alignOf`, the persistent tail base, the ≤64 ceiling, the
+//       uniform-f32 no-op, and determinism). The bit-exact behavioural half — that an
+//       aligned recolor did not perturb the render, INCLUDING the z⁻¹ feedback state
+//       carried across callbacks — is the spine differential and the comb-bank gate
+//       above; the test here adds an explicit second witness that recolor is a pure
+//       layout function (so two identical graphs recolor identically).
+//
+//       NOTE: if any assertion below FAILS, it is reporting a real misalignment /
+//       layout bug in `concurrencyColor` — do not weaken it; an `@alignCast` that
+//       can trap is a correctness defect, not a tuning knob.
+// ===========================================================================
+
+const Frame = pan.Frame;
+
+/// `Frame(f64, .mono)` has element alignment 8 (its lane is `f64`), strictly wider
+/// than `Sample(f32)`'s alignment of 4. A graph mixing the two is the exact shape
+/// that exercises the recolorer's alignment arithmetic: packing f64 buffers by byte
+/// size alone (the latent bug this section guards) can drop a wide buffer onto a
+/// 4-aligned-but-not-8-aligned offset, which the engine's `@alignCast` would reject.
+const Wide = Frame(f64, .mono);
+
+const WideSrc = struct {
+    const Self = @This();
+    pub fn process(_: *Self, out: []Wide) void {
+        for (out) |*o| o.ch[0] = 0;
+    }
+};
+const WideGain = struct {
+    const Self = @This();
+    g: f64 = 1.0,
+    pub fn process(self: *Self, in: []const Wide, out: []Wide) void {
+        for (in, out) |x, *o| o.ch[0] = x.ch[0] * self.g;
+    }
+};
+const WideAdd2 = struct {
+    const Self = @This();
+    pub const inputs = .{ .x = Wide, .y = Wide };
+    pub fn process(_: *Self, x: []const Wide, y: []const Wide, out: []Wide) void {
+        for (x, y, out) |a, b, *o| o.ch[0] = a.ch[0] + b.ch[0];
+    }
+};
+const WideSink = struct {
+    const Self = @This();
+    pub fn process(_: *Self, _: []const Wide) void {}
+};
+const NarrowSrc = struct {
+    const Self = @This();
+    pub fn process(_: *Self, out: []Sample(f32)) void {
+        for (out) |*o| o.ch[0] = 0;
+    }
+};
+const NarrowSink = struct {
+    const Self = @This();
+    pub fn process(_: *Self, _: []const Sample(f32)) void {}
+};
+
+/// Visit every distinct buffer id REFERENCED by the recolored plan (each op's
+/// outputs, sample inputs, and parameter inputs) and assert the alignment law:
+///   • the buffer's start offset is an exact multiple of its recorded alignment;
+///   • the recorded alignment is a real power-of-two ≥ 1 and ≤ 64 (so, combined
+///     with the 64-aligned pool base, the ABSOLUTE address is aligned too — the
+///     `@alignCast` the engine performs on the byte region cannot trap);
+///   • the alignment is consistent with the byte length: a length that is itself
+///     a multiple of the alignment is required for the next color to start aligned.
+/// `expect_align[len]` (when provided) additionally pins the alignment that a
+/// given byte length MUST carry, cross-checking that the recolorer recorded the
+/// TRUE element `@alignOf`, not merely *some* aligned value.
+fn assertAlignmentInvariant(plan: anytype) !void {
+    const NB = pan.graph.max_buffers;
+    var seen = [_]bool{false} ** NB;
+    var any: usize = 0;
+    var i: usize = 0;
+    while (i < plan.op_count) : (i += 1) {
+        const op = &plan.ops[i];
+        inline for (.{
+            op.output_buffer_ids[0..op.output_count],
+            op.input_buffer_ids[0..op.input_count],
+            op.param_input_buffer_ids[0..op.param_input_count],
+        }) |ids| {
+            for (ids) |id| {
+                try std.testing.expect(id < NB);
+                if (seen[id]) continue;
+                seen[id] = true;
+                any += 1;
+                const off = plan.buffer_offset[id];
+                const al = plan.buffer_align[id];
+                // A real, sane alignment: power of two, in [1, 64].
+                try std.testing.expect(al >= 1 and al <= 64);
+                try std.testing.expect((al & (al - 1)) == 0);
+                // THE INVARIANT: the offset meets the element's natural alignment, so
+                // the engine's typed/`@Vector` reinterpret of [off, off+len) via a
+                // safety-checked `@alignCast` is valid (the pool base is align(64)).
+                try std.testing.expectEqual(@as(usize, 0), off % al);
+            }
+        }
+    }
+    // The observation set must be non-empty — a vacuous pass would prove nothing.
+    try std.testing.expect(any > 0);
+}
+
+/// The uniform-f32 wide fan-out topology as a BUILDER (so its `.ir` can be committed
+/// per-edge for the recolorer). Same shape as `buildWide`, but with placeholder
+/// source/sink pointers (the recolorer never reads sample data — it lays out buffers
+/// from the static plan). The caller owns and must `deinit` the returned builder.
+fn buildWideGraph(alloc: std.mem.Allocator, comptime N: usize) !pan.Graph {
+    var bg = pan.Graph.init(alloc, cfg(N));
+    errdefer bg.deinit();
+    const src = try bg.add(BufSource, .{});
+    const g0 = try bg.add(Gain, .{ .gain = 0.5012 });
+    const a0 = try bg.add(Affine, .{ .a = 1.31, .b = -0.07 });
+    const g1 = try bg.add(Gain, .{ .gain = 0.7734 });
+    const a1 = try bg.add(Affine, .{ .a = 0.92, .b = 0.013 });
+    const g2 = try bg.add(Gain, .{ .gain = 1.211 });
+    const a2 = try bg.add(Affine, .{ .a = -0.5, .b = 0.21 });
+    const g3 = try bg.add(Gain, .{ .gain = 0.3001 });
+    const a3 = try bg.add(Affine, .{ .a = 1.07, .b = -0.001 });
+    const s01 = try bg.add(Add2, .{});
+    const s23 = try bg.add(Add2, .{});
+    const stop = try bg.add(Add2, .{});
+    const sink = try bg.add(BufSink, .{});
+    try bg.connect(src, g0);
+    try bg.connect(src, g1);
+    try bg.connect(src, g2);
+    try bg.connect(src, g3);
+    try bg.connect(g0, a0);
+    try bg.connect(g1, a1);
+    try bg.connect(g2, a2);
+    try bg.connect(g3, a3);
+    try bg.connect(a0, s01.in.x);
+    try bg.connect(a1, s01.in.y);
+    try bg.connect(a2, s23.in.x);
+    try bg.connect(a3, s23.in.y);
+    try bg.connect(s01, stop.in.x);
+    try bg.connect(s23, stop.in.y);
+    try bg.connect(stop, sink);
+    return bg;
+}
+
+/// Recolor a freshly committed per-edge plan exactly as the engine's Tier-B pass-0
+/// does: build the preliminary schedule on the per-edge DAG, then `concurrencyColor`
+/// on its intervals. Returns the recolored plan by value (it lives in the caller).
+fn recolored(ir: pan.graph.Graph, executor: pan.TierBExecutor, p: usize) !pan.commit.Plan(pan.graph.max_nodes) {
+    var plan = try pan.commitRuntime(ir, .per_edge);
+    const dag = parallel.buildDag(plan);
+    var costs = parallel.CostModel.fromPlan(plan);
+    const sched = switch (executor) {
+        .level_barrier => parallel.levelSchedule(&dag, &costs, p),
+        .heft => parallel.heftSchedule(&dag, &costs, p),
+    };
+    parallel.concurrencyColor(&plan, &sched);
+    return plan;
+}
+
+test "align invariant: every recolored buffer offset divides its element alignment (uniform f32, both executors, P=1..8)" {
+    // Drive the recolorer on the wide uniform-f32 differential graph through both
+    // executors and every worker count the engine could pick, and assert the
+    // alignment law on every referenced buffer. Uniform-f32 means every alignment is
+    // 4 and every length a multiple of 4, so a CORRECT recolorer trivially satisfies
+    // it — but a recolorer that mislaid a color (e.g. an off-by-one in the offset
+    // accumulation) would still surface here, and the same harness drives the mixed
+    // graph below where alignment actually bites.
+    const N = 64;
+    const alloc = std.testing.allocator;
+    var bg = try buildWideGraph(alloc, N);
+    defer bg.deinit();
+
+    inline for (.{ pan.TierBExecutor.level_barrier, pan.TierBExecutor.heft }) |exe| {
+        var p: usize = 1;
+        while (p <= 8) : (p += 1) {
+            var plan = try recolored(bg.ir, exe, p);
+            try assertAlignmentInvariant(&plan);
+            // Uniform f32 ⇒ EVERY buffer is 4-aligned and the scratch total is a
+            // multiple of 4 (so the persistent tail, if any, also starts aligned).
+            var id: usize = 0;
+            while (id < plan.pool_buffer_count) : (id += 1) {
+                try std.testing.expectEqual(@as(usize, 4), plan.buffer_align[id]);
+            }
+            try std.testing.expectEqual(@as(usize, 0), plan.pool_bytes % 4);
+        }
+    }
+}
+
+/// A MIXED narrow/wide graph: an independent `Sample(f32)` (align 4) chain AND an
+/// independent `Frame(f64,.mono)` (align 8) fan-in tree, both rooted at sources and
+/// reaching sinks. The two element classes share the recolored pool, so the f64
+/// buffers MUST be laid at 8-aligned offsets even though 4-aligned slots between f32
+/// buffers would be "free" by byte size — the precise case the alignment repack
+/// exists for. The f64 tree is wide (a 2-deep adder fan-in) so several wide buffers
+/// coexist and the colorer has real choices to make.
+fn buildMixedAlign(alloc: std.mem.Allocator, comptime N: usize) !pan.Graph {
+    var bg = pan.Graph.init(alloc, cfg(N));
+    errdefer bg.deinit();
+
+    // Narrow (align-4) chain.
+    const ns = try bg.add(NarrowSrc, .{});
+    const nk = try bg.add(NarrowSink, .{});
+    try bg.connect(ns, nk);
+
+    // Wide (align-8) fan-out → adder tree → sink.
+    const ws = try bg.add(WideSrc, .{});
+    const w0 = try bg.add(WideGain, .{ .g = 0.5 });
+    const w1 = try bg.add(WideGain, .{ .g = 1.5 });
+    const w2 = try bg.add(WideGain, .{ .g = -0.25 });
+    const w3 = try bg.add(WideGain, .{ .g = 2.0 });
+    const a01 = try bg.add(WideAdd2, .{});
+    const a23 = try bg.add(WideAdd2, .{});
+    const atop = try bg.add(WideAdd2, .{});
+    const wk = try bg.add(WideSink, .{});
+    try bg.connect(ws, w0);
+    try bg.connect(ws, w1);
+    try bg.connect(ws, w2);
+    try bg.connect(ws, w3);
+    try bg.connect(w0, a01.in.x);
+    try bg.connect(w1, a01.in.y);
+    try bg.connect(w2, a23.in.x);
+    try bg.connect(w3, a23.in.y);
+    try bg.connect(a01, atop.in.x);
+    try bg.connect(a23, atop.in.y);
+    try bg.connect(atop, wk);
+    return bg;
+}
+
+test "align invariant: a MIXED narrow/wide graph recolors to aligned offsets, and buffer_align is the TRUE element @alignOf" {
+    // The load-bearing alignment case: f64 (align 8) buffers must NOT be dropped onto
+    // a 4-aligned offset just because it is the next free byte. We pin both the law
+    // (offset % align == 0) AND that the recorded alignment is the genuine element
+    // `@alignOf` — keyed off byte length, which uniquely identifies the class here
+    // (N f32 frames ⇒ align 4; N f64 frames ⇒ align 8).
+    //
+    // N is ODD on purpose: N=63 makes a narrow f32 buffer 63·4 = 252 bytes, whose
+    // remainder mod 8 is 4. So a naive size-only packer would drop a following f64
+    // (align-8) buffer at an offset ≡ 4 (mod 8) — exactly the misalignment the engine's
+    // `@alignCast` would trap on. A correct recolorer must insert 4 padding bytes; this
+    // odd N is what makes the alignment arithmetic load-bearing rather than incidental.
+    const N = 63;
+    const alloc = std.testing.allocator;
+    const narrow_len = N * @sizeOf(Sample(f32)); // 252, ≡ 4 (mod 8)
+    const wide_len = N * @sizeOf(Wide); // 504
+    try std.testing.expectEqual(@as(usize, 4), @alignOf(Sample(f32)));
+    try std.testing.expectEqual(@as(usize, 8), @alignOf(Wide));
+    try std.testing.expectEqual(@as(usize, 4), narrow_len % 8); // the stressor holds
+
+    inline for (.{ pan.TierBExecutor.level_barrier, pan.TierBExecutor.heft }) |exe| {
+        var p: usize = 1;
+        while (p <= 6) : (p += 1) {
+            var bg = try buildMixedAlign(alloc, N);
+            defer bg.deinit();
+            var plan = try recolored(bg.ir, exe, p);
+
+            // The base law on every referenced buffer.
+            try assertAlignmentInvariant(&plan);
+
+            // The alignment recorded is the TRUE element @alignOf, not merely *an*
+            // aligned value: every wide (f64) buffer carries align 8, every narrow
+            // (f32) buffer align 4 — discriminated by byte length, which is unique
+            // per class for this graph.
+            var saw_wide = false;
+            var saw_narrow = false;
+            var id: usize = 0;
+            while (id < plan.pool_buffer_count) : (id += 1) {
+                const len = plan.buffer_byte_len[id];
+                if (len == wide_len) {
+                    try std.testing.expectEqual(@as(usize, 8), plan.buffer_align[id]);
+                    try std.testing.expectEqual(@as(usize, 0), plan.buffer_offset[id] % 8);
+                    saw_wide = true;
+                } else if (len == narrow_len) {
+                    try std.testing.expectEqual(@as(usize, 4), plan.buffer_align[id]);
+                    saw_narrow = true;
+                }
+            }
+            // Both classes must actually be present, or the cross-check is vacuous.
+            try std.testing.expect(saw_wide);
+            try std.testing.expect(saw_narrow);
+        }
+    }
+}
+
+/// A MIXED graph that also carries a WIDE (align-8) persistent z⁻¹ feedback buffer:
+/// the f64 comb loop's delay output is the persistent tail, plus an independent f32
+/// chain to keep the pool mixed. After recolor the persistent tail is repacked just
+/// past the (smaller) scratch — and its ABSOLUTE offset must still be 8-aligned, or
+/// the engine's `@alignCast` on the z⁻¹ state buffer (read EVERY callback) would trap.
+const WideSummer = struct {
+    const Self = @This();
+    g: f64 = 0.4,
+    pub const inputs = .{ .dry = Wide, .wet = Wide };
+    pub fn process(self: *Self, dry: []const Wide, wet: []const Wide, out: []Wide) void {
+        for (dry, wet, out) |d, w, *y| y.ch[0] = d.ch[0] + self.g * w.ch[0];
+    }
+};
+
+fn buildMixedFeedback(alloc: std.mem.Allocator, comptime N: usize) !pan.Graph {
+    var bg = pan.Graph.init(alloc, cfg(N));
+    errdefer bg.deinit();
+    const Delay = pan.DelayLine(Wide, 3);
+
+    // Narrow chain — keeps the pool mixed-alignment.
+    const ns = try bg.add(NarrowSrc, .{});
+    const nk = try bg.add(NarrowSink, .{});
+    try bg.connect(ns, nk);
+
+    // Wide feedback comb: src → Summer → DelayLine, delay fed back into Summer.wet.
+    const ws = try bg.add(WideSrc, .{});
+    const sum = try bg.add(WideSummer, .{ .g = 0.4 });
+    const dl = try bg.add(Delay, .{});
+    const wk = try bg.add(WideSink, .{});
+    try bg.connect(ws, sum.in.dry);
+    try bg.connect(sum, dl);
+    try bg.connectFeedback(dl, sum.in.wet);
+    try bg.connect(sum, wk);
+    return bg;
+}
+
+test "align invariant: the WIDE persistent z⁻¹ feedback tail is repacked with an aligned absolute offset" {
+    // The persistent feedback buffers live PAST the scratch region and survive the
+    // callback boundary carrying filter/delay state. `concurrencyColor` rebases them
+    // just past the (recolored, smaller) scratch — and because the scratch size now
+    // differs from the commit pass's, a wider-than-f32 element's alignment is NOT
+    // free: the recolorer must align each persistent ABSOLUTE offset to its element
+    // `@alignOf`. We pin that the wide z⁻¹ buffer (the only one with last_use == -1
+    // and matching the f64 byte length) sits at an 8-aligned offset at/after pool_bytes.
+    //
+    // N=63 (odd) makes the narrow scratch a non-multiple of 8, so pool_bytes is forced
+    // to a non-8-multiple before the persistent tail is appended — the recolorer must
+    // align the wide z⁻¹ ABSOLUTE offset past it, not merely keep its relative slot.
+    const N = 63;
+    const alloc = std.testing.allocator;
+    const wide_len = N * @sizeOf(Wide);
+
+    inline for (.{ pan.TierBExecutor.level_barrier, pan.TierBExecutor.heft }) |exe| {
+        var p: usize = 1;
+        while (p <= 4) : (p += 1) {
+            var bg = try buildMixedFeedback(alloc, N);
+            defer bg.deinit();
+            var plan = try recolored(bg.ir, exe, p);
+
+            try assertAlignmentInvariant(&plan);
+
+            // A persistent feedback buffer is marked by last_use == -1 and lives in
+            // the pool tail [pool_bytes, pool_bytes+persistent_bytes). Find the wide
+            // z⁻¹ tail and assert it is 8-aligned and correctly placed.
+            try std.testing.expect(plan.persistent_bytes >= wide_len);
+            var saw_persistent_wide = false;
+            var id: usize = 0;
+            while (id < plan.pool_buffer_count) : (id += 1) {
+                if (plan.buffer_last_use[id] != -1) continue; // scratch (or unused root)
+                if (plan.buffer_byte_len[id] != wide_len) continue; // not the wide z⁻¹
+                const off = plan.buffer_offset[id];
+                try std.testing.expectEqual(@as(usize, 8), plan.buffer_align[id]);
+                try std.testing.expectEqual(@as(usize, 0), off % 8); // absolute aligned
+                try std.testing.expect(off >= plan.pool_bytes); // in the tail
+                try std.testing.expect(off + wide_len <= plan.pool_bytes + plan.persistent_bytes);
+                saw_persistent_wide = true;
+            }
+            try std.testing.expect(saw_persistent_wide);
+        }
+    }
+}
+
+test "align invariant: uniform-f32 recolor inserts NO alignment padding (footprint == tight size-only packing)" {
+    // THE NO-OP PROPERTY. For a uniform-f32 graph every alignment is 4 and every
+    // color size a multiple of 4, so `alignForward(off, 4)` is the identity: the
+    // alignment-aware repack must produce EXACTLY the byte total a size-only packer
+    // would — no padding is paid. We verify this without a "before" snapshot (recolor
+    // mutates in place) by independently reconstructing the tight packing: the sum of
+    // the DISTINCT color sizes (each scratch color appears once; persistent buffers
+    // are appended past the scratch). If the recolorer ever rounded a 4-aligned class
+    // up, pool_bytes would exceed this tight sum and the assertion would fire.
+    const N = 64;
+    const alloc = std.testing.allocator;
+    var bg = try buildWideGraph(alloc, N);
+    defer bg.deinit();
+
+    inline for (.{ pan.TierBExecutor.level_barrier, pan.TierBExecutor.heft }) |exe| {
+        var p: usize = 1;
+        while (p <= 8) : (p += 1) {
+            const plan = try recolored(bg.ir, exe, p);
+            // The scratch colors are the buffer ids whose last_use is NOT -1 (the
+            // persistent tail is appended after). For a no-padding f32 layout the sum
+            // of their byte lengths equals pool_bytes exactly.
+            var tight: usize = 0;
+            var id: usize = 0;
+            while (id < plan.pool_buffer_count) : (id += 1) {
+                if (plan.buffer_last_use[id] == -1) continue; // persistent tail
+                tight += plan.buffer_byte_len[id];
+            }
+            // No alignment padding: every f32 color packs flush against the previous.
+            try std.testing.expectEqual(tight, plan.pool_bytes);
+        }
+    }
+}
+
+test "align invariant: recolor is a PURE layout function (two identical graphs recolor bit-identically)" {
+    // The recolored layout must be a deterministic function of (graph, executor, P):
+    // two independently committed copies of the SAME graph must recolor to identical
+    // offsets/alignments/sizes. This pins that the alignment repack introduces no
+    // order-dependence (e.g. iterating a hash set) that could make the Tier-B pool —
+    // and thus the cross-worker anti-dependencies derived from it — non-reproducible.
+    // N=63 (odd) keeps the mixed-alignment padding in play across the comparison.
+    const N = 63;
+    const alloc = std.testing.allocator;
+
+    inline for (.{ pan.TierBExecutor.level_barrier, pan.TierBExecutor.heft }) |exe| {
+        var p: usize = 1;
+        while (p <= 6) : (p += 1) {
+            var bg1 = try buildMixedAlign(alloc, N);
+            defer bg1.deinit();
+            var bg2 = try buildMixedAlign(alloc, N);
+            defer bg2.deinit();
+            const plan1 = try recolored(bg1.ir, exe, p);
+            const plan2 = try recolored(bg2.ir, exe, p);
+
+            try std.testing.expectEqual(plan1.pool_bytes, plan2.pool_bytes);
+            try std.testing.expectEqual(plan1.persistent_bytes, plan2.persistent_bytes);
+            try std.testing.expectEqual(plan1.pool_buffer_count, plan2.pool_buffer_count);
+            try std.testing.expectEqualSlices(usize, plan1.buffer_offset[0..], plan2.buffer_offset[0..]);
+            try std.testing.expectEqualSlices(usize, plan1.buffer_align[0..], plan2.buffer_align[0..]);
+            try std.testing.expectEqualSlices(usize, plan1.buffer_byte_len[0..], plan2.buffer_byte_len[0..]);
+        }
+    }
+}

@@ -281,6 +281,12 @@ pub fn Plan(comptime n_ops: usize) type {
         buffer_offset: [graph.max_buffers]usize = [_]usize{0} ** graph.max_buffers,
         /// Byte length of each buffer id (`N · element_size` of its class).
         buffer_byte_len: [graph.max_buffers]usize = [_]usize{0} ** graph.max_buffers,
+        /// Required start-address alignment of each buffer id — `@alignOf(Elem)` of
+        /// its class. The engine reinterprets a buffer's raw bytes as a typed (and,
+        /// for planar views, `@Vector`-lane) slice via a safety-checked `@alignCast`,
+        /// so its pool offset must meet this; both layout passes (the commit pass and
+        /// the Tier-B concurrency recolorer) align offsets to it. `1` for an unused id.
+        buffer_align: [graph.max_buffers]usize = [_]usize{1} ** graph.max_buffers,
         /// For each POOL buffer id, the op index (forward-topo position) of the LAST
         /// read across every value that occupies it — the point after which the
         /// buffer is dead for the remainder of the render. `-1` marks an unused id
@@ -720,6 +726,10 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
             start: usize,
             end: usize,
             elem_size: usize,
+            /// `@alignOf` of this value's element — the alignment its pool buffer's
+            /// start must satisfy so the engine's typed/vector reinterpret of the
+            /// byte region (a safety-checked `@alignCast`) is valid.
+            elem_align: usize,
             elem_name: []const u8,
             /// Elements this value's producer emits per callback (`want[from_node]`)
             /// — the SECOND half of the pool class key `(elem_name, want)` and the
@@ -756,6 +766,7 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
                     .start = s,
                     .end = en,
                     .elem_size = e.elem_size,
+                    .elem_align = e.elem_align,
                     .elem_name = e.elem_name,
                     .want = want[e.from_node],
                 };
@@ -880,6 +891,9 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
         // assert below stands guard).
         var class_names: [max_edges][]const u8 = undefined;
         var class_elem_size: [max_edges]usize = undefined;
+        // Per-class element alignment (uniform within a class, since a class is keyed
+        // by `(elem_name, want)` ⇒ a single element type ⇒ a single `@alignOf`).
+        var class_elem_align: [max_edges]usize = undefined;
         var class_want: [max_edges]usize = undefined;
         var class_M: [max_edges]usize = [_]usize{0} ** max_edges;
         var class_count: usize = 0;
@@ -897,6 +911,7 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
             } else {
                 class_names[class_count] = values[vi].elem_name;
                 class_elem_size[class_count] = values[vi].elem_size;
+                class_elem_align[class_count] = values[vi].elem_align;
                 class_want[class_count] = values[vi].want;
                 class_count += 1;
             }
@@ -994,6 +1009,7 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
         var fb_buf: [max_edges]usize = undefined;
         var persist_count: usize = 0;
         var persist_elem: [graph.max_edges]usize = [_]usize{0} ** graph.max_edges;
+        var persist_align: [graph.max_edges]usize = [_]usize{@alignOf(f32)} ** graph.max_edges;
         var persist_want: [graph.max_edges]usize = [_]usize{0} ** graph.max_edges;
         for (0..FC) |fi| {
             const f = g.feedback[fi];
@@ -1010,6 +1026,7 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
             }
             const id = total_pool + persist_count;
             persist_elem[persist_count] = f.elem_size;
+            persist_align[persist_count] = f.elem_align;
             persist_want[persist_count] = want[f.write_node];
             persist_count += 1;
             fb_buf[fi] = id;
@@ -1149,27 +1166,50 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
         // buffers follow in the tail (ids `total_pool + fi`).
         var buffer_offset: [graph.max_buffers]usize = [_]usize{0} ** graph.max_buffers;
         var buffer_byte_len: [graph.max_buffers]usize = [_]usize{0} ** graph.max_buffers;
+        var buffer_align: [graph.max_buffers]usize = [_]usize{1} ** graph.max_buffers;
+        // Each buffer's start must satisfy its element type's natural alignment: the
+        // runtime engine reinterprets the raw byte region as a typed (and, for planar
+        // views, `@Vector`-lane) slice via a safety-checked `@alignCast`, which traps
+        // on a misaligned start. The flat pool's base is 64-byte aligned, so aligning
+        // each in-pool offset to `@alignOf(Elem)` (always ≤ 64) makes the absolute
+        // address aligned too. A uniform-f32 graph is already 4-aligned at every
+        // offset, so this adds ZERO padding and the pool stays exactly
+        // `want·size·M` per class — i.e. the footprint scales linearly with N, and the
+        // layout is byte-identical to packing the buffers contiguously. Only a graph
+        // that mixes narrow and wide element types pays a few alignment bytes.
+        const pool_base_align = 64; // the engine's flat pool is declared `align(64)`
         var pool_bytes: usize = 0;
         for (0..class_count) |c| {
             // A class's stride is its per-callback element count `want` × element
             // size (== N × size for a rate-1:1 class — byte-identical to pre-P8).
             const stride = class_want[c] * class_elem_size[c];
+            const align_c = class_elem_align[c];
+            std.debug.assert(align_c <= pool_base_align); // a wider element would defeat the base alignment
             for (0..class_M[c]) |color| {
                 const id = class_base[c] + color;
+                pool_bytes = std.mem.alignForward(usize, pool_bytes, align_c);
                 buffer_offset[id] = pool_bytes;
                 buffer_byte_len[id] = stride;
+                buffer_align[id] = align_c;
                 pool_bytes += stride;
             }
         }
         // Persistent feedback z⁻¹ buffers, in the pool tail past the scratch pool —
         // one per distinct feedback source (deduped above), each `want` elements wide.
+        // The scratch total `pool_bytes` need not be a multiple of a feedback element's
+        // alignment, so align the ABSOLUTE offset (pool base + tail cursor); the base
+        // is 64-aligned, so an aligned absolute offset yields an aligned address.
         var persistent_bytes: usize = 0;
         for (0..persist_count) |k| {
             const id = total_pool + k;
             const stride = persist_want[k] * persist_elem[k];
-            buffer_offset[id] = pool_bytes + persistent_bytes;
+            const align_k = persist_align[k];
+            std.debug.assert(align_k <= pool_base_align);
+            const tail_off = std.mem.alignForward(usize, pool_bytes + persistent_bytes, align_k);
+            buffer_offset[id] = tail_off;
             buffer_byte_len[id] = stride;
-            persistent_bytes += stride;
+            buffer_align[id] = align_k;
+            persistent_bytes = tail_off - pool_bytes + stride;
         }
         // The H2 reporting figure (delay rings + per-block state are instance-
         // resident — counted, not pooled).
@@ -1203,6 +1243,7 @@ fn computePlan(g: graph.Graph, comptime mode: BufferMode) CommitError!Plan(graph
             .persistent_bytes = persistent_bytes,
             .buffer_offset = buffer_offset,
             .buffer_byte_len = buffer_byte_len,
+            .buffer_align = buffer_align,
             .buffer_last_use = buffer_last_use,
         };
     }
@@ -1227,6 +1268,7 @@ pub fn commitComptimeMode(comptime g: graph.Graph, comptime mode: BufferMode) Co
             .persistent_bytes = full.persistent_bytes,
             .buffer_offset = full.buffer_offset,
             .buffer_byte_len = full.buffer_byte_len,
+            .buffer_align = full.buffer_align,
             .buffer_last_use = full.buffer_last_use,
         };
         for (0..g.node_count) |i| p.ops[i] = full.ops[i];
@@ -1320,6 +1362,7 @@ pub fn insertCoercions(g: graph.Graph) graph.Graph {
             .feedback = false,
             .elem_size = e.elem_size,
             .elem_name = e.elem_name,
+            .elem_align = e.elem_align,
             .is_param = e.is_param,
             .channels = e.channels,
         };
@@ -1383,6 +1426,7 @@ pub fn insertCoercions(g: graph.Graph) graph.Graph {
             .feedback = false,
             .elem_size = e.to_elem_size,
             .elem_name = e.to_elem_name,
+            .elem_align = e.to_elem_align,
             .is_param = false,
             .channels = e.to_channels,
         };
@@ -1521,6 +1565,7 @@ fn insertDelayOnEdge(g2: *graph.Graph, ei: usize, len: usize) void {
         .feedback = false,
         .elem_size = e.elem_size,
         .elem_name = e.elem_name,
+        .elem_align = e.elem_align,
         .is_param = e.is_param,
         .channels = e.channels,
     };

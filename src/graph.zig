@@ -139,6 +139,14 @@ pub const Edge = struct {
     elem_size: usize,
     /// `@typeName` of the element type carried (pool class discriminator).
     elem_name: []const u8,
+    /// `@alignOf` of the carried element — the required start-address alignment of
+    /// this value's pool buffer. The runtime engine reinterprets a buffer's raw
+    /// byte region as a typed (and, for planar views, `@Vector`-lane) slice via a
+    /// safety-checked `@alignCast`, which traps on a misaligned start; the commit
+    /// pass therefore aligns each buffer's pool offset to this. Defaults to the
+    /// f32 lane alignment so hand-built fixture edges need not set it — the connect
+    /// helpers and coercion builders always record the true `@alignOf(Elem)`.
+    elem_align: usize = @alignOf(f32),
     /// True iff this is a wired PARAMETER (control) edge — a side input carrying
     /// one coefficient per render call, exempt from the rate-1:1 law and subject
     /// to the one-source rule (a slot driven by both a wire and `set` is a commit
@@ -165,6 +173,11 @@ pub const Edge = struct {
     /// The CONSUMER's expected element size (`@sizeOf(Frame(Lane,L_to))`) for a
     /// layout-coerced edge. 0 when unset.
     to_elem_size: usize = 0,
+    /// The CONSUMER's expected element alignment (`@alignOf(Frame(Lane,L_to))`) for
+    /// a layout-coerced edge — the alignment the inserted matrix node's output edge
+    /// must carry. Defaults to the f32 lane alignment; `connectCoerced` records the
+    /// true `@alignOf(InPort.Elem)`.
+    to_elem_align: usize = @alignOf(f32),
 };
 
 /// A declared feedback (back) edge — the z⁻¹ write/read split. Its **write side**
@@ -182,6 +195,11 @@ pub const FeedbackEdge = struct {
     read_port: port.PortIndex,
     elem_size: usize,
     elem_name: []const u8,
+    /// `@alignOf` of the carried element — the required start-address alignment of
+    /// the persistent z⁻¹ buffer this feedback source mints (see `Edge.elem_align`).
+    /// Defaults to the f32 lane alignment; the feedback connect helper records the
+    /// true `@alignOf(OutPort.Elem)`.
+    elem_align: usize = @alignOf(f32),
 };
 
 /// Fixed capacities keep the graph comptime-evaluable (no allocator) so the
@@ -377,6 +395,7 @@ pub const Graph = struct {
             .read_port = in_idx,
             .elem_size = @sizeOf(OutPort.Elem),
             .elem_name = @typeName(OutPort.Elem),
+            .elem_align = @alignOf(OutPort.Elem),
         };
         self.feedback_count += 1;
     }
@@ -408,11 +427,13 @@ pub const Graph = struct {
             .feedback = false,
             .elem_size = @sizeOf(OutPort.Elem),
             .elem_name = @typeName(OutPort.Elem),
+            .elem_align = @alignOf(OutPort.Elem),
             .is_param = false,
             .channels = channelsOf(OutPort.Elem),
             .to_channels = channelsOf(InPort.Elem),
             .to_elem_name = @typeName(InPort.Elem),
             .to_elem_size = @sizeOf(InPort.Elem),
+            .to_elem_align = @alignOf(InPort.Elem),
         };
         self.edge_count += 1;
     }
@@ -465,6 +486,7 @@ pub const Graph = struct {
             .feedback = false,
             .elem_size = @sizeOf(Elem),
             .elem_name = @typeName(Elem),
+            .elem_align = @alignOf(Elem),
             .is_param = is_param,
             .channels = channelsOf(Elem),
         };

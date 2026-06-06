@@ -857,6 +857,9 @@ pub fn concurrencyColor(plan: anytype, sched: *const Schedule) void {
     var new_id = [_]usize{none} ** NB;
     var color_hi: [NB]f32 = undefined;
     var color_size: [NB]usize = undefined;
+    // A color's required alignment is the MAX `@alignOf` over the buffers sharing it
+    // (same byte size may still differ in alignment, e.g. `[4]f32` vs `@Vector(4,f32)`).
+    var color_align: [NB]usize = undefined;
     var n_color: usize = 0;
     for (pool_ids[0..n_pool]) |id| {
         var chosen: usize = none;
@@ -870,17 +873,23 @@ pub fn concurrencyColor(plan: anytype, sched: *const Schedule) void {
         if (chosen == none) {
             chosen = n_color;
             color_size[n_color] = size[id];
+            color_align[n_color] = 1;
             n_color += 1;
         }
         color_hi[chosen] = hi[id];
+        color_align[chosen] = @max(color_align[chosen], plan.buffer_align[id]);
         new_id[id] = chosen;
     }
 
-    // Lay the colors out compactly; that is the new scratch region size.
+    // Lay the colors out compactly, each aligned to its element alignment so the
+    // engine's typed/`@Vector` reinterpret (a safety-checked `@alignCast`) is valid;
+    // that aligned total is the new scratch region size. The flat pool base is
+    // 64-byte aligned, so an aligned in-pool offset yields an aligned address.
     var color_off: [NB]usize = undefined;
     var off: usize = 0;
     var c2: usize = 0;
     while (c2 < n_color) : (c2 += 1) {
+        off = std.mem.alignForward(usize, off, color_align[c2]);
         color_off[c2] = off;
         off += color_size[c2];
     }
@@ -900,21 +909,33 @@ pub fn concurrencyColor(plan: anytype, sched: *const Schedule) void {
     // Remap every op's buffer ids and rebuild the per-id offset/length tables.
     var new_offset = [_]usize{0} ** NB;
     var new_len = [_]usize{0} ** NB;
+    var new_align = [_]usize{1} ** NB;
     var new_last = [_]isize{-1} ** NB;
     // Colors: compact offsets, never poisoned mid-render (last_use past the end).
     c2 = 0;
     while (c2 < n_color) : (c2 += 1) {
         new_offset[c2] = color_off[c2];
         new_len[c2] = color_size[c2];
+        new_align[c2] = color_align[c2];
         new_last[c2] = @intCast(plan.op_count);
     }
+    // Persistent feedback buffers: repacked just past the new scratch, each absolute
+    // offset aligned to its element alignment (no live data exists at recolor time, so
+    // they may move freely). This mirrors the commit pass's persistent layout, since
+    // the recolored scratch size differs from the original and a kept-relative rebase
+    // would not preserve a wider-than-f32 element's alignment.
+    var tail: usize = 0;
     b = 0;
     while (b < NB) : (b += 1) {
         if (used[b] and persistent[b]) {
             const nid = new_id[b];
-            new_offset[nid] = new_pool_bytes + (plan.buffer_offset[b] - plan.pool_bytes);
+            const align_b = plan.buffer_align[b];
+            const poff = std.mem.alignForward(usize, new_pool_bytes + tail, align_b);
+            new_offset[nid] = poff;
             new_len[nid] = plan.buffer_byte_len[b];
+            new_align[nid] = align_b;
             new_last[nid] = -1; // persistent: never poisoned
+            tail = poff - new_pool_bytes + plan.buffer_byte_len[b];
         }
     }
     i = 0;
@@ -926,8 +947,10 @@ pub fn concurrencyColor(plan: anytype, sched: *const Schedule) void {
     }
     plan.buffer_offset = new_offset;
     plan.buffer_byte_len = new_len;
+    plan.buffer_align = new_align;
     plan.buffer_last_use = new_last;
     plan.pool_bytes = new_pool_bytes;
+    plan.persistent_bytes = tail;
     plan.pool_buffer_count = next_id;
 }
 

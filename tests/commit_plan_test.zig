@@ -697,3 +697,371 @@ test "L6 re-committing the same graph yields an identical plan (footprint + op_c
         try std.testing.expectEqual(p1.ops[i].input_buffer_ids[0], p2.ops[i].input_buffer_ids[0]);
     }
 }
+
+// ===========================================================================
+// L7 — POOL-BUFFER ALIGNMENT (the @alignCast-validity invariant).
+//
+// WHY THIS MATTERS (the load-bearing reason, not just "what"): at render the
+// engine takes each pool buffer's RAW BYTE region and reinterprets it as a typed
+// (and, for planar views, `@Vector`-lane) slice via a SAFETY-CHECKED `@alignCast`
+// (`engine.zig` `sliceMut`/`planarMutView`). An `@alignCast` to an address that
+// is not a multiple of the element's natural `@alignOf` is Illegal Behaviour —
+// it PANICS in Debug/ReleaseSafe (and is UB in ReleaseFast). Therefore EVERY
+// buffer id a committed plan hands an op MUST start at an offset that is a
+// multiple of that buffer's element alignment. The engine's flat pool base is
+// declared `align(64)`, so an in-pool offset aligned to `@alignOf(Elem)` (which
+// is always ≤ 64 for every element type pan carries) yields an aligned ABSOLUTE
+// address — the offset alignment is the whole obligation the commit pass owns.
+//
+// The Yoneda observation set fully DEFINING the invariant:
+//   • For every buffer id used by any op of a committed plan,
+//       buffer_offset[id] % buffer_align[id] == 0   (the @alignCast precondition)
+//     AND buffer_align[id] == @alignOf(that id's element type)   (the right target).
+//   • The fix is a NO-OP on uniform-f32 graphs: footprint stays exactly Σ want·4·M,
+//     scales linearly with N, and the per-op layout is byte-identical — every f32
+//     buffer is 4-aligned at every packed offset already, so zero padding is added.
+//   • A graph genuinely MIXING narrow- and wide-alignment element classes (so a
+//     naive contiguous pack would land a later, wider buffer on a misaligned
+//     offset) is correctly padded: the wider class's buffers are bumped forward to
+//     their alignment, and the invariant holds for every id.
+//   • Both layout passes agree: the per-edge baseline (.per_edge) aligns offsets
+//     by the SAME rule as the shipped colored pool (.colored).
+//   • The persistent feedback z⁻¹ tail aligns its ABSOLUTE offset too (so a comb
+//     whose feedback element is wider-aligned than the scratch tail-end still lands
+//     its z⁻¹ buffer on an aligned address).
+//
+// Element-alignment ladder used below (verified against zig 0.16.0):
+//   Sample(i16) → @alignOf 2, @sizeOf 2
+//   Sample(f32) → @alignOf 4, @sizeOf 4
+//   Sample(f64) → @alignOf 8, @sizeOf 8
+// (`Frame(Lane,L)` is `[count]Lane`, so its alignment is `@alignOf(Lane)`, which
+// exceeds 4 for an f64 lane — the wide-alignment class the invariant guards.)
+// ===========================================================================
+
+const commitComptimeMode = pan.commitComptimeMode;
+const BufferMode = pan.BufferMode;
+
+// --- Synthetic blocks over wider/narrower element lanes -------------------
+// `Sample(i16)` (align 2), `Sample(f64)` (align 8): used to build classes whose
+// natural alignment straddles the f32 (align 4) default, so a naive contiguous
+// pack of an i16 class followed by an f64 class can misalign the f64 buffers.
+
+const SrcI16 = struct {
+    const Self = @This();
+    pub fn process(self: *Self, out: []Sample(i16)) void {
+        _ = self;
+        _ = out;
+    }
+};
+const Map1I16 = struct {
+    const Self = @This();
+    pub fn process(self: *Self, in: []const Sample(i16), out: []Sample(i16)) void {
+        _ = self;
+        @memcpy(out, in);
+    }
+};
+const SinkI16 = struct {
+    const Self = @This();
+    pub fn process(self: *Self, in: []const Sample(i16)) void {
+        _ = self;
+        _ = in;
+    }
+};
+
+const SrcF64 = struct {
+    const Self = @This();
+    pub fn process(self: *Self, out: []Sample(f64)) void {
+        _ = self;
+        _ = out;
+    }
+};
+const Map1F64 = struct {
+    const Self = @This();
+    pub fn process(self: *Self, in: []const Sample(f64), out: []Sample(f64)) void {
+        _ = self;
+        @memcpy(out, in);
+    }
+};
+const SinkF64 = struct {
+    const Self = @This();
+    pub fn process(self: *Self, in: []const Sample(f64)) void {
+        _ = self;
+        _ = in;
+    }
+};
+
+/// Collect, into a fixed array, the DISTINCT buffer ids that any op of `plan`
+/// actually references — sample inputs, outputs, AND parameter-edge inputs. The
+/// alignment invariant must hold for every id the render loop will hand to an
+/// `@alignCast`, which is exactly this set (an id present in the byte tables but
+/// touched by no op cannot be misaligned-cast, so we observe the touched set).
+fn referencedBufferIds(plan: anytype) struct { ids: [graph.max_buffers]usize, len: usize } {
+    var ids: [graph.max_buffers]usize = undefined;
+    var len: usize = 0;
+    const add = struct {
+        fn f(arr: *[graph.max_buffers]usize, n: *usize, id: usize) void {
+            for (0..n.*) |k| if (arr[k] == id) return;
+            arr[n.*] = id;
+            n.* += 1;
+        }
+    }.f;
+    for (0..plan.op_count) |oi| {
+        const op = plan.ops[oi];
+        for (0..op.input_count) |k| add(&ids, &len, op.input_buffer_ids[k]);
+        for (0..op.output_count) |k| add(&ids, &len, op.output_buffer_ids[k]);
+        for (0..op.param_input_count) |k| add(&ids, &len, op.param_input_buffer_ids[k]);
+    }
+    return .{ .ids = ids, .len = len };
+}
+
+/// THE INVARIANT, factored: every referenced buffer id starts on a multiple of
+/// its recorded alignment, and that recorded alignment is a real power-of-two
+/// `@alignOf` (≤ 64, the pool base alignment, so the absolute address is aligned
+/// once added to the 64-aligned base). Asserting `>= 1` and power-of-two rules
+/// out a bogus `0`/`3` alignment that would make the modulo test vacuous.
+fn assertAlignmentInvariant(plan: anytype) !void {
+    const ref = referencedBufferIds(plan);
+    for (0..ref.len) |k| {
+        const id = ref.ids[k];
+        const a = plan.buffer_align[id];
+        // A genuine alignment: power-of-two and within the 64-byte pool base.
+        try std.testing.expect(a >= 1);
+        try std.testing.expect(a <= 64);
+        try std.testing.expect((a & (a - 1)) == 0);
+        // The @alignCast precondition: the offset is a multiple of the alignment.
+        try std.testing.expectEqual(@as(usize, 0), plan.buffer_offset[id] % a);
+    }
+}
+
+// --- L7.a uniform-f32 graphs: the fix is a provable NO-OP --------------------
+
+test "L7 uniform-f32 chain: every buffer is 4-aligned and footprint is UNCHANGED (no padding)" {
+    // A pure Sample(f32) chain — every element aligns to 4 and every stride
+    // (N·4) is a multiple of 4, so aligning offsets adds ZERO bytes. The
+    // footprint must stay EXACTLY 2·N·4 (the pre-fix figure) and the invariant
+    // must hold trivially. This is the property that the alignment fix does not
+    // perturb the dominant uniform-f32 case.
+    const N = 256;
+    const g = comptime chainGraph(N);
+    const plan = comptime try commitComptime(g);
+    try assertAlignmentInvariant(plan);
+    // No padding: footprint is the bare ping-pong pool, byte-for-byte as before.
+    try std.testing.expectEqual(@as(usize, 2 * N * 4), plan.footprint_bytes);
+    try std.testing.expectEqual(@as(usize, 2 * N * 4), plan.pool_bytes);
+    // Every referenced id records align == @alignOf(Sample(f32)) == 4.
+    const ref = referencedBufferIds(plan);
+    for (0..ref.len) |k| {
+        try std.testing.expectEqual(@as(usize, @alignOf(Sample(f32))), plan.buffer_align[ref.ids[k]]);
+    }
+}
+
+test "L7 uniform-f32 footprint stays linear in N AND offsets stay aligned across a sweep" {
+    // Sweep N (including ODD sizes, where N·4 is still a multiple of 4 so no pad
+    // is ever needed). For every N: footprint == 2·N·4 (linear, no alignment
+    // bytes) and the invariant holds. Odd N is the case a careless "round the
+    // stride up to 8" implementation would wrongly pad — it must NOT.
+    inline for ([_]usize{ 1, 3, 7, 64, 255, 1024 }) |N| {
+        const g = comptime chainGraph(N);
+        const plan = comptime try commitComptime(g);
+        try assertAlignmentInvariant(plan);
+        try std.testing.expectEqual(@as(usize, 2 * N * 4), plan.footprint_bytes);
+    }
+}
+
+test "L7 the alignment fix does NOT change the f32 buffer-id layout (offsets are the contiguous pack)" {
+    // For a uniform-f32 graph the aligned layout is byte-identical to a naive
+    // contiguous pack: buffer 0 at offset 0, buffer 1 at offset N·4 (no gap),
+    // because every stride is already a multiple of 4. Pin the exact offsets so
+    // a regression that started inserting spurious f32 padding is caught.
+    const N = 128;
+    const g = comptime chainGraph(N);
+    const plan = comptime try commitComptime(g);
+    // The map op (op 1) reads one buffer and writes the OTHER (ping-pong).
+    const in_id = plan.ops[1].input_buffer_ids[0];
+    const out_id = plan.ops[1].output_buffer_ids[0];
+    // The two ping-pong buffers sit at 0 and N·4 with no padding between them.
+    const lo = @min(plan.buffer_offset[in_id], plan.buffer_offset[out_id]);
+    const hi = @max(plan.buffer_offset[in_id], plan.buffer_offset[out_id]);
+    try std.testing.expectEqual(@as(usize, 0), lo);
+    try std.testing.expectEqual(@as(usize, N * 4), hi);
+}
+
+// --- L7.b a graph that GENUINELY mixes narrow + wide alignment ---------------
+
+/// Two independent chains in one graph: a Sample(i16) (align 2) chain wired
+/// FIRST (so its class is laid out first) and a Sample(f64) (align 8) chain
+/// wired second. At small N the i16 class's total bytes are not a multiple of 8,
+/// so a naive contiguous pack would start an f64 buffer on a 4- or 2-aligned
+/// (mis-aligned) offset — the exact failure the fix prevents.
+fn mixedAlignGraph(comptime N: usize) graph.Graph {
+    var gg = graph.Graph.empty;
+    gg.block_size = N;
+    // i16 chain first → i16 is element-class 0 (laid out at the pool front).
+    const i_in = gg.add(SrcI16);
+    const i_map = gg.add(Map1I16);
+    const i_out = gg.add(SinkI16);
+    gg.connect(port.MapOutPort(SrcI16), i_in, 0, port.MapInPort(Map1I16), i_map, 0);
+    gg.connect(port.MapOutPort(Map1I16), i_map, 0, port.MapInPort(SinkI16), i_out, 0);
+    // f64 chain second → f64 is element-class 1 (laid out AFTER the i16 class).
+    const f_in = gg.add(SrcF64);
+    const f_map = gg.add(Map1F64);
+    const f_out = gg.add(SinkF64);
+    gg.connect(port.MapOutPort(SrcF64), f_in, 0, port.MapInPort(Map1F64), f_map, 0);
+    gg.connect(port.MapOutPort(Map1F64), f_map, 0, port.MapInPort(SinkF64), f_out, 0);
+    return gg;
+}
+
+test "L7 mixed i16/f64 graph at N=1: f64 buffers are bumped to an 8-aligned offset" {
+    // i16 class first: M=2, each buffer N·2 = 2 bytes → occupies [0,2) and [2,4),
+    // so the scratch cursor is at 4 after the i16 class. The f64 class (align 8)
+    // must then start at 8 (a 4-byte PAD), NOT at the contiguous 4 — because 4 is
+    // not a multiple of @alignOf(Sample(f64))==8 and an `@alignCast` of a +4
+    // address to *f64 would PANIC. Pin the bumped offset explicitly.
+    const g = comptime mixedAlignGraph(1);
+    const plan = comptime try commitComptime(g);
+    try assertAlignmentInvariant(plan);
+
+    // The f64 map op (node 4, op index 4 since topo == id order here) ping-pongs
+    // in the f64 class. Its referenced offsets must be multiples of 8.
+    const f_in = plan.ops[4].input_buffer_ids[0];
+    const f_out = plan.ops[4].output_buffer_ids[0];
+    try std.testing.expectEqual(@as(usize, 8), plan.buffer_align[f_in]);
+    try std.testing.expectEqual(@as(usize, 8), plan.buffer_align[f_out]);
+    try std.testing.expectEqual(@as(usize, 0), plan.buffer_offset[f_in] % 8);
+    try std.testing.expectEqual(@as(usize, 0), plan.buffer_offset[f_out] % 8);
+    // The lower f64 buffer sits at 8 (the i16 class ended at 4, padded up to 8) —
+    // proving a non-trivial pad was inserted, not a coincidental alignment.
+    const f_lo = @min(plan.buffer_offset[f_in], plan.buffer_offset[f_out]);
+    try std.testing.expectEqual(@as(usize, 8), f_lo);
+    // The i16 class itself is 2-aligned and packed contiguously at the front.
+    const i_in = plan.ops[1].input_buffer_ids[0];
+    const i_out = plan.ops[1].output_buffer_ids[0];
+    try std.testing.expectEqual(@as(usize, 2), plan.buffer_align[i_in]);
+    try std.testing.expectEqual(@as(usize, 2), plan.buffer_align[i_out]);
+    const i_lo = @min(plan.buffer_offset[i_in], plan.buffer_offset[i_out]);
+    try std.testing.expectEqual(@as(usize, 0), i_lo);
+}
+
+test "L7 mixed-alignment invariant holds across a sweep of N (incl. ones that force a pad)" {
+    // Whatever the i16 class's total bytes are, the f64 class's every buffer must
+    // land on an 8-multiple. Sweep N over sizes whose i16 totals are and are NOT
+    // multiples of 8, so both the pad and no-pad branches are exercised; the
+    // invariant — every referenced id offset % its align == 0 — holds throughout.
+    inline for ([_]usize{ 1, 2, 3, 5, 7, 16, 64, 257 }) |N| {
+        const g = comptime mixedAlignGraph(N);
+        const plan = comptime try commitComptime(g);
+        try assertAlignmentInvariant(plan);
+    }
+}
+
+test "L7 the two classes still pay only their own bytes plus the alignment pad (footprint accounting)" {
+    // footprint = i16 pools + f64 pools + alignment pad between the classes. With
+    // N=1: i16 = 2·1·2 = 4, then pad 4 → f64 base 8, f64 = 2·1·8 = 16. Total pool
+    // = 8 (i16 + pad) + 16 = 24. The pad is the ONLY extra over the bare class
+    // sums (4 + 16 = 20) — alignment costs exactly the bytes it must, no more.
+    const g = comptime mixedAlignGraph(1);
+    const plan = comptime try commitComptime(g);
+    const bare = (2 * 1 * 2) + (2 * 1 * 8); // 4 + 16 = 20, the un-padded class sums
+    const pad = 4; // i16 class ends at 4, f64 (align 8) bumps it to 8
+    try std.testing.expectEqual(@as(usize, bare + pad), plan.pool_bytes);
+    try std.testing.expectEqual(@as(usize, 24), plan.footprint_bytes);
+}
+
+test "L7 buffer_align equals @alignOf of each class's element type (right target, not just aligned)" {
+    // An offset that happens to be a multiple of a WRONG (too-small) alignment
+    // would pass the modulo test yet still let a real @alignCast trap. Pin that
+    // each class records the TRUE @alignOf of its element: i16→2, f64→8. This is
+    // what makes `buffer_offset % buffer_align == 0` the actual @alignCast guard.
+    const g = comptime mixedAlignGraph(7);
+    const plan = comptime try commitComptime(g);
+    // i16 ping-pong (op 1) and f64 ping-pong (op 4).
+    try std.testing.expectEqual(@as(usize, @alignOf(Sample(i16))), plan.buffer_align[plan.ops[1].input_buffer_ids[0]]);
+    try std.testing.expectEqual(@as(usize, @alignOf(Sample(i16))), plan.buffer_align[plan.ops[1].output_buffer_ids[0]]);
+    try std.testing.expectEqual(@as(usize, @alignOf(Sample(f64))), plan.buffer_align[plan.ops[4].input_buffer_ids[0]]);
+    try std.testing.expectEqual(@as(usize, @alignOf(Sample(f64))), plan.buffer_align[plan.ops[4].output_buffer_ids[0]]);
+    // And the recorded aligns are 2 and 8 concretely (catches a stale default).
+    try std.testing.expectEqual(@as(usize, 2), @alignOf(Sample(i16)));
+    try std.testing.expectEqual(@as(usize, 8), @alignOf(Sample(f64)));
+}
+
+// --- L7.c both layout passes agree (per-edge baseline ≡ colored on alignment) -
+
+test "L7 the per-edge baseline aligns offsets by the SAME rule as the colored pool" {
+    // The alignment guard lives in the layout pass shared by BOTH buffer modes,
+    // so the obviously-correct per-edge baseline (every value its own buffer, no
+    // reuse) must satisfy the SAME invariant. If only the colored path aligned,
+    // a Tier-B recolor onto the per-edge baseline could re-introduce a misaligned
+    // @alignCast — so we pin the baseline independently.
+    const g = comptime mixedAlignGraph(3);
+    const plan_pe = comptime try commitComptimeMode(g, BufferMode.per_edge);
+    const plan_c = comptime try commitComptimeMode(g, BufferMode.colored);
+    try assertAlignmentInvariant(plan_pe);
+    try assertAlignmentInvariant(plan_c);
+    // Both passes record the same per-class alignment target on every used id.
+    const ref_pe = referencedBufferIds(plan_pe);
+    for (0..ref_pe.len) |k| {
+        const a = plan_pe.buffer_align[ref_pe.ids[k]];
+        try std.testing.expect(a == @alignOf(Sample(i16)) or a == @alignOf(Sample(f64)));
+    }
+}
+
+// --- L7.d the persistent feedback z⁻¹ tail aligns its absolute offset --------
+
+test "L7 a wide-aligned feedback z⁻¹ buffer in the pool tail lands on an aligned absolute offset" {
+    // A comb whose SCRATCH pool is a narrow class (i16, ending the scratch on a
+    // non-8 byte boundary) but whose FEEDBACK element is wide (f64, align 8). The
+    // persistent z⁻¹ buffer lives PAST the scratch pool; its absolute offset must
+    // still be 8-aligned, or the engine's @alignCast of the tail region to *f64
+    // would trap. We build a delayed f64 loop so the SCC-has-delay check passes
+    // and the feedback source mints a persistent f64 buffer.
+    const DelayF64 = struct {
+        const Self = @This();
+        pub const delay_len: usize = 3; // marks the block a delay (closes the loop causally)
+        pub fn process(self: *Self, in: []const Sample(f64), out: []Sample(f64)) void {
+            _ = self;
+            @memcpy(out, in);
+        }
+    };
+    // The graph: an i16 scratch chain (to push the scratch pool to a non-8 end)
+    // PLUS an f64 feedback loop  src→sum→delay→gain→sink, gain ⤳ sum (z⁻¹).
+    const N = 1; // i16 scratch = 2·1·2 = 4 bytes ⇒ scratch ends NOT on an 8-boundary
+    const g = comptime blk: {
+        var gg = graph.Graph.empty;
+        gg.block_size = N;
+        // narrow scratch chain (i16), laid out first
+        const i_in = gg.add(SrcI16);
+        const i_out = gg.add(SinkI16);
+        gg.connect(port.MapOutPort(SrcI16), i_in, 0, port.MapInPort(SinkI16), i_out, 0);
+        // f64 feedback loop, laid out second
+        const f_in = gg.add(SrcF64);
+        const sum = gg.add(Map1F64);
+        const dl = gg.add(DelayF64);
+        const gain = gg.add(Map1F64);
+        const f_out = gg.add(SinkF64);
+        gg.connect(port.MapOutPort(SrcF64), f_in, 0, port.MapInPort(Map1F64), sum, 0);
+        gg.connect(port.MapOutPort(Map1F64), sum, 0, port.MapInPort(DelayF64), dl, 0);
+        gg.connect(port.MapOutPort(DelayF64), dl, 0, port.MapInPort(Map1F64), gain, 0);
+        gg.connect(port.MapOutPort(Map1F64), gain, 0, port.MapInPort(SinkF64), f_out, 0);
+        gg.connectFeedback(port.MapOutPort(Map1F64), gain, 0, port.MapInPort(Map1F64), sum, 0);
+        break :blk gg;
+    };
+    const plan = comptime try commitComptime(g);
+    // There IS a persistent tail (one f64 z⁻¹ buffer).
+    try std.testing.expect(plan.persistent_bytes > 0);
+    // The whole invariant still holds across scratch + tail.
+    try assertAlignmentInvariant(plan);
+    // The persistent buffer id is the one whose offset sits at/after the scratch
+    // pool end (`pool_bytes`); find every referenced id in the tail and assert it
+    // is 8-aligned with align == @alignOf(Sample(f64)).
+    const ref = referencedBufferIds(plan);
+    var saw_tail = false;
+    for (0..ref.len) |k| {
+        const id = ref.ids[k];
+        if (plan.buffer_offset[id] >= plan.pool_bytes and plan.buffer_byte_len[id] > 0) {
+            saw_tail = true;
+            try std.testing.expectEqual(@as(usize, @alignOf(Sample(f64))), plan.buffer_align[id]);
+            try std.testing.expectEqual(@as(usize, 0), plan.buffer_offset[id] % @alignOf(Sample(f64)));
+        }
+    }
+    try std.testing.expect(saw_tail);
+}
