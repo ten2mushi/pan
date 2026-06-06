@@ -270,6 +270,8 @@ pub fn build(b: *std.Build) void {
     const examples = [_][]const u8{
         "examples/animation/analyze.zig",
         "examples/spectrogram/spectrogram.zig",
+        "examples/sonification/deep_space/deep_space.zig",
+        "examples/extract_and_generate/ghost_autoencoder.zig",
     };
     for (examples) |path| {
         const ex_mod = b.createModule(.{

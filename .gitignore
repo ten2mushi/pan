@@ -10,18 +10,25 @@ zig-out/
 /tests/vectors/**/*.npy
 
 # --- data/ ---------------------------------------------------------------
-# Inputs ARE committed (data/input/<source>/<source>_lpcm.wav + metadata), EXCEPT:
-#  - source video containers (.mkv) — large, redundant with the decoded LPCM;
+# Inputs ARE committed (data/input/<source>/<source>_lpcm.wav + metadata + any
+# still images), EXCEPT:
+#  - source media containers (.mkv/.webm/.mp4/.m4a/.opus/.part) — large, and
+#    redundant with the decoded LPCM;
 #  - files that exceed GitHub's 100 MB per-file limit (the Nature Sounds clip's
 #    1.6 GB .webm and 513 MB .wav — a push would be rejected). Use Git LFS if you
 #    really need them tracked.
 /data/input/**/*.mkv
+/data/input/**/*.webm
+/data/input/**/*.mp4
+/data/input/**/*.m4a
+/data/input/**/*.opus
+/data/input/**/*.part
 /data/input/Nature Sounds – European Birds Singing/*.webm
 /data/input/Nature Sounds – European Birds Singing/*_lpcm.wav
 # Intermediates (decoded mono LPCM, feature matrices) — regenerated on demand.
 /data/work/
-# Staging area for outputs not (yet) chosen for commit.
-/data/output/ignore/
+# Generated renders — large and regenerable from the committed inputs + examples.
+/data/output/
 
 # Project docs / specs kept local (not tracked).
 /specifications/
