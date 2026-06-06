@@ -1339,3 +1339,38 @@ test "align invariant: recolor is a PURE layout function (two identical graphs r
         }
     }
 }
+
+// §13 — workgroup gating: Tier-B must not auto-engage on an unverified RT path.
+//
+// The cost gate promotes to Tier-B only when a co-scheduling Workgroup is
+// `available`. `detect()` reports availability per OS, and the policy is that an
+// OS whose real-time worker path has not been validated on real hardware stays
+// OFF by default (so an untested scheduler can never glitch a live render):
+//   - macOS needs an explicit device `os_workgroup` handle (via `withHandle`);
+//   - Linux is gated off pending an on-device real-time soak test.
+// Either way the safe default is "unavailable", because Tier-B is bit-exact to
+// Tier-A — gating it off costs only multicore throughput, never correctness.
+
+test "Workgroup.detect: co-scheduling is unavailable by default (Tier-B opt-in until verified)" {
+    const wg = parallel.Workgroup.detect();
+    try std.testing.expect(!wg.available);
+    try std.testing.expect(wg.handle == null);
+}
+
+test "Workgroup.withHandle: binding a real handle is the explicit opt-in that marks it available" {
+    var dummy_handle: u8 = 0;
+    const wg = parallel.Workgroup.withHandle(&dummy_handle);
+    try std.testing.expect(wg.available);
+    try std.testing.expect(wg.handle != null);
+}
+
+test "cost gate: an unavailable workgroup forces Tier-A regardless of a busy, parallel graph" {
+    // A graph that is plainly busy (work ≫ deadline) AND plainly parallel
+    // (span ≪ work) would normally promote — but with no workgroup to bound the
+    // cross-worker spin, the gate must refuse and keep the engine on Tier A.
+    const busy_work: f32 = 100.0;
+    const short_span: f32 = 1.0;
+    const deadline: f32 = 10.0;
+    const decision = parallel.costGate(busy_work, short_span, 8, deadline, false, .{});
+    try std.testing.expect(!decision.enable);
+}

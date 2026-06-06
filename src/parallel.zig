@@ -103,15 +103,24 @@ pub const Workgroup = struct {
 
     /// Probe the platform for the co-scheduling mechanism.
     ///   * Linux: SCHED_FIFO + CPU affinity is the documented bound and the
-    ///     mechanism is always present, so `available = true` (whether the *process*
-    ///     has the RT-scheduling privilege is a best-effort runtime detail applied at
-    ///     join — an unprivileged process simply runs the workers at normal priority,
-    ///     a weaker but still-functional bound).
+    ///     mechanism is always present — BUT it is reported `available = false`
+    ///     FOR NOW. The Linux real-time path (worker SCHED_FIFO + CPU pinning under
+    ///     an audio deadline) has not yet been validated on real Linux hardware
+    ///     (the parallel bench ran on macOS), so Tier-B is intentionally gated OFF
+    ///     there rather than auto-promoting an unverified real-time scheduler that
+    ///     could glitch under load. This is safe because Tier-B is bit-exact to
+    ///     Tier-A, so staying on Tier-A (single-threaded) costs only multicore
+    ///     throughput, never correctness. Re-enable by flipping the `.linux` branch
+    ///     below back to `.available = true` once an on-device soak test passes:
+    ///     a sustained real-time render under CPU contention with zero xruns and
+    ///     parallel-output identical to sequential.
     ///   * macOS / embedded / other: no mechanism without a real device workgroup
     ///     handle, so `available = false` until one is bound via `withHandle`.
     pub fn detect() Workgroup {
         return switch (builtin.os.tag) {
-            .linux => .{ .available = true, .handle = null },
+            // Linux RT path unverified on real hardware — gate Tier-B OFF until a
+            // device soak test passes, then flip this back to `.available = true`.
+            .linux => .{ .available = false, .handle = null },
             else => .{ .available = false, .handle = null },
         };
     }
