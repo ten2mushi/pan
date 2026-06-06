@@ -17,6 +17,8 @@
 const std = @import("std");
 const types = @import("types.zig");
 const port = @import("port.zig");
+const graph = @import("graph.zig");
+const engine = @import("engine.zig");
 
 // ===========================================================================
 // Concat — the named heterogeneous fan-in
@@ -220,6 +222,201 @@ pub fn ChannelMap(comptime Sub: type, comptime C: usize) type {
                 const xs: []const types.Sample(Lane) = @ptrCast(in.plane(c));
                 const ys: []types.Sample(Lane) = @ptrCast(out.plane(c));
                 self.subs[c].process(xs, ys);
+            }
+        }
+    };
+}
+
+// ===========================================================================
+// Subgraph — the block-size-1 subgraph combinator (single-pass loop fusion +
+// sample-accurate tight feedback)
+// ===========================================================================
+//
+// A `Map` block exposes only a per-WINDOW kernel `process(self, in, out)` — there
+// is no per-sample kernel. So the only way to make a chain of Maps run as a SINGLE
+// fused pass (the intermediate value never round-trips memory) is to drive the
+// inner blocks one sample at a time: at window length 1, each inner kernel's loop
+// degenerates to one iteration, and the comptime-monomorphized inner replay inlines
+// into the outer per-sample loop, so adjacent maps `g ∘ f` compose into one pass
+// with bit-identical output. This realizes categorical composition concretely:
+// fusion is just composition of rate-1:1 type-stable morphisms, and the law it must
+// honour is `(g ∘ f)(x) = g(f(x))` sample-for-sample.
+//
+// Driving at window length 1 also makes feedback SAMPLE-ACCURATE for free. The
+// commit pass satisfies a declared feedback (back-)edge from LAST render call's
+// persistent z⁻¹ buffer; at window length 1 one render call IS one sample, so a
+// feedback edge carries EXACTLY one sample of latency. A delay-guarded cycle inside
+// the sub-graph therefore reproduces a hand-fused tight-feedback recurrence (e.g.
+// `y[n] = x[n] + g·y[n−D]`) exactly, with the loop closed at the sample, not the
+// block.
+//
+// Realization (reuse-maximizing): the wrapped sub-graph is committed and run by the
+// frozen Tier-A `engine.Executor` at `block_size = 1`. The combinator instance HOLDS
+// that inner executor; its pool (the colored scratch prefix + the persistent z⁻¹
+// tail) lives inside the instance, so feedback state persists across outer samples
+// AND across outer `process` calls exactly as a hand-fused kernel's ring does. Per
+// outer sample i: poke the inner `Inlet` source's current cell with `in[i]`, replay
+// the inner op-list once, read the inner `Outlet` sink's captured cell into `out[i]`.
+
+/// `Inlet(Elem)` — the sub-graph's single-sample input endpoint: a zero-sample-input
+/// source `Map` whose `process(out)` writes its one stored `sample` into the (length-1)
+/// output window. The `Subgraph` driver sets `sample` to the current outer input
+/// sample before each inner render. Author wires it as the head of the inner graph
+/// (`Inlet → … → Outlet`) so the inner graph is source-rooted. Located inside the
+/// inner block list by the `is_subgraph_inlet` marker, mirroring how the offline
+/// executor finds its source by `is_offline_source`.
+pub fn Inlet(comptime Elem: type) type {
+    return struct {
+        const Self = @This();
+        /// The current sample to emit on the next inner render (set by the driver).
+        sample: Elem = std.mem.zeroes(Elem),
+        /// Marker so `Subgraph` can locate the unique injection node at comptime.
+        pub const is_subgraph_inlet = true;
+
+        pub fn process(self: *Self, out: []Elem) void {
+            // Driven at window length 1: emit the one stored sample. (Defensive over
+            // a longer window: the same sample fills it — never exercised at N=1.)
+            for (out) |*o| o.* = self.sample;
+        }
+    };
+}
+
+/// `Outlet(Elem)` — the sub-graph's single-sample output endpoint: an output-only
+/// `Map` (a sink) whose `process(in)` captures the last sample of its (length-1)
+/// input window into its `sample` cell. The `Subgraph` driver reads `sample` after
+/// each inner render. Located by the `is_subgraph_outlet` marker.
+pub fn Outlet(comptime Elem: type) type {
+    return struct {
+        const Self = @This();
+        /// The sample captured on the most recent inner render (read by the driver).
+        sample: Elem = std.mem.zeroes(Elem),
+        pub const is_subgraph_outlet = true;
+
+        pub fn process(self: *Self, in: []const Elem) void {
+            // At window length 1 this captures the single rendered sample; over a
+            // longer window the last sample wins (never exercised at N=1).
+            for (in) |x| self.sample = x;
+        }
+    };
+}
+
+/// Find the node id of the unique block in `sub_blocks` carrying the marker decl
+/// `marker` (`is_subgraph_inlet` / `is_subgraph_outlet`). Exactly one is required;
+/// zero or many is a loud compile error naming the violated contract.
+fn endpointNode(comptime sub_blocks: []const type, comptime marker: []const u8, comptime which: []const u8) usize {
+    comptime {
+        var found: ?usize = null;
+        for (sub_blocks, 0..) |Block, i| {
+            if (@hasDecl(Block, marker)) {
+                if (found != null)
+                    @compileError("pan: Subgraph sub-graph declares more than one " ++ which ++
+                        " — wrap the body with exactly one Inlet and one Outlet");
+                found = i;
+            }
+        }
+        if (found) |id| return id;
+        @compileError("pan: Subgraph sub-graph declares no " ++ which ++
+            " — the body must be wrapped Inlet → … → Outlet (an " ++ which ++
+            " roots/terminates the single-sample driver)");
+    }
+}
+
+/// Reject a sub-block that would expose an unbound PARAMETER port or EVENT lane on
+/// the OUTER `Subgraph` interface. v1 scope: the combinator forwards no control plane
+/// — a sub-graph that declares parameter ports (`params`) or consumes an event lane
+/// has external control inputs the outer `process(in, out)` cannot deliver, so fail
+/// loud rather than silently drop them. (The two endpoint markers are exempt: they
+/// are the driver's own injection/capture cells, not author-facing control.)
+fn rejectControlPorts(comptime sub_blocks: []const type) void {
+    comptime {
+        for (sub_blocks) |Block| {
+            if (@hasDecl(Block, "params"))
+                @compileError("pan: Subgraph sub-block " ++ @typeName(Block) ++
+                    " declares parameter ports — outer parameter forwarding is out of scope" ++
+                    " (v1 wraps only param-free sample chains/cycles)");
+            if (port.isEventConsumer(Block))
+                @compileError("pan: Subgraph sub-block " ++ @typeName(Block) ++
+                    " consumes an event lane — outer event forwarding is out of scope" ++
+                    " (v1 wraps only event-free sample chains/cycles)");
+        }
+    }
+}
+
+/// Build the inner executor's all-default `instances` tuple (one block per node).
+/// The `Executor` struct gives `instances` no aggregate default — it is a tuple of
+/// arbitrary block types — so each node is default-constructed here; every sub-block
+/// carries field defaults, and the `Subgraph` caller seeds coefficients afterward via
+/// `inner.instances[id]`.
+fn defaultInstances(comptime sub_blocks: []const type) std.meta.Tuple(sub_blocks) {
+    var t: std.meta.Tuple(sub_blocks) = undefined;
+    inline for (sub_blocks, 0..) |Block, i| t[i] = Block{};
+    return t;
+}
+
+/// `Subgraph(sub_g, sub_blocks)` — wrap a committed inner sub-graph as ONE rate-1:1
+/// `Map` that runs the sub-graph at window length 1 once per outer sample.
+///
+/// `sub_g` is the inner graph (one node per entry of `sub_blocks`, in node-id order,
+/// the `Executor` contract) wrapped `Inlet → … → Outlet`: exactly one block declares
+/// `is_subgraph_inlet` (the input endpoint) and exactly one declares
+/// `is_subgraph_outlet` (the output endpoint). The outer block's input element is the
+/// `Inlet`'s element and its output element is the `Outlet`'s element.
+///
+/// Semantics — for an outer window `in`/`out` of length L, for each i in 0..L:
+/// set the inner `Inlet`'s current sample to `in[i]`, render the inner graph once
+/// (window length 1), and read the inner `Outlet`'s captured sample into `out[i]`.
+/// Inner persistent state (delay rings, feedback z⁻¹ tail) lives in the held inner
+/// executor and threads across both samples and outer calls, so a delay-guarded
+/// feedback cycle is closed at the sample with exactly one sample of latency.
+pub fn Subgraph(comptime sub_g: graph.Graph, comptime sub_blocks: []const type) type {
+    if (sub_blocks.len != sub_g.node_count)
+        @compileError("pan: Subgraph needs exactly one block type per sub-graph node");
+    rejectControlPorts(sub_blocks);
+
+    const inlet_id = endpointNode(sub_blocks, "is_subgraph_inlet", "Inlet");
+    const outlet_id = endpointNode(sub_blocks, "is_subgraph_outlet", "Outlet");
+
+    const InElem = port.MapOutElem(sub_blocks[inlet_id]); // Inlet's emitted element
+    const OutElem = port.MapInElem(sub_blocks[outlet_id]); // Outlet's captured element
+
+    // Drive the inner graph one sample at a time: the only window length at which the
+    // inner kernels' per-window loops collapse to a single iteration that inlines into
+    // the outer loop (the fusion mechanism) and at which a feedback edge is exactly
+    // one sample of latency (the tight-feedback mechanism).
+    const inner_g = comptime blk: {
+        var g2 = sub_g;
+        g2.block_size = 1;
+        break :blk g2;
+    };
+    const InnerExec = engine.Executor(inner_g, sub_blocks);
+
+    return struct {
+        const Self = @This();
+        /// The inner Tier-A executor: its block instances (one per sub-graph node)
+        /// and its flat pool (colored scratch + persistent z⁻¹ tail) live here, so
+        /// the inner feedback/delay state persists across outer samples and calls.
+        /// The caller may seed inner block coefficients via `inner.instances[id]`.
+        /// The inner executor's `instances` tuple has no aggregate default (it is a
+        /// tuple of the sub-block types), so each block is explicitly default-
+        /// constructed here — every sub-block carries field defaults, so `.{}` per
+        /// node is the all-default instance the caller then seeds.
+        inner: InnerExec = .{ .instances = defaultInstances(sub_blocks) },
+
+        pub fn process(self: *Self, in: []const InElem, out: []OutElem) void {
+            // The realtime token is a witness-only value (the inner `render` consumes
+            // it solely as proof flush-to-zero was set on the calling thread). The
+            // outer `process` runs on whatever thread the outer executor already
+            // entered; constructing the default token here adds no syscall and never
+            // touches the FP control word — `enterRealtimeThread` is NOT called per
+            // sample. The default fields are the entered witness.
+            const token = engine.RealtimeToken{};
+            for (in, out) |x, *y| {
+                // Poke the inlet, render one inner sample, read the outlet. The inner
+                // op-list is comptime-fixed, so this replay monomorphizes/inlines into
+                // a single fused pass over the sub-graph's kernels.
+                self.inner.instances[inlet_id].sample = x;
+                self.inner.render(token);
+                y.* = self.inner.instances[outlet_id].sample;
             }
         }
     };

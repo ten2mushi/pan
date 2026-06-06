@@ -157,6 +157,25 @@ pub fn SpectralFlux(comptime num: numeric.Numeric, comptime bins: usize) type {
         /// The previous hop's power spectrum, zero before the stream began.
         prev: [bins]f32 = @splat(0),
 
+        /// Timeline-chunking warm-up, in this Map's input element (one HOP /
+        /// FeatureFrame per element). The only cross-hop state is `prev`, the
+        /// immediately preceding spectrum. Feeding ONE frame of lead-in before a
+        /// chunk's first real output processes that prior frame, leaving `prev`
+        /// bit-identical to what a whole-timeline render would hold at the chunk
+        /// boundary — hence exact, not tolerance-bounded.
+        ///
+        /// Scope of the warm-up lever (applies to every warm-up-declaring feat
+        /// Map here): declaring `warmup_samples` only unlocks data-parallel
+        /// timeline chunking for a LINEAR chain in which EVERY node declares it,
+        /// expressed in the chain's element unit (hops/frames here). It does NOT
+        /// make a full fan-out analysis DAG chunkable: such graphs route through a
+        /// frame-domain Framer/Stft re-blocker (a rate-changing block that is not
+        /// in this per-element warm-up model) and have fan-out, so they stay on
+        /// the sequential or file-level path. These declarations let a feat block
+        /// participate in a chunkable hop-domain linear stage, not in the DAG.
+        pub const warmup_samples: usize = 1;
+        pub const warmup_exact: bool = true;
+
         pub fn process(self: *Self, in: []const In, out: []types.Scalar(f32)) void {
             for (in, out) |frame, *o| {
                 var acc: f64 = 0;
@@ -767,6 +786,19 @@ pub fn DominantBandHysteresis(comptime num: numeric.Numeric, comptime bins: usiz
         /// The currently reported (held) dominant bin.
         held: u16 = 0,
 
+        /// Timeline-chunking warm-up, in HOPs (FeatureFrames). The smoothed
+        /// power is a leaky integrator `s ← 0.7·s + 0.3·power`, so a wrong
+        /// boundary value decays by 0.7 each frame: after n frames its residual
+        /// influence is 0.7^n. Thirteen frames drives that residual to
+        /// 0.7^13 ≈ 9.7e-3 of the original error — small enough that the
+        /// reconstructed `smoothed` is within tolerance of the true value. The
+        /// `held` band is a LATCHED hysteresis decision (not a decaying
+        /// quantity), so even an exact `smoothed` cannot guarantee a bit-exact
+        /// `held` across a chunk seam — hence the warm-up is tolerance-bounded
+        /// (allclose), never bit-exact.
+        pub const warmup_samples: usize = 13;
+        pub const warmup_exact: bool = false;
+
         pub fn process(self: *Self, in: []const In, out: []types.Scalar(u16)) void {
             for (in, out) |frame, *o| {
                 // leaky-integrate, tracking the challenger argmax
@@ -901,6 +933,18 @@ pub fn BallisticEnvelope(comptime num: numeric.Numeric, comptime FRAME: usize) t
         attack: f32 = 0.6,
         /// The falling-edge smoothing fraction (slow).
         release: f32 = 0.05,
+
+        /// Timeline-chunking warm-up, in HOPs (frames). The only cross-frame
+        /// state is `env`. A boundary error in `env` decays by (1 − coeff) each
+        /// frame; the SLOWEST decay is the release edge (coeff = 0.05), giving a
+        /// per-frame residual factor of 0.95. The release tail dominates the
+        /// warm-up: 0.95^128 ≈ 1.5e-3, so 128 frames of discarded lead-in shrink
+        /// a wrong boundary `env` to well under a tolerance, after which the
+        /// reconstructed envelope tracks the true one. Because the convergence is
+        /// asymptotic (an IIR settle), not finite, the warm-up is
+        /// tolerance-bounded (allclose), never bit-exact.
+        pub const warmup_samples: usize = 128;
+        pub const warmup_exact: bool = false;
 
         pub fn process(self: *Self, in: []const In, out: []types.Scalar(f32)) void {
             for (in, out) |frame, *o| {

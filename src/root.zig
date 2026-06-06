@@ -73,6 +73,20 @@ pub const Ring = mux.Ring;
 /// timeline.
 pub const offline = @import("offline.zig");
 pub const OfflineBatch = offline.OfflineBatch;
+/// `OfflineBatch` with automatic comptime loop-fusion applied: a drop-in that runs
+/// the same Tier-C machinery on the fused graph, recovering the single-pass /
+/// byte-displacement win for offline renders. Bit-exact to the unfused render.
+pub const OfflineBatchFused = offline.OfflineBatchFused;
+
+/// The thin unified entry façade: one `pan.render(...)` that routes by intent
+/// (`.realtime` → the comptime Tier-A executor block-by-block; `.offline` → the
+/// Tier-C `OfflineBatch`) over an offline-style endpoint graph, plus `renderJobs`
+/// for file-level offline parallelism. It delegates to the existing executors —
+/// it unifies only the entry seam, not the tier internals.
+pub const facade = @import("facade.zig");
+pub const render = facade.render;
+pub const renderJobs = facade.renderJobs;
+pub const RenderOptions = facade.RenderOptions;
 
 // --- graph, commit, engine ------------------------------------------------
 
@@ -132,6 +146,17 @@ pub const Telemetry = engine.Telemetry;
 pub const RealtimeToken = engine.RealtimeToken;
 pub const enterRealtimeThread = engine.enterRealtimeThread;
 pub const renderInto = engine.renderInto;
+
+/// Automatic comptime loop fusion — the pure `graph + block-tuple` rewrite
+/// (`fusion.fuse`) that folds adjacent rate-1:1 type-stable single-consumer `Map`
+/// chains into one block-size-1 `combinators.Subgraph` pass, plus the
+/// `engine.FusedExecutor` that applies it transparently. Never an author API: an
+/// author writes plain separate blocks; `FusedExecutor` just opts in to the win.
+pub const fusion = @import("fusion.zig");
+pub const FusedExecutor = engine.FusedExecutor;
+pub const FusedExecutorMode = engine.FusedExecutorModeOnly;
+pub const ParanoidFusedExecutor = engine.ParanoidFusedExecutor;
+
 /// The Tier-A bound executor — monomorphize over a committed comptime graph and
 /// its node-id → block-type tuple to get a runnable, wait-free pull renderer.
 pub const Executor = engine.Executor;

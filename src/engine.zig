@@ -33,6 +33,7 @@ const config = @import("config.zig");
 const io = @import("io.zig");
 const synth = @import("synth.zig");
 const parallel = @import("parallel.zig");
+const fusion = @import("fusion.zig");
 
 // ===========================================================================
 // Floating-point environment — flush-to-zero / denormals-are-zero
@@ -453,6 +454,115 @@ fn ExecutorModeParanoid(comptime g: graph.Graph, comptime node_blocks: []const t
 
         pub fn telemetry(self: *Self) Telemetry {
             return self.tele;
+        }
+    };
+}
+
+// ===========================================================================
+// FusedExecutor — the comptime executor with automatic loop fusion applied
+// ===========================================================================
+//
+// `FusedExecutor` is the opt-in monomorphization that recovers the single-pass /
+// byte-displacement-per-render win: it runs `fusion.fuse` on the author's graph +
+// block tuple (folding adjacent rate-1:1 type-stable single-consumer Map chains into
+// one `combinators.Subgraph` block-size-1 pass each) and drives the rewritten graph
+// through the ordinary `ExecutorModeParanoid`. Fusion is denotationally identity:
+// `(g ∘ f)(x) = g(f(x))` holds sample-for-sample, so a fused render is BIT-IDENTICAL
+// to the unfused one — that equivalence is the differential gate.
+//
+// The base `Executor`/`ExecutorMode` are deliberately left as the UNFUSED baseline:
+// their `.{ .instances = .{…} }` direct-seeding contract is what the differential
+// (and the rest of the suite) leans on. `FusedExecutor` keeps the SAME author-facing
+// seed shape (one configured block per ORIGINAL node, in original node-id order) and
+// SCATTERS each seed to where fusion put that node — a passthrough node's instance
+// goes to its new top-level slot; a folded node's instance goes INSIDE its fused
+// Subgraph's inner executor at the body position the route records. So fusion stays
+// invisible to authors: they still hand `FusedExecutor.init` plain per-node blocks.
+
+/// As `Executor`, with automatic loop fusion applied. See `FusedExecutorMode`.
+pub fn FusedExecutor(comptime g: graph.Graph, comptime node_blocks: []const type) type {
+    return FusedExecutorMode(g, node_blocks, .colored, false);
+}
+
+/// As `ExecutorMode`, with automatic loop fusion applied (buffer mode chosen
+/// explicitly so the fused≡unfused differential can pin both `.colored` and
+/// `.per_edge`).
+pub fn FusedExecutorModeOnly(comptime g: graph.Graph, comptime node_blocks: []const type, comptime mode: commit.BufferMode) type {
+    return FusedExecutorMode(g, node_blocks, mode, false);
+}
+
+/// As `ParanoidExecutor`, with automatic loop fusion applied (active NaN-poison on the
+/// fused inner pool in Debug/ReleaseSafe).
+pub fn ParanoidFusedExecutor(comptime g: graph.Graph, comptime node_blocks: []const type, comptime mode: commit.BufferMode) type {
+    return FusedExecutorMode(g, node_blocks, mode, true);
+}
+
+/// The fused executor body. `f = fusion.fuse(g, node_blocks)` is the comptime rewrite;
+/// the inner `ExecutorModeParanoid(f.graph, f.blocks, mode, paranoid)` runs it. The
+/// author seeds via `init(unfused)` where `unfused` is the SAME per-original-node tuple
+/// the unfused `ExecutorMode` would take, so the two executors are seeded from one
+/// shared value in the differential.
+pub fn FusedExecutorMode(
+    comptime g: graph.Graph,
+    comptime node_blocks: []const type,
+    comptime mode: commit.BufferMode,
+    comptime paranoid: bool,
+) type {
+    if (node_blocks.len != g.node_count)
+        @compileError("pan: FusedExecutor needs exactly one block type per graph node");
+    const f = fusion.fuse(g, node_blocks);
+    const Inner = ExecutorModeParanoid(f.graph, f.blocks, mode, paranoid);
+
+    return struct {
+        const Self = @This();
+        /// The inner executor over the fused graph (its pool + per-fused-node
+        /// instances, including each fused node's nested inner sub-executor).
+        exec: Inner,
+
+        /// The committed plan of the FUSED graph (op-list, footprint, buffer layout) —
+        /// exposed for footprint/op-count reporting. Its `op_count` is strictly ≤ the
+        /// unfused plan's whenever any chain fused (each fused chain collapses to one
+        /// top-level op).
+        pub const committed = Inner.committed;
+        /// The per-render deadline of the fused graph (identical to the unfused one —
+        /// fusion never changes N/Fs).
+        pub const deadline_ns = Inner.deadline_ns;
+        /// The fusion routing table, exposed for tests/tooling.
+        pub const route = f.route;
+
+        /// Seed from the author's per-ORIGINAL-node tuple, scattering each instance to
+        /// where fusion placed that node: a passthrough node to its new top-level slot,
+        /// a folded node into its fused Subgraph's inner executor at the recorded body
+        /// position. `Inlet`/`Outlet` inner endpoints keep their (default) construction.
+        pub fn init(unfused: std.meta.Tuple(node_blocks)) Self {
+            // `.{ .instances = undefined }` takes `Inner`'s field defaults for `pool`
+            // (zeroed — the persistent feedback tail must start silent) and `tele`.
+            var self: Self = .{ .exec = .{ .instances = undefined } };
+            // Place every instance at its all-default first, so each fused node's
+            // nested Subgraph inner executor (and its own zeroed sub-pool + default
+            // Inlet/Outlet endpoints) is initialized before we selectively overwrite
+            // the author-seeded coefficient fields below.
+            inline for (f.blocks, 0..) |Block, j| self.exec.instances[j] = Block{};
+            inline for (node_blocks, 0..) |_, i| {
+                switch (comptime f.route[i]) {
+                    .passthrough => |nid| self.exec.instances[nid] = unfused[i],
+                    .fused => |fp| self.exec.instances[fp.node].inner.instances[fp.inner] = unfused[i],
+                }
+            }
+            return self;
+        }
+
+        /// Render one block: delegates to the inner executor over the fused graph.
+        pub fn render(self: *Self, token: RealtimeToken) void {
+            self.exec.render(token);
+        }
+
+        pub fn recordTiming(self: *Self, render_ns: u64) void {
+            self.exec.recordTiming(render_ns);
+        }
+
+        pub fn telemetry(self: *Self) Telemetry {
+            return self.exec.telemetry();
         }
     };
 }

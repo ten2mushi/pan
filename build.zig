@@ -96,6 +96,8 @@ pub fn build(b: *std.Build) void {
         "tests/fused_feedback_test.zig",
         "tests/persistent_feedback_test.zig",
         "tests/inplace_coalescing_test.zig",
+        "tests/subgraph_combinator_test.zig",
+        "tests/fusion_differential_test.zig",
         "tests/planar_delay_test.zig",
         "tests/fdn_reverb_test.zig",
         "tests/ladder_test.zig",
@@ -136,6 +138,12 @@ pub fn build(b: *std.Build) void {
         "tests/polyvoice_behaviour_test.zig",
         "tests/channelmap_functoriality_test.zig",
         "tests/offline_yoneda_test.zig",
+        "tests/offline_batch_filelevel_test.zig",
+        "tests/offline_chunking_warmup_test.zig",
+        "tests/offline_fusion_test.zig",
+        "tests/subgraph_yoneda_test.zig",
+        "tests/fusion_yoneda_test.zig",
+        "tests/facade_test.zig",
         "tests/ring_yoneda_test.zig",
         "tests/parallel_tier_b_test.zig",
         "tests/parallel_pure_yoneda_test.zig",
@@ -308,6 +316,8 @@ pub fn build(b: *std.Build) void {
         "bench/offline_bench.zig",
         "bench/biquad_cascade_bench.zig",
         "bench/parallel_bench.zig",
+        "bench/fusion_bench.zig",
+        "bench/filelevel_bench.zig",
     };
     for (benches) |path| {
         const bench_mod = b.createModule(.{

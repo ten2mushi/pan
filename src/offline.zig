@@ -59,6 +59,7 @@ const graph = @import("graph.zig");
 const port = @import("port.zig");
 const engine = @import("engine.zig");
 const mux = @import("mux.zig");
+const fusion = @import("fusion.zig");
 
 const Sample = types.Sample;
 
@@ -224,6 +225,81 @@ pub fn OfflineBatch(comptime g: graph.Graph, comptime node_blocks: []const type)
             std.debug.assert(input.len == output.len);
             var exec: Exec = .{ .instances = template };
             driveWindow(&exec, input, output);
+        }
+
+        // -------------------------------------------------------------------
+        // File-level parallelism (renderBatch) — embarrassingly parallel
+        // -------------------------------------------------------------------
+
+        /// One independent offline render: an input timeline and the
+        /// equal-length destination it renders into. A batch is a list of these.
+        pub const Job = struct { input: []const f32, output: []f32 };
+
+        /// Render a list of fully independent jobs across up to `cores` worker
+        /// threads. Each job is a complete, isolated `renderSequential` over its
+        /// own freshly-seeded `Exec` instance (its own block state + pool), so
+        /// jobs share nothing: there is no warm-up, boundary, or shape concern,
+        /// and each job's output is **bit-identical** to running that one job
+        /// through `renderSequential` alone — parallelism here changes only
+        /// scheduling, never the per-job arithmetic. Workers pop job indices off
+        /// a shared atomic counter (`fetchAdd`), so the work self-balances and a
+        /// slow job does not stall the others. Offline (O1): a worker may block,
+        /// spin, and allocate freely.
+        ///
+        /// Degenerate cases run inline with no threads: an empty job list is a
+        /// no-op, and `cores <= 1` is a plain serial loop. A thread-spawn failure
+        /// is propagated (the partial set already spawned is joined first so no
+        /// worker is leaked).
+        pub fn renderBatch(
+            alloc: std.mem.Allocator,
+            template: InstanceTuple,
+            jobs: []const Job,
+            cores: usize,
+        ) !void {
+            if (jobs.len == 0) return;
+
+            // Serial fast path: one core (or fewer) ⇒ no threads at all.
+            if (cores <= 1) {
+                for (jobs) |job| renderSequential(template, job.input, job.output);
+                return;
+            }
+
+            const n_threads = @min(cores, jobs.len);
+
+            const Shared = struct {
+                next: std.atomic.Value(usize) = .init(0),
+                jobs: []const Job,
+                template: InstanceTuple,
+
+                fn work(s: *@This()) void {
+                    while (true) {
+                        // Claim the next unrendered job. Monotonic counter: once
+                        // it reaches jobs.len every worker drains and returns.
+                        const idx = s.next.fetchAdd(1, .monotonic);
+                        if (idx >= s.jobs.len) return;
+                        const job = s.jobs[idx];
+                        // Each job gets its own fresh Exec instance via
+                        // renderSequential — isolated state, bit-identical to a
+                        // solo serial render of this job.
+                        renderSequential(s.template, job.input, job.output);
+                    }
+                }
+            };
+            var shared = Shared{ .jobs = jobs, .template = template };
+
+            const threads = try alloc.alloc(std.Thread, n_threads);
+            defer alloc.free(threads);
+
+            // Spawn the worker pool. On a spawn failure, join the workers already
+            // started (so none leak) before propagating the error.
+            var spawned: usize = 0;
+            errdefer {
+                for (threads[0..spawned]) |t| t.join();
+            }
+            while (spawned < n_threads) : (spawned += 1) {
+                threads[spawned] = try std.Thread.spawn(.{}, Shared.work, .{&shared});
+            }
+            for (threads[0..spawned]) |t| t.join();
         }
 
         // -------------------------------------------------------------------
@@ -536,6 +612,153 @@ pub fn OfflineBatch(comptime g: graph.Graph, comptime node_blocks: []const type)
             while (done < dest.len) : (done += N) {
                 exec.render(tok);
             }
+        }
+    };
+}
+
+// ===========================================================================
+// OfflineBatchFused — OfflineBatch with automatic loop-fusion applied
+//
+// The offline analogue of `engine.FusedExecutor`: it runs the SAME `OfflineBatch`
+// machinery, but on the FUSED graph produced by `fusion.fuse`. Fusing adjacent
+// rate-1:1, type-stable, single-consumer, param-free `Map`s into one block-size-1
+// `Subgraph` pass is denotationally identity — `(g ∘ f)(x) = g(f(x))` sample for
+// sample — so the fused render is BIT-EXACT to the unfused render, while the
+// intermediate value never round-trips memory (the byte-displacement win).
+//
+// The trick that keeps this from threading a `fuse` flag through every internal
+// seeding site and footprint formula: we delegate wholesale to
+// `OfflineBatch(f.graph, f.blocks)` — the same generic type on the fused graph —
+// so chunk / pipeline / sequential routing, the footprint formulas, `chunkable`,
+// and `isLinearChain` all compute UNCHANGED on the fused graph. The only new code
+// is `scatterTemplate`, which turns the author's per-ORIGINAL-node template into
+// the per-FUSED-node template the inner `OfflineBatch` expects (mirroring the
+// `FusedExecutor.init` scatter): a `.passthrough` node copies straight across; a
+// `.fused` node default-constructs the `Subgraph` and seeds its inner instances.
+// ===========================================================================
+
+/// `OfflineBatch` with automatic comptime loop-fusion applied. Drop-in for the
+/// plain `OfflineBatch` at the call site, except the public render entries take
+/// the author's per-ORIGINAL-node `template` (the same tuple the unfused
+/// `OfflineBatch` takes) and scatter it onto the fused graph internally. The
+/// fused render is bit-exact to the unfused render; chunked/pipeline routing runs
+/// on the fused graph (a graph that fused any chain is no longer `chunkable`,
+/// since a `Subgraph` node declares no `warmup_samples` — sequential is then the
+/// baseline and the routing falls back to pipeline/sequential automatically).
+pub fn OfflineBatchFused(comptime g: graph.Graph, comptime node_blocks: []const type) type {
+    if (node_blocks.len != g.node_count)
+        @compileError("pan: OfflineBatchFused needs exactly one block type per graph node");
+
+    const f = comptime fusion.fuse(g, node_blocks);
+    // The real worker: the plain OfflineBatch over the FUSED graph and its fused
+    // block tuple. Every render lever, footprint formula, and routing predicate is
+    // its own, computed on the fused graph — we add nothing, only translate the
+    // template before each call.
+    const Fused = OfflineBatch(f.graph, f.blocks);
+
+    return struct {
+        const Self = @This();
+
+        /// The author's per-ORIGINAL-node instance tuple (what the unfused
+        /// `OfflineBatch` also takes), so this type is a drop-in: a caller seeds
+        /// exactly as if no fusion happened.
+        pub const InstanceTuple = std.meta.Tuple(node_blocks);
+
+        /// The committed plan of the FUSED graph (op-list, footprint, buffer
+        /// layout). Its `op_count` is ≤ the unfused plan's whenever any chain
+        /// fused (each fused chain collapses to one top-level op) — the proof that
+        /// fusion actually fired.
+        pub const committed = Fused.committed;
+        /// The fused graph's block size, source/sink node ids (in the fused graph),
+        /// chunkability, and warm-up — exposed for tests and tooling.
+        pub const block_size = Fused.block_size;
+        pub const source_id = Fused.source_id;
+        pub const sink_id = Fused.sink_id;
+        pub const chunkable = Fused.chunkable;
+        pub const warmup_exact = Fused.warmup_exact;
+        pub const total_warmup = Fused.total_warmup;
+        /// The fusion routing table, exposed for tests/tooling.
+        pub const route = f.route;
+
+        /// Translate the author's per-ORIGINAL-node template into the per-FUSED-node
+        /// template the inner `OfflineBatch` consumes. For a `.passthrough` node the
+        /// original instance is copied straight into its new top-level slot; for a
+        /// `.fused` node the slot holds a default-constructed `Subgraph` whose inner
+        /// executor's body instances are seeded from the originals (the `Inlet`/
+        /// `Outlet` inner endpoints keep their defaults). Mirrors the scatter in
+        /// `engine.FusedExecutor.init`.
+        fn scatterTemplate(unfused: InstanceTuple) Fused.InstanceTuple {
+            var out: Fused.InstanceTuple = undefined;
+            // Default-construct every fused slot first, so each fused node's nested
+            // Subgraph inner executor (its sub-instances + default Inlet/Outlet) is
+            // initialized before we selectively overwrite the seeded body fields.
+            inline for (f.blocks, 0..) |Block, j| out[j] = Block{};
+            inline for (node_blocks, 0..) |_, i| {
+                switch (comptime f.route[i]) {
+                    .passthrough => |nid| out[nid] = unfused[i],
+                    .fused => |fp| out[fp.node].inner.instances[fp.inner] = unfused[i],
+                }
+            }
+            return out;
+        }
+
+        /// Render the whole timeline with a single worker, on the fused graph.
+        /// Bit-exact to the unfused `OfflineBatch.renderSequential`.
+        pub fn renderSequential(template: InstanceTuple, input: []const f32, output: []f32) void {
+            Fused.renderSequential(scatterTemplate(template), input, output);
+        }
+
+        pub const Job = Fused.Job;
+
+        /// File-level parallelism over the fused graph (each job an isolated render).
+        pub fn renderBatch(
+            alloc: std.mem.Allocator,
+            template: InstanceTuple,
+            jobs: []const Job,
+            cores: usize,
+        ) !void {
+            return Fused.renderBatch(alloc, scatterTemplate(template), jobs, cores);
+        }
+
+        /// Auto-route the render on the fused graph: chunking when the fused graph is
+        /// chunkable (rare — a `Subgraph` fused node declares no `warmup_samples`),
+        /// else pipeline for a linear fused chain, else sequential.
+        pub fn render(alloc: std.mem.Allocator, template: InstanceTuple, input: []const f32, output: []f32) !void {
+            return Fused.render(alloc, scatterTemplate(template), input, output);
+        }
+
+        /// Data-parallel timeline chunking over the fused graph. Only callable when
+        /// the fused graph is `chunkable`; a fused graph containing a `Subgraph` node
+        /// is not, so the inner `@compileError` fires exactly as for the unfused case.
+        pub fn renderChunked(
+            alloc: std.mem.Allocator,
+            template: InstanceTuple,
+            input: []const f32,
+            output: []f32,
+            k_req: usize,
+        ) !void {
+            return Fused.renderChunked(alloc, scatterTemplate(template), input, output, k_req);
+        }
+
+        /// Pipeline parallelism over the fused graph. Runs each fused top-level op on
+        /// its own thread; `error.NotLinearChain` if the fused graph is not linear.
+        pub fn renderPipeline(
+            alloc: std.mem.Allocator,
+            template: InstanceTuple,
+            input: []const f32,
+            output: []f32,
+        ) !void {
+            return Fused.renderPipeline(alloc, scatterTemplate(template), input, output);
+        }
+
+        /// The bounded chunk footprint of the fused graph (O2).
+        pub fn chunkFootprintBytes(k_chunks: usize, total_samples: usize) usize {
+            return Fused.chunkFootprintBytes(k_chunks, total_samples);
+        }
+
+        /// The bounded pipeline footprint of the fused graph (O2).
+        pub fn pipelineFootprintBytes() usize {
+            return Fused.pipelineFootprintBytes();
         }
     };
 }
