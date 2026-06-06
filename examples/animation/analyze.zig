@@ -62,14 +62,13 @@ const ANALYSIS_RATE = 44_100;
 /// are spectral-shape descriptors the renderer uses to shape the oscillatory 3-D
 /// spatial distribution.
 const Spec = .{
+    .full_spectrum = pan.FeatureFrame(BINS), // The full 1025-bin power spectrum
     .dominant = pan.Scalar(u16), // COLOR  — flicker-free dominant frequency bin
     .amplitude = pan.Scalar(f32), // AMPLITUDE — ballistic envelope, 0..1
     .rms = pan.Scalar(f32), // spectral broadband energy
     .centroid = pan.Scalar(f32), // brightness (centre-of-mass bin)
     .rolloff = pan.Scalar(f32), // 85%-energy roll-off bin
     .flux = pan.Scalar(f32), // spectral flux (onset / novelty)
-    .flatness = pan.Scalar(f32), // tonal↔noisy, 0..1
-    .contrast = pan.FeatureFrame(NB), // octave-band peak/valley contrast
 };
 const Collect = pan.combinators.Concat(Spec);
 const Row = pan.port.ConcatOut(Spec);
@@ -117,8 +116,6 @@ pub fn main(init: std.process.Init) !void {
     const centroid = try g.add(pan.feat.SpectralCentroid(Num, BINS), .{});
     const rolloff = try g.add(pan.feat.SpectralRolloff(Num, BINS), .{});
     const flux = try g.add(pan.feat.SpectralFlux(Num, BINS), .{});
-    const flatness = try g.add(pan.feat.SpectralFlatness(Num, BINS), .{});
-    const contrast = try g.add(pan.feat.SpectralContrast(Num, BINS, NB), .{});
     // time-domain amplitude branch
     const framer = try g.add(pan.spectral.Framer(Num, FRAME, HOP), .{});
     const envelope = try g.add(pan.feat.BallisticEnvelope(Num, FRAME), .{});
@@ -131,21 +128,20 @@ pub fn main(init: std.process.Init) !void {
     // wire the two branches off the one source (same-rate fan-out)
     try g.connect(src, stft);
     try g.connect(stft, power);
-    inline for (.{ dominant, rms, centroid, rolloff, flux, flatness, contrast }) |node| {
+    inline for (.{ dominant, rms, centroid, rolloff, flux }) |node| {
         try g.connect(power, node);
     }
     try g.connect(src, framer);
     try g.connect(framer, envelope);
 
     // fan every feature into the named Concat columns
+    try g.connect(power, collect.in.full_spectrum);
     try g.connect(dominant, collect.in.dominant);
     try g.connect(envelope, collect.in.amplitude);
     try g.connect(rms, collect.in.rms);
     try g.connect(centroid, collect.in.centroid);
     try g.connect(rolloff, collect.in.rolloff);
     try g.connect(flux, collect.in.flux);
-    try g.connect(flatness, collect.in.flatness);
-    try g.connect(contrast, collect.in.contrast);
     try g.connect(collect, sink);
 
     // ---- drive the analysis root to input exhaustion -------------------------
@@ -203,14 +199,13 @@ fn writeSidecar(
         \\  "n_cols": {d},
         \\  "hz_per_bin": {d},
         \\  "columns": [
-        \\    {{ "name": "dominant",  "offset": 0, "width": 1, "kind": "freq_bin" }},
-        \\    {{ "name": "amplitude", "offset": 1, "width": 1, "kind": "unit" }},
-        \\    {{ "name": "rms",       "offset": 2, "width": 1, "kind": "energy" }},
-        \\    {{ "name": "centroid",  "offset": 3, "width": 1, "kind": "freq_bin" }},
-        \\    {{ "name": "rolloff",   "offset": 4, "width": 1, "kind": "freq_bin" }},
-        \\    {{ "name": "flux",      "offset": 5, "width": 1, "kind": "energy" }},
-        \\    {{ "name": "flatness",  "offset": 6, "width": 1, "kind": "unit" }},
-        \\    {{ "name": "contrast",  "offset": 7, "width": {d}, "kind": "vector" }}
+        \\    {{ "name": "full_spectrum", "offset": 0, "width": {d}, "kind": "vector" }},
+        \\    {{ "name": "dominant",  "offset": {d}, "width": 1, "kind": "freq_bin" }},
+        \\    {{ "name": "amplitude", "offset": {d}, "width": 1, "kind": "unit" }},
+        \\    {{ "name": "rms",       "offset": {d}, "width": 1, "kind": "energy" }},
+        \\    {{ "name": "centroid",  "offset": {d}, "width": 1, "kind": "freq_bin" }},
+        \\    {{ "name": "rolloff",   "offset": {d}, "width": 1, "kind": "freq_bin" }},
+        \\    {{ "name": "flux",      "offset": {d}, "width": 1, "kind": "energy" }}
         \\  ]
         \\}}
         \\
@@ -224,7 +219,13 @@ fn writeSidecar(
         n_frames,
         cols,
         @as(f64, @floatFromInt(sample_rate)) / @as(f64, @floatFromInt(FRAME)),
-        NB,
+        BINS,
+        BINS + 0,
+        BINS + 1,
+        BINS + 2,
+        BINS + 3,
+        BINS + 4,
+        BINS + 5,
     });
     defer gpa.free(json);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });

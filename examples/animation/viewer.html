@@ -102,6 +102,14 @@ const KNN_MODE   = q.get("knn") || "spatial";
 const KNN_K      = parseInt(q.get("knn_k") || "4");
 const KNN_WINDOW = parseFloat(q.get("knn_window") || "5");
 
+// Spectral peak detection: when the matrix contains full_spectrum (1025 bins),
+// emit one point per spectral peak per frame instead of one point per frame.
+// max_peaks  — max peaks to emit per frame (default 5; 0 = legacy single-point)
+// peak_floor — minimum power fraction of frame-max to count as a peak (default 0.01)
+const MAX_PEAKS  = parseInt(q.get("max_peaks") || "5");
+const PEAK_FLOOR = parseFloat(q.get("peak_floor") || "0.01");
+const PURE_FEATURE_SPACE = q.get("pure_feature_space") === "true";
+
 const ICE = [[0.169,0.290,0.471],[0.357,0.561,0.788],[0.663,0.824,0.949],
              [0.910,0.957,1.0],[1,1,1]];  // matches render_viz_v2.ICE
 
@@ -147,45 +155,192 @@ async function load() {
   } catch (e) { fail("could not fetch " + root + ".{json,f32} — serve the repo root over http (see the file header)"); }
   const cols = meta.n_cols, fps = meta.fps, hzpb = meta.hz_per_bin;
   const m = new Float32Array(buf);
-  const n = Math.floor(m.length / cols);
+  const nFrames = Math.floor(m.length / cols);
   const off = {}; for (const c of meta.columns) off[c.name] = c.offset;
+
+  // Detect new 1031-col schema with full_spectrum
+  const specCol = meta.columns.find(c => c.name === "full_spectrum");
+  const HAS_SPECTRUM = !!(specCol) && MAX_PEAKS > 0;
+  const BINS = HAS_SPECTRUM ? specCol.width : 0;
 
   const get = (name, i) => m[i*cols + off[name]];
   const dominant=[], amplitude=[], centroid=[], rolloff=[], flux=[];
-  for (let i=0;i<n;i++){ dominant.push(get("dominant",i)); amplitude.push(get("amplitude",i));
+  for (let i=0;i<nFrames;i++){ dominant.push(get("dominant",i)); amplitude.push(get("amplitude",i));
     centroid.push(get("centroid",i)); rolloff.push(get("rolloff",i)); flux.push(get("flux",i)); }
   const freq = dominant.map(d=>Math.max(d*hzpb,1));
-  let ampN = norm01(amplitude,98); if (Math.max(...ampN)<=0) ampN = norm01(amplitude.map((_,i)=>get("rms",i)),98);
+  let ampN = norm01(amplitude,98); 
+  let maxAmp = 0; for(let i=0;i<ampN.length;i++) if(ampN[i]>maxAmp) maxAmp=ampN[i];
+  if (maxAmp<=0) ampN = norm01(amplitude.map((_,i)=>get("rms",i)),98);
   const cenN=norm01(centroid,98), rolN=norm01(rolloff,98), fluxN=norm01(flux,97);
 
+  // Frequency range for log-mapping (used for both legacy and spectral paths)
   const flo=Math.max(20,pctile(freq,2)), fhi=Math.max(flo*2,pctile(freq,98));
   const L2=Math.log2, lflo=L2(flo), lfhi=L2(fhi);
   const GOLDEN=Math.PI*(3-Math.sqrt(5));
+  const totalT=nFrames/fps;
 
-  // feature placement (identical to render_viz_v2 / build_particles)
-  const pos=new Float32Array(n*3), col=new Float32Array(n*3),
-        emit=new Float32Array(n), amp=new Float32Array(n);
-  let cdrift=0;
-  for (let i=0;i<n;i++){
-    cdrift += (cenN[i]-0.5);
-    const lf=(L2(Math.min(Math.max(freq[i],flo),fhi))-lflo)/(lfhi-lflo);
-    const az=i*GOLDEN + 0.6*cdrift/fps;
-    const r=1+4.6*ampN[i]+2.2*fluxN[i];
-    pos[i*3]=r*Math.cos(az); pos[i*3+1]=(lf-0.5)*8+0.5*Math.sin(az*0.5); pos[i*3+2]=r*Math.sin(az);
-    const cv=(L2(Math.min(Math.max(freq[i],flo),fhi))-lflo)/(lfhi-lflo);
+  // -----------------------------------------------------------------------
+  // Colour helper: ICE ramp + time-based hue progression
+  // -----------------------------------------------------------------------
+  function colourFor(freqHz, frameIdx) {
+    const cv=(L2(Math.min(Math.max(freqHz,flo),fhi))-lflo)/(lfhi-lflo);
     const c=lerp3(ICE,cv);
-    // Time-based hue progression: rotate hue by (i/n)*HUE_SHIFT across the piece.
-    // At HUE_SHIFT=0.50 (180°): start=blue→white, mid=teal→cyan, end=rose→pink.
     if (HUE_SHIFT > 0) {
       const [h,s,l]=rgb2hsl(c[0],c[1],c[2]);
-      const [r2,g2,b2]=hsl2rgb((h+(i/n)*HUE_SHIFT)%1.0,s,l);
-      col[i*3]=r2; col[i*3+1]=g2; col[i*3+2]=b2;
-    } else {
-      col[i*3]=c[0]; col[i*3+1]=c[1]; col[i*3+2]=c[2];
+      return hsl2rgb((h+(frameIdx/nFrames)*HUE_SHIFT)%1.0,s,l);
     }
-    emit[i]=i/fps; amp[i]=ampN[i];
+    return c;
   }
-  const totalT=n/fps;
+
+  let pos, col, emit, amp, n, freqOut, ampRaw;
+
+  if (HAS_SPECTRUM) {
+    // -------------------------------------------------------------------
+    // NEW PATH: spectral peak detection → one point per peak per frame
+    // -------------------------------------------------------------------
+    console.log(`spectral peak detection: ${BINS} bins, max_peaks=${MAX_PEAKS}, floor=${PEAK_FLOOR}`);
+
+    // Pass 1: compute global power p95 for normalisation + count peaks
+    // Use reservoir sampling for p95 to avoid keeping all bin powers.
+    const powerSamples = new Float32Array(20000); // reservoir for p95
+    let pSampleCount = 0;
+    let peakCounts = new Uint16Array(nFrames);
+    let totalPeaks = 0;
+
+    for (let i = 0; i < nFrames; i++) {
+      if (ampN[i] < 0.003) { peakCounts[i] = 0; continue; } // silence → skip
+      const base = i * cols + specCol.offset;
+      let frameMax = 0;
+      for (let b = 0; b < BINS; b++) { const v = m[base + b]; if (v > frameMax) frameMax = v; }
+      if (frameMax < 1e-10) { peakCounts[i] = 0; continue; }
+      const floor = frameMax * PEAK_FLOOR;
+      // Count local maxima above floor
+      let count = 0;
+      for (let b = 2; b < BINS - 2; b++) {
+        const v = m[base + b];
+        if (v > floor && v > m[base+b-1] && v > m[base+b+1]
+            && v > m[base+b-2] && v > m[base+b+2]) {
+          count++;
+          // Reservoir sample for p95
+          if (pSampleCount < powerSamples.length) {
+            powerSamples[pSampleCount++] = v;
+          } else {
+            const j = Math.floor(Math.random() * (pSampleCount + 1));
+            if (j < powerSamples.length) powerSamples[j] = v;
+            pSampleCount++;
+          }
+        }
+      }
+      peakCounts[i] = Math.min(count, MAX_PEAKS);
+      totalPeaks += peakCounts[i];
+    }
+    const p95 = pctile(powerSamples.subarray(0, Math.min(pSampleCount, powerSamples.length)), 95) || 1;
+    console.log(`spectral peaks: ${totalPeaks} total points from ${nFrames} frames (avg ${(totalPeaks/nFrames).toFixed(1)}/frame), p95=${p95.toExponential(2)}`);
+
+    // Pass 2: allocate and fill
+    n = totalPeaks;
+    pos = new Float32Array(n * 3);
+    col = new Float32Array(n * 3);
+    emit = new Float32Array(n);
+    amp = new Float32Array(n);
+    freqOut = new Float32Array(n);
+    ampRaw = new Float32Array(n);
+    let cdrift = 0, pi = 0; // pi = point index
+
+    for (let i = 0; i < nFrames; i++) {
+      cdrift += (cenN[i] - 0.5);
+      if (peakCounts[i] === 0) continue;
+      const base = i * cols + specCol.offset;
+      let frameMax = 0;
+      for (let b = 0; b < BINS; b++) { const v = m[base + b]; if (v > frameMax) frameMax = v; }
+      const floor = frameMax * PEAK_FLOOR;
+
+      // Collect peaks with bin index and power
+      const peaks = [];
+      for (let b = 2; b < BINS - 2; b++) {
+        const v = m[base + b];
+        if (v > floor && v > m[base+b-1] && v > m[base+b+1]
+            && v > m[base+b-2] && v > m[base+b+2]) {
+          peaks.push({ b, power: v });
+        }
+      }
+      peaks.sort((a, b) => b.power - a.power);
+      const K = Math.min(peaks.length, MAX_PEAKS);
+
+      const az = i * GOLDEN + 0.6 * cdrift / fps;
+      const emitTime = i / fps;
+
+      for (let p = 0; p < K; p++) {
+        const pk = peaks[p];
+        const peakHz = Math.max(pk.b * hzpb, 1);
+        const lf = (L2(Math.min(Math.max(peakHz, flo), fhi)) - lflo) / (lfhi - lflo);
+        const pAmp = Math.min(1, pk.power / p95);
+
+        if (PURE_FEATURE_SPACE) {
+          // Pure Feature Space: Z = Amplitude, Y = Pitch, X = Centroid
+          pos[pi*3]   = (cenN[i] - 0.5) * 16.0;
+          pos[pi*3+1] = (lf - 0.5) * 8;
+          pos[pi*3+2] = (pAmp - 0.5) * 16.0;
+        } else if (KNN_MODE === "spectro-temporal") {
+          // Cartesian Timbre Space: Z=time, Y=pitch, X=centroid
+          pos[pi*3]   = (cenN[i] - 0.5) * 16.0;
+          pos[pi*3+1] = (lf - 0.5) * 8;
+          pos[pi*3+2] = -(i / fps) * 2.0;
+        } else {
+          // Cylinder: azimuthal from frame, Y from peak frequency
+          const r = 1 + 4.6 * pAmp + 2.2 * fluxN[i];
+          pos[pi*3]   = r * Math.cos(az);
+          pos[pi*3+1] = (lf - 0.5) * 8 + 0.5 * Math.sin(az * 0.5);
+          pos[pi*3+2] = r * Math.sin(az);
+        }
+
+        const cc = colourFor(peakHz, i);
+        col[pi*3] = cc[0]; col[pi*3+1] = cc[1]; col[pi*3+2] = cc[2];
+        emit[pi] = emitTime;
+        amp[pi] = pAmp;
+        freqOut[pi] = peakHz;
+        ampRaw[pi] = amplitude[i];
+        pi++;
+      }
+    }
+    console.log(`spectral peak cloud: ${pi} points placed`);
+    n = pi;
+
+  } else {
+    // -------------------------------------------------------------------
+    // LEGACY PATH: one point per frame (old 13-col matrices)
+    // -------------------------------------------------------------------
+    n = nFrames;
+    pos = new Float32Array(n * 3);
+    col = new Float32Array(n * 3);
+    emit = new Float32Array(n);
+    amp = new Float32Array(n);
+    freqOut = freq;
+    ampRaw = amplitude;
+    let cdrift = 0;
+    for (let i = 0; i < n; i++) {
+      cdrift += (cenN[i] - 0.5);
+      const lf = (L2(Math.min(Math.max(freq[i], flo), fhi)) - lflo) / (lfhi - lflo);
+      const az = i * GOLDEN + 0.6 * cdrift / fps;
+      const r = 1 + 4.6 * ampN[i] + 2.2 * fluxN[i];
+      if (PURE_FEATURE_SPACE) {
+        pos[i*3]   = (cenN[i] - 0.5) * 16.0;
+        pos[i*3+1] = (lf - 0.5) * 8;
+        pos[i*3+2] = (ampN[i] - 0.5) * 16.0;
+      } else if (KNN_MODE === "spectro-temporal") {
+        pos[i*3]   = (cenN[i] - 0.5) * 16.0;
+        pos[i*3+1] = (lf - 0.5) * 8;
+        pos[i*3+2] = -(i / fps) * 2.0;
+      } else {
+        pos[i*3] = r * Math.cos(az);
+        pos[i*3+1] = (lf - 0.5) * 8 + 0.5 * Math.sin(az * 0.5);
+        pos[i*3+2] = r * Math.sin(az);
+      }
+      const cc = colourFor(freq[i], i);
+      col[i*3] = cc[0]; col[i*3+1] = cc[1]; col[i*3+2] = cc[2];
+      emit[i] = i / fps; amp[i] = ampN[i];
+    }
+  }
 
   // -----------------------------------------------------------------------
   // kNN mesh — mode-dispatched edge construction
@@ -193,39 +348,44 @@ async function load() {
   const edges=[];
 
   if (KNN_MODE === "temporal") {
-    // Pure temporal: connect each point to its K forward time-neighbours.
-    // K=1 → single thread, K=2 → thin ribbon, K=4 → thicker braid.
     for (let i=0;i<n;i++)
       for (let d=1;d<=KNN_K && i+d<n;d++)
         edges.push(i, i+d);
-
   } else {
-    // Spatial or spectro-temporal: grid-hash kNN in 3D position space.
-    // spectro-temporal adds a time-window constraint: only points emitted
-    // within ±KNN_WINDOW seconds of each other can be connected.
     const useTimeConstraint = (KNN_MODE === "spectro-temporal");
     let mn=[1e9,1e9,1e9], mx=[-1e9,-1e9,-1e9];
     for(let i=0;i<n;i++)for(let k=0;k<3;k++){mn[k]=Math.min(mn[k],pos[i*3+k]);mx[k]=Math.max(mx[k],pos[i*3+k]);}
-    const ext=Math.max(mx[0]-mn[0],mx[1]-mn[1],mx[2]-mn[2])||1;
-    const cell=ext/Math.cbrt(n)*1.5||1, grid=new Map();
+    const vol = Math.max(mx[0]-mn[0], 1) * Math.max(mx[1]-mn[1], 1) * Math.max(mx[2]-mn[2], 1);
+    const density = n / vol;
+    let cell = Math.cbrt(10 / density);
+    if (cell < 0.5) cell = 0.5;
+    if (cell > 10.0) cell = 10.0;
+    const grid=new Map();
     const key=(a,b,c)=>a+"_"+b+"_"+c;
     const ci=i=>[Math.floor((pos[i*3]-mn[0])/cell),Math.floor((pos[i*3+1]-mn[1])/cell),Math.floor((pos[i*3+2]-mn[2])/cell)];
     for(let i=0;i<n;i++){const[a,b,c]=ci(i);const k=key(a,b,c);(grid.get(k)||grid.set(k,[]).get(k)).push(i);}
     const seen=new Set();
-    for(let i=0;i<n;i++){const[a,b,c]=ci(i);const cand=[];
+    for(let i=0;i<n;i++){const[a,b,c]=ci(i);
+      let bestD = [1e9,1e9,1e9,1e9,1e9,1e9,1e9,1e9]; // Up to max expected KNN_K
+      let bestJ = [-1,-1,-1,-1,-1,-1,-1,-1];
       for(let da=-1;da<=1;da++)for(let db=-1;db<=1;db++)for(let dc=-1;dc<=1;dc++){
         const g=grid.get(key(a+da,b+db,c+dc)); if(g)for(const j of g){
           if(j===i) continue;
           if(useTimeConstraint && Math.abs(emit[j]-emit[i])>KNN_WINDOW) continue;
-          cand.push(j);
+          const dj=(pos[j*3]-pos[i*3])**2+(pos[j*3+1]-pos[i*3+1])**2+(pos[j*3+2]-pos[i*3+2])**2;
+          if (dj < bestD[KNN_K-1]) {
+            let rank = KNN_K - 1;
+            while(rank > 0 && dj < bestD[rank-1]) rank--;
+            for(let r=KNN_K-1; r>rank; r--) { bestD[r]=bestD[r-1]; bestJ[r]=bestJ[r-1]; }
+            bestD[rank] = dj; bestJ[rank] = j;
+          }
         }}
-      cand.sort((p,j)=>{const dp=(pos[p*3]-pos[i*3])**2+(pos[p*3+1]-pos[i*3+1])**2+(pos[p*3+2]-pos[i*3+2])**2;
-                        const dj=(pos[j*3]-pos[i*3])**2+(pos[j*3+1]-pos[i*3+1])**2+(pos[j*3+2]-pos[i*3+2])**2;return dp-dj;});
-      for(let t=0;t<Math.min(KNN_K,cand.length);t++){const j=cand[t];const lo=Math.min(i,j),hi=Math.max(i,j);
+      for(let t=0;t<KNN_K;t++){const j=bestJ[t]; if(j===-1) continue;
+        const lo=Math.min(i,j),hi=Math.max(i,j);
         const ek=lo*n+hi; if(!seen.has(ek)){seen.add(ek);edges.push(lo,hi);}}}
   }
 
-  return {meta,n,fps,totalT,pos,col,emit,amp,freq,ampRaw:amplitude,edges,flo,fhi};
+  return {meta,n,nFrames,fps,totalT,pos,col,emit,amp,freq:freqOut,ampRaw,edges,flo,fhi};
 }
 
 const D = await load();
@@ -367,25 +527,40 @@ addEventListener("resize",()=>{ renderer.setSize(innerWidth,innerHeight);
 // equatorial, near-overhead, and near-underside views without ever repeating.
 // cam_polar1/2 = 0 → flat equatorial orbit (original behaviour).
 function camAt(tt){
-  const theta = tt * CAM_SPEED;
-  const phi   = Math.PI / 2
-              + CAM_POLAR1 * Math.sin(tt * CAM_SPEED / PHI)
-              + CAM_POLAR2 * Math.sin(tt * CAM_SPEED * PHI);
-  const sp = Math.sin(phi);
-  camera.position.set(
-    CAM_RADIUS * sp * Math.cos(theta),
-    CAM_RADIUS * Math.cos(phi),
-    CAM_RADIUS * sp * Math.sin(theta)
-  );
-  camera.lookAt(0, 0, 0);
+  if (KNN_MODE === "spectro-temporal") {
+    // Fly down the timeline alongside the current clusters
+    const currentZ = -tt * 2.0;
+    const wobbleX = CAM_RADIUS * 0.3 * Math.sin(tt * 0.5);
+    const wobbleY = CAM_RADIUS * 0.3 * Math.cos(tt * 0.3);
+    camera.position.set(wobbleX, wobbleY, currentZ + CAM_RADIUS);
+    camera.lookAt(0, 0, currentZ);
+  } else {
+    // Spherical Lissajous orbit around the origin
+    const theta = tt * CAM_SPEED;
+    const phi   = Math.PI / 2
+                + CAM_POLAR1 * Math.sin(tt * CAM_SPEED / PHI)
+                + CAM_POLAR2 * Math.sin(tt * CAM_SPEED * PHI);
+    const sp = Math.sin(phi);
+    camera.position.set(
+      CAM_RADIUS * sp * Math.cos(theta),
+      CAM_RADIUS * Math.cos(phi),
+      CAM_RADIUS * sp * Math.sin(theta)
+    );
+    camera.lookAt(0, 0, 0);
+  }
 }
-function hudFor(tt){ const cur=Math.min(D.n-1, Math.max(0,Math.floor(tt*D.fps)));
+function hudFor(tt){
+  // Find a point near current time (binary search on emit array)
+  let lo=0, hi=D.n-1;
+  while(lo<hi){ const mid=(lo+hi)>>1; if(D.emit[mid]<tt) lo=mid+1; else hi=mid; }
+  const cur = Math.min(D.n-1, Math.max(0, lo));
+  const born = countLEQ(appearSorted, tt) * 2; // edges born so far
   hud.innerHTML =
-    `<span class="k">current point</span><br>`+
-    `COLOR / FREQUENCY  ${D.freq[cur].toFixed(1).padStart(8)} Hz<br>`+
-    `SIGNAL AMPLITUDE   ${D.ampRaw[cur].toFixed(4).padStart(8)}<br>`+
-    `LIFETIME           ${uniforms.uTau.value.toFixed(2).padStart(8)} s<br>`+
-    `EMISSION TIME      ${(cur/D.fps).toFixed(4).padStart(8)} s`;
+    `<span class="k">constellation</span><br>`+
+    `FREQUENCY  ${D.freq[cur].toFixed(1).padStart(8)} Hz<br>`+
+    `AMPLITUDE  ${D.ampRaw[cur].toFixed(4).padStart(8)}<br>`+
+    `POINTS     ${countLEQ(D.emit, tt).toString().padStart(8)} / ${D.n}<br>`+
+    `TIME       ${tt.toFixed(2).padStart(8)} s`;
   tlab.textContent=`${tt.toFixed(1)} / ${D.totalT.toFixed(0)} s`; }
 
 // the headless capture API: a driver sets each frame's time and renders one frame.

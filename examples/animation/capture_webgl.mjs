@@ -74,6 +74,13 @@ const KNN_MODE   = arg("knn",        "spatial");
 const KNN_K      = arg("knn-k",      "4");
 const KNN_WINDOW = arg("knn-window", "5");
 
+// Spectral peak detection (when the matrix contains full_spectrum).
+// --max-peaks   peaks per frame (default 5; 0 = legacy single-point)
+// --peak-floor  min power fraction of frame-max to count as peak (default 0.01)
+const MAX_PEAKS  = arg("max-peaks",  "5");
+const PEAK_FLOOR = arg("peak-floor", "0.01");
+const PURE_FEATURE_SPACE = arg("pure-feature-space", "false");
+
 const SRC = path.basename(BASE).replace(/\.features$/, "");
 const OUT = arg("out", path.join(REPO, "data", "output", `${EXPERIMENT}_${SRC}`,
   `${SRC}.constellation.mp4`));
@@ -172,6 +179,9 @@ params.set("hue_shift",  HUE_SHIFT);
 params.set("knn",        KNN_MODE);
 params.set("knn_k",      KNN_K);
 params.set("knn_window", KNN_WINDOW);
+params.set("max_peaks",  MAX_PEAKS);
+params.set("peak_floor", PEAK_FLOOR);
+params.set("pure_feature_space", PURE_FEATURE_SPACE);
 const pageUrl = `http://127.0.0.1:${port}/examples/animation/viewer.html?${params}`;
 
 const chrome = spawn(CHROME, [
