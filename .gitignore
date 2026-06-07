@@ -10,25 +10,27 @@ zig-out/
 /tests/vectors/**/*.npy
 
 # --- data/ ---------------------------------------------------------------
-# Inputs ARE committed (data/input/<source>/<source>_lpcm.wav + metadata + any
-# still images), EXCEPT:
-#  - source media containers (.mkv/.webm/.mp4/.m4a/.opus/.part) — large, and
-#    redundant with the decoded LPCM;
-#  - files that exceed GitHub's 100 MB per-file limit (the Nature Sounds clip's
-#    1.6 GB .webm and 513 MB .wav — a push would be rejected). Use Git LFS if you
-#    really need them tracked.
+# Only the Integraation and Pachelbel example inputs are committed (their decoded
+# *_lpcm.wav + metadata); every other input source is kept local. Source media
+# containers (.webm etc.) stay ignored even in the kept dirs — large and redundant
+# with the decoded LPCM.
+/data/input/*
+!/data/input/Integraation/
+!/data/input/Pachelbel Canon in D Major - the original and best version./
 /data/input/**/*.mkv
 /data/input/**/*.webm
 /data/input/**/*.mp4
 /data/input/**/*.m4a
 /data/input/**/*.opus
 /data/input/**/*.part
-/data/input/Nature Sounds – European Birds Singing/*.webm
-/data/input/Nature Sounds – European Birds Singing/*_lpcm.wav
 # Intermediates (decoded mono LPCM, feature matrices) — regenerated on demand.
 /data/work/
-# Generated renders — large and regenerable from the committed inputs + examples.
+# Generated renders — large and regenerable; kept entirely local. The README's demo
+# videos live on YouTube, so nothing under data/output is committed.
 /data/output/
+
+# Example kept local (not tracked).
+/examples/extract_and_generate/
 
 # Project docs / specs kept local (not tracked).
 /specifications/

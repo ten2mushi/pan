@@ -7,7 +7,6 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
-        "CONTRIBUTING.md",
         "src",
         "tests",
         "bench",
