@@ -17,6 +17,7 @@ zig build examples
 TICKER="BTC-USD"
 PERIOD="2y"
 INTERVAL="1d"
+RATE=48000  # must match SampleRate in market.zig
 
 EXP_DIR="$OUT_BASE_DIR/$TICKER"
 mkdir -p "$EXP_DIR"
@@ -42,7 +43,7 @@ echo "Synthesizing audio..."
 
 # 3. Convert to WAV
 echo "Converting to WAV..."
-python examples/sound_generation/to_wav.py --stereo "$RAW_FILE" "$WAV_FILE"
+python examples/utils/to_wav.py --rate "$RATE" --stereo "$RAW_FILE" "$WAV_FILE"
 
 # 4. Generate Animation
 echo "Rendering Animation..."

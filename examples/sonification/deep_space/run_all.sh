@@ -5,6 +5,7 @@ set -e
 INPUT_DIR="data/input/hubble_pictures"
 WORK_DIR="data/work"
 OUT_BASE_DIR="data/output/sonification/deep_space"
+RATE=48000  # must match SampleRate in deep_space.zig
 
 # Create necessary directories
 mkdir -p "$WORK_DIR"
@@ -40,7 +41,7 @@ for IMG_PATH in "$INPUT_DIR"/*; do
     ./zig-out/bin/example-deep_space "$SPEC_FILE" "$RAW_FILE"
     
     # 3. Convert to WAV
-    python examples/sound_generation/to_wav.py "$RAW_FILE" "$WAV_FILE"
+    python examples/utils/to_wav.py --rate "$RATE" "$RAW_FILE" "$WAV_FILE"
     
     # 4. Generate Animation
     python examples/sonification/deep_space/animate.py "$IMG_PATH" "$WAV_FILE" "$MP4_FILE"
