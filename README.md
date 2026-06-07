@@ -100,7 +100,7 @@ financial time series → events → synthesis
 ## Install / build
 
 ```sh
-git clone <repo> pan && cd pan
+git clone https://github.com/ten2mushi/pan && cd pan
 zig build                 # build the library + CLI
 zig build run             # build and run the pan CLI
 ```
