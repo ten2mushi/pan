@@ -1,104 +1,176 @@
-# examples/animation — audio-reactive 3-D constellation visualization
+# examples/animation — audio-reactive 3-D feature animations
 
-Turns a recording into the `notes/1.md` generative 3-D point-cloud animation, using
-the **pan library** for all feature extraction and **WebGL** for rendering. No Python
-and no npm dependencies — just the pan binary, a browser/Chrome, and ffmpeg.
+Turns a recording into a generative 3-D point-cloud animation, using the **pan
+library** for all feature extraction and **WebGL** for rendering. One command runs
+the whole pipeline and writes a self-describing output folder.
 
 ```
-audio ─(scripts/decode_audio.py)─► mono f32 LPCM ─(example-analyze, pan)─► <source>.features.f32
-                                                                              │
-                                              ┌────────────────────────────────┤
-                                              ▼                                 ▼
-                                       viewer.html                       capture_webgl.mjs
-                                  (three.js, real-time GPU,           (headless Chrome via the
-                                   interactive orbit/scrub)            DevTools Protocol → mp4)
+audio ─(to_lpcm)─► mono/stereo f32 LPCM ─(example-analyze, pan)─► <base>.f32 + .json
+                                                                       │
+                                  ┌────────────────────────────────────┤
+                                  ▼                                     ▼
+                            viewer.html                          capture_webgl.mjs
+                       (three.js, real-time GPU,             (headless Chrome → mp4,
+                        interactive orbit/scrub)              audio muxed; no npm deps)
 ```
+
+## One command
+
+```
+python examples/animation/render.py <experiment>          # e.g. andesana_helix
+python examples/animation/render.py --list                # show all experiments
+python examples/animation/render.py --batch               # the curated compound "hero" set
+python examples/animation/render.py --all                 # render every experiment
+python examples/animation/render.py incea_torus --seconds 20   # quick preview
+python examples/animation/render.py andesana_helix --fps 60 --cam-speed 0.05  # ad-hoc overrides
+```
+
+An experiment is named `<input>_<mode>`. **Inputs** (in `experiments.py`): `andesana`
+(overtone singing), `incea`, `pachelbel` (Canon in D), `integraation`, `strasbourgeoise`
+— add your own by dropping a file in `data/input/` and one line in `INPUTS`. **Modes** are
+listed below. `--list` prints every registered combination.
+
+> New here? Read **`PIPELINES.md`** for a step-by-step dump (preprocess → render) of
+> exactly what happens, with parameters — enough to reproduce by hand.
+
+`render.py` resolves the experiment, then runs **decode → frequency pre-scan →
+analyze → GPU capture → stamp config**, caching every stage. The output folder is
+
+```
+data/output/animation/ideation/<EXPERIMENT>/
+├── <experiment>.mp4              the render (audio muxed)
+├── <experiment>_description.md   what you're seeing + the exact reproduce command
+├── config.json                   the fully-resolved parameters (output ↔ config link)
+└── features.json                 the feature-matrix column layout
+```
+
+So an output is never orphaned from the code/config that produced it: the
+description carries `python examples/animation/render.py <experiment>`, and
+`config.json` records the mode, FFT window, detected frequency band, fps, channels,
+and every forwarded viewer parameter.
 
 ## Files
+
 | file | role |
 |---|---|
-| `analyze.zig` | The pan Analyzer graph: `LpcmSource → Stft → PowerSpectrum → {full_spectrum[1025], dominant band, RMS, centroid, rolloff, flux}` + `Framer → BallisticEnvelope` → `Concat → FeatureCollectorSink`. Built by `zig build examples` → `zig-out/bin/example-analyze`. Emits `<base>.features.f32` (row-major f32, 1031 columns per 60 fps hop) + `.json` sidecar. |
-| `viewer.html` | Self-contained three.js/WebGL viewer with **spectral peak detection**: instead of one point per frame, the viewer extracts the top spectral peaks from the full 1025-bin power spectrum, emitting one point per peak per frame. This reveals polyphonic structure — simultaneous notes, harmonics, and timbral layers each get their own point. Backward-compatible with old 13-col matrices (single-point legacy path). |
-| `capture_webgl.mjs` | Renders `viewer.html` to an mp4 by driving headless Chrome over the **DevTools Protocol** using Node's built-in `WebSocket`/`fetch` — **zero npm dependencies** — then muxes the audio. |
+| `render.py` | The orchestrator (the single command). Decode (cached), numpy frequency pre-scan, analyze (cached), drive the capturer, stamp `config.json` + `_description.md`. |
+| `experiments.py` | Declarative experiment registry. Every render is named `<input>_<mode>`; the full mode×input grid is generated, hand-tuned presets extend it. |
+| `layouts.js` | **Standalone, importable** visualization modes. Each mode = `place()` (geometry) + `knn` (edge strategy) + `camera()` (its own adapted motion). Add a mode here; nothing else changes. |
+| `analyze.zig` | The pan Analyzer pull graph → per-frame feature matrix. Runtime **granularity** (`frame` ∈ 1024/2048/4096/8192) and a `--stereo` path (two STFT branches → L/R spectra). |
+| `viewer.html` | Self-contained three.js viewer: spectral peak detection, mode dispatch, fat-line kNN web, ICE colour, track-adaptive pitch axis. Live (orbit/scrub) or headless. |
+| `capture_webgl.mjs` | Headless-Chrome frame capture (DevTools Protocol, zero npm deps) → mp4 with audio muxed (silent intermediate auto-deleted). |
+| `probe.py` | Thin mono/stereo probe: is this input *usably* stereo? Used to gate `channels=stereo`. |
+| `spectrogram.py` | Wide, high-res STFT spectrogram PNG from the same feature matrix (`python spectrogram.py <input>`; see below). |
+| `PIPELINES.md` | Concise step-by-step dump of the whole pipeline (preprocess + render) with parameters — the quickest way to understand the system. |
 
-## Run (from the repo root)
+## Modes
 
-1. Decode the source to mono LPCM:
+Each mode carries its own camera (the camera is part of the design — pure feature
+space gets an auto-fitting orbit that always frames the whole cube; the timeline
+flies down its own time axis; etc.).
+
+| mode | kind | what it does |
+|---|---|---|
+| `feature-space` | information | Axes are the features (X brightness, Y pitch, Z loudness). Auto-fitting camera tours the whole feature cube. |
+| `cylinder` | aesthetic | Audio-driven phyllotaxis: azimuth = frame×golden-angle + centroid drift, radius = loudness+flux, height = pitch — time→angle, so the cloud grows as an emergent cylindrical coil. Global kNN web. |
+| `constellation` | aesthetic | An **organic acoustic-similarity star cloud**: points embedded purely by timbre (sphere direction from brightness/pitch-class, radius from energy, deterministic feature-hash jitter), never by time, so similar moments cluster with no central form. |
+| `timeline` | information | Cartesian timbre space — time unrolled along Z, pitch up Y, brightness across X; the camera flies down the timeline. |
+| `helix` | aesthetic | The Shepard pitch helix — one turn per octave, height = octave; harmonic series spiral, octave-related partials stack. |
+| `torus` | aesthetic | The chroma torus — pitch class wraps the tube, octave wraps the ring; rising pitch winds around the surface. |
+| `harmonic` | information | **Harmonic comb / overtone detachment.** Per frame the fundamental f0 is estimated (HPS); every partial sits on a vertical ladder by harmonic number, the sung pitch slides the ladder, time unrolls into depth, and a reinforced overtone *detaches* (brighter, lifted) the instant it overtakes the fundamental. Edges are the comb teeth. |
+| `pca` | information | **PCA timbral fingerprint.** Each frame is projected onto the track's own top-3 principal timbral axes (centroid/rolloff/flux/rms + flatness + spectral contrast + MFCCs); acoustically-similar moments cluster, so the silhouette is unique to the track. Built in `render.py` (numpy SVD), served as `<base>.pca.*.f32`. |
+| `stereo-field` | information | **Stereo only.** Each peak placed at its real pan position (√L−√R)/(√L+√R); pitch up Y, time into Z — a literal moving image of the stereo spectrum. |
+
+## Dynamic granularity (frequency resolution)
+
+The FFT window is a runtime knob: bigger window = finer Hz/bin (better harmonic
+separation) at the cost of coarser time resolution and a larger matrix. Set it per
+experiment (`"frame": 4096`) or ad-hoc (`--frame 4096`). The viewer adapts to the
+resulting bin count automatically via the sidecar. `render.py` also **pre-scans each
+track's active frequency band** (numpy) and feeds `[f_lo, f_hi]` to the viewer so the
+log-pitch axis fits the track instead of guessing.
+
+## Mono vs. stereo
+
+`render.py` decodes to mono by default. Request stereo per experiment
+(`"channels": "stereo"`) or ad-hoc (`--channels stereo`). Stereo runs two STFT
+branches and stores both per-bin spectra, so the viewer can place each peak at its
+stereo pan position (and the `stereo-field` mode visualises exactly that).
+
+A 2-channel container is not necessarily *usably* stereo (a phone voice memo is
+dual-mono). `probe.py` measures the Side/(Mid+Side) energy fraction; if it's below
+the 3% threshold, **`channels=stereo` fails with a clear message** rather than
+rendering a misleading stereo image:
+
 ```
-.venv/bin/python scripts/decode_audio.py \
-    "data/input/<source>/<source>_lpcm.wav" data/work/<source>
+python examples/animation/probe.py "<file>"          # report
+python examples/animation/render.py incea_constellation --channels stereo
+  → ERROR: 'incea' is not usably stereo (side energy 0.93% < 3% threshold). Re-run with channels=mono.
 ```
-2. Run the pan analysis (build the binary first with `zig build examples`):
+
+## Colour & bloom (perceptual, no rainbow)
+
+Colour and glow are fully CLI-configurable (all viewer-only — no re-analysis):
+
+| flag | default | meaning |
+|---|---|---|
+| `--color-space oklch\|linear` | `oklch` | interpolate the ramp perceptually (OKLab) or in straight RGB. |
+| `--palette ice\|ember\|aurora\|bone\|mono` | `ice` | curated multi-stop gradient (all muted, no full hue wheel). |
+| `--color-by pitch\|timbre\|pan\|constant` | `pitch` | what drives the ramp position (timbre = per-frame spectral flatness; pan = stereo position). |
+| `--sat-by-timbre 0\|1` | `0` | scale chroma by tonality: tonal→saturated, breathy/noisy→grey. |
+| `--bloom 0\|1` + `--bloom-strength/-radius/-threshold` | off / 0.7 / 0.4 / 0.6 | cinematic glow (UnrealBloomPass via EffectComposer). |
+| `--tonemap 0\|1` | follows `--bloom` | ACES tonemap so additive transients roll off into glow instead of clipping to flat white. |
+
+Harmonic-comb knobs: `--f0-method dominant|lowest|hps`, `--harmonic-max-n`,
+`--harmonic-tolerance-cents`, `--overtone-detach 0|1`, `--harmonic-spacing/-xscale/-timev`.
+PCA knobs: `--pca-features <scalars,flatness,contrast,mfcc>`, `--pca-whiten 0|1`,
+`--pca-pitch-spread <f>`.
+
+## Compound "hero" renders
+
+`experiments.py` generates a curated set that stacks these features — per-track
+palette (ice/ember/aurora), saturation-by-timbre, ACES-tonemapped bloom, and long
+soft edge trails on the artistic modes — overriding the plain grid entries:
+
 ```
-./zig-out/bin/example-analyze data/work/<source>.mono.f32 44100 data/work/<source>.features
+python examples/animation/render.py --batch        # render the whole curated set
+python examples/animation/render.py andesana_harmonic
+python examples/animation/render.py pachelbel_pca
 ```
-3a. Render to a file (GPU, headless):
+
+## Aesthetic defaults
+
+Pure-black void; a narrow **ICE** blue→white frequency ramp (no rainbow — `hue_shift`
+defaults to 0). Round glowing points with a tight grow-then-shrink birth pulse. A
+**fat** (screen-space, not 1px) kNN web with a soft exponential recency fade
+(`edge_life` is the fade time; 60 → ~20 s soft trails). Slow cameras. Source audio is
+always muxed into the mp4.
+
+## Spectrogram (2-D view of the same data)
+
+A wide, high-resolution STFT spectrogram straight from the cached feature matrix —
+the literal 2-D form of `timeline` mode (time × frequency × power, with the *full*
+spectrum on Y instead of a per-frame summary):
+
 ```
-node examples/animation/capture_webgl.mjs \
-    --base data/work/<source>.features \
-    --audio "data/input/<source>/<source>_lpcm.wav" --fps 30 --title "<Source>"
+python examples/animation/spectrogram.py incea
+python examples/animation/spectrogram.py incea --px-per-sec 300 --height 3200   # deeper zoom
+# knobs: --frame --px-per-sec --height --fmin --fmax --db-range --cmap
 ```
-3b. …or explore it live in a browser:
+
+Output → `data/output/animation/ideation/<input>_spectrogram/<input>_spectrogram.png`
+(log-frequency y-axis, seconds x-axis, dB colour; default 140 px/s ≈ 2.3 px per 60-fps hop).
+
+## Build / dependencies
+
+- `zig build examples` builds `zig-out/bin/example-analyze` (auto-built on first run).
+- The repo `.venv` (numpy/scipy) + `ffmpeg` for decode/pre-scan.
+- **node ≥ 22** + Chrome/Chromium + `ffmpeg` for `capture_webgl.mjs` (no `npm install`).
+
+## Live exploration
+
 ```
 python3 -m http.server 8000
-# open http://localhost:8000/examples/animation/viewer.html?base=data/work/<source>.features
+# open: http://localhost:8000/examples/animation/viewer.html?base=data/work/andesana.f4096.features&mode=helix
 ```
-
-## Output
-`capture_webgl.mjs` writes to **`data/output/animation_<source>/<source>.constellation.mp4`**
-(auto-created), 1920×1080 @ 30 fps, with the source audio muxed in. `--out PATH` overrides.
-
-## What you see
-
-### Spectral peak detection (new — 1031-col matrices)
-When the feature matrix contains the `full_spectrum` column (1025 power-spectrum bins per
-frame), the viewer performs **spectral peak detection**: for each frame, it finds local
-maxima in the power spectrum and emits one point per peak (up to `--max-peaks`). This
-solves two visual artefacts present in the old single-point-per-frame approach:
-
-- **"Infinity symbol" during silence** — zero power → zero peaks → no points born →
-  kNN has nothing to cluster into anomalous shapes.
-- **"Big kick" masking** — a loud bass kick occupies low-frequency bins, but concurrent
-  hi-hats, synths, and vocals appear as separate peaks at higher frequencies. Each gets
-  its own point at the correct pitch on the Y-axis. No masking.
-
-Point positions use a **log-frequency Y-axis** (perceptually correct pitch spacing) and
-the colour of each point reflects its individual peak frequency, not just the dominant band.
-
-### Visual schema
-- **colour** = peak frequency (icy blue→white ramp) + time-based hue progression (`--hue-shift`);
-- **node size/brightness** = peak power (normalised against the 95th percentile);
-- each node is born small, pulses (a tight grow-then-shrink), then settles;
-- **edges** form a crystalline mesh via kNN clustering, with a soft exponential recency fade (`--edge-life`);
-- **camera** drifts in a spherical Lissajous orbit quasi-periodically.
-
-### Backward compatibility
-Old 13-col matrices (without `full_spectrum`) fall through to the legacy single-point-per-frame
-path automatically. No re-analysis needed.
-
-## Configuration & CLI Arguments
-The rendering pipeline is highly configurable. `capture_webgl.mjs` forwards these directly to the viewer:
-
-**Spectral Peak Detection**
-* `--max-peaks`: Maximum spectral peaks to emit per frame (default: 5). Set to `0` to force the legacy single-point-per-frame path even for new matrices.
-* `--peak-floor`: Minimum power fraction of a frame's peak to count as a spectral peak (default: 0.01 = 1% of frame-max). Lower values produce more points from quieter harmonics.
-
-**Clustering & Layout**
-* `--knn`: `spatial` (default, folds time into an overlapping cylinder), `temporal` (pure timeline thread/ribbon), or `spectro-temporal` (unrolls time along the Z-axis into a *Cartesian Timbre Space*, mapping Pitch to Y and Texture/Centroid to X).
-* `--knn-k`: Neighbours per point (default: 4).
-* `--knn-window`: Time window constraint in seconds for spectro-temporal mode (default: 5).
-
-**Aesthetics**
-* `--edge-life`: Soft exponential fade duration in seconds for the crystalline web (default: 30). Set to `0` to disable fading.
-* `--hue-shift`: Total colour wheel rotation over the piece duration (default: 0.50 = 180° shift from icy blue to rose).
-
-**Camera (Spherical Lissajous)**
-* `--cam-speed`: Azimuthal angular velocity (default: 0.10).
-* `--cam-radius`: Orbital distance (default: 11).
-* `--cam-polar1` & `--cam-polar2`: Golden-ratio-incommensurate polar wobble amplitudes (default: 0.90 and 0.25). Set to `0` for a flat equatorial orbit.
-
-## Dependencies
-`scripts/decode_audio.py` (numpy/scipy, ffmpeg for compressed inputs) · `zig build
-examples` for the analyzer · **node ≥ 22** + a Chrome/Chromium + **ffmpeg** for
-`capture_webgl.mjs` (auto-detects Chrome; override with `--chrome PATH`). No `npm
-install` needed.
+Drag to orbit · scroll to zoom · space = play/pause · slider scrubs.

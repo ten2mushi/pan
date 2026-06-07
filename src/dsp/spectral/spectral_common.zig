@@ -60,6 +60,11 @@ fn SrTwiddle(comptime T: type, comptime N: usize) type {
 }
 
 fn srTwiddle(comptime T: type, comptime N: usize, comptime inverse: bool) SrTwiddle(T, N) {
+    // The table loop runs N/4 iterations at compile time; the default 1000
+    // backwards-branch quota only covers up to a 2048-point node. Raise it so
+    // larger windows (4096, 8192, …) can build their twiddle tables. Comptime
+    // only — no runtime cost.
+    @setEvalBranchQuota(@max(1000, N * 8));
     const q = N / 4;
     var t: SrTwiddle(T, N) = undefined;
     const sign: T = if (inverse) 1.0 else -1.0;

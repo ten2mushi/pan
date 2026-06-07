@@ -43,47 +43,66 @@ const W = parseInt(arg("width", "1920"));
 const H = parseInt(arg("height", "1080"));
 const TITLE = arg("title", "");
 
-// Camera: spherical Lissajous orbit. The polar wobble frequencies are derived
-// from cam-speed via the golden ratio (always incommensurate → quasi-periodic).
-// --cam-speed   azimuthal angular velocity (rad/s). 0.10 → one orbit ~63s.
-// --cam-radius  orbital distance in world units. Smaller = tighter framing.
-// --cam-polar1  primary polar wobble amplitude (radians). 0 = flat orbit.
-// --cam-polar2  secondary polar wobble amplitude; adds organic texture.
-const CAM_SPEED  = arg("cam-speed",  "0.10");
-const CAM_RADIUS = arg("cam-radius", "11");
-const CAM_POLAR1 = arg("cam-polar1", "0.90");
-const CAM_POLAR2 = arg("cam-polar2", "0.25");
+// The visualization MODE. Each mode (defined in layouts.js) carries its own
+// adapted camera, edge strategy and aesthetic defaults, so we deliberately do NOT
+// inject hardcoded camera/edge/hue defaults here — only forward params the caller
+// EXPLICITLY set, letting the mode defaults win otherwise.
+// --mode  feature-space | constellation | timeline | helix | torus
+const MODE = arg("mode", "constellation");
 
-// Edge recency: soft exponential fade over this many seconds.
-// --edge-life  0 = no fade, all edges persist (original behaviour).
-//              30 (default) → edges reach ~5% opacity at 30s, culled at 90s.
-const EDGE_LIFE = arg("edge-life", "30");
+// Track-adaptive frequency window (Hz). The orchestrator pre-scans the audio and
+// passes the real active band so the log-pitch axis fits this track exactly.
+const FREQ_LO = arg("freq-lo");
+const FREQ_HI = arg("freq-hi");
 
-// Colour: time-based hue progression across the piece.
-// --hue-shift  fraction of the colour wheel (0–1). 0 = original ICE blue→white.
-//              0.50 (default) = 180° rotation: blue→teal→green→violet→rose.
-const HUE_SHIFT = arg("hue-shift", "0.50");
-
-// kNN clustering mode for the constellation edge mesh.
-// --knn         "spatial" (default) = K nearest in 3D position space.
-//               "temporal" = K nearest in emission time (ribbon/thread).
-//               "spectro-temporal" = spatial kNN with ±knn-window time constraint.
-// --knn-k       neighbours per point (default 4). For temporal: 1=thread, 2=ribbon.
-// --knn-window  time window in seconds for spectro-temporal mode (default 5).
-const KNN_MODE   = arg("knn",        "spatial");
-const KNN_K      = arg("knn-k",      "4");
-const KNN_WINDOW = arg("knn-window", "5");
-
-// Spectral peak detection (when the matrix contains full_spectrum).
-// --max-peaks   peaks per frame (default 5; 0 = legacy single-point)
-// --peak-floor  min power fraction of frame-max to count as peak (default 0.01)
-const MAX_PEAKS  = arg("max-peaks",  "5");
-const PEAK_FLOOR = arg("peak-floor", "0.01");
-const PURE_FEATURE_SPACE = arg("pure-feature-space", "false");
+// Optional explicit overrides (undefined = use the mode's own default).
+// --cam-speed/-radius/-polar1/-polar2  spherical-orbit params
+// --edge-life  edge fade lifetime (s); 0 = persistent web
+// --edge-width edge thickness in screen pixels (fat lines)
+// --hue-shift  colour-wheel rotation over the piece (0 = pure ICE; default)
+// --knn / --knn-k / --knn-window  edge meshing override
+// --max-peaks / --peak-floor  spectral peak detection
+const OPT = {
+  cam_speed:  arg("cam-speed"),
+  cam_radius: arg("cam-radius"),
+  cam_polar1: arg("cam-polar1"),
+  cam_polar2: arg("cam-polar2"),
+  edge_life:  arg("edge-life"),
+  edge_width: arg("edge-width"),
+  hue_shift:  arg("hue-shift"),
+  knn:        arg("knn"),
+  knn_k:      arg("knn-k"),
+  knn_window: arg("knn-window"),
+  max_peaks:  arg("max-peaks"),
+  peak_floor: arg("peak-floor"),
+  // colour & bloom
+  color_space:     arg("color-space"),
+  palette:         arg("palette"),
+  color_by:        arg("color-by"),
+  sat_by_timbre:   arg("sat-by-timbre"),
+  bloom:           arg("bloom"),
+  bloom_strength:  arg("bloom-strength"),
+  bloom_radius:    arg("bloom-radius"),
+  bloom_threshold: arg("bloom-threshold"),
+  tonemap:         arg("tonemap"),
+  point_gain:      arg("point-gain"),
+  exposure:        arg("exposure"),
+  // harmonic comb
+  f0_method:                 arg("f0-method"),
+  harmonic_max_n:            arg("harmonic-max-n"),
+  harmonic_tolerance_cents:  arg("harmonic-tolerance-cents"),
+  overtone_detach:           arg("overtone-detach"),
+  harmonic_spacing:          arg("harmonic-spacing"),
+  harmonic_xscale:           arg("harmonic-xscale"),
+  harmonic_timev:            arg("harmonic-timev"),
+  // pca timbral fingerprint
+  pca_file:         arg("pca-file"),
+  pca_pitch_spread: arg("pca-pitch-spread"),
+};
 
 const SRC = path.basename(BASE).replace(/\.features$/, "");
 const OUT = arg("out", path.join(REPO, "data", "output", `${EXPERIMENT}_${SRC}`,
-  `${SRC}.constellation.mp4`));
+  `${SRC}.${MODE}.mp4`));
 fs.mkdirSync(path.dirname(OUT), { recursive: true });
 
 const CHROME = arg("chrome", findChrome());
@@ -167,21 +186,13 @@ const srv = await startServer();
 const port = srv.address().port;
 const cdpPort = await freePort();
 const userDir = fs.mkdtempSync(path.join(os.tmpdir(), "pancap-"));
-const params = new URLSearchParams({ base: BASE, capture: "1" });
+const params = new URLSearchParams({ base: BASE, capture: "1", mode: MODE });
 if (TITLE) params.set("title", TITLE);
-// Forward all viewer params as URL query strings
-params.set("cam_speed",  CAM_SPEED);
-params.set("cam_radius", CAM_RADIUS);
-params.set("cam_polar1", CAM_POLAR1);
-params.set("cam_polar2", CAM_POLAR2);
-params.set("edge_life",  EDGE_LIFE);
-params.set("hue_shift",  HUE_SHIFT);
-params.set("knn",        KNN_MODE);
-params.set("knn_k",      KNN_K);
-params.set("knn_window", KNN_WINDOW);
-params.set("max_peaks",  MAX_PEAKS);
-params.set("peak_floor", PEAK_FLOOR);
-params.set("pure_feature_space", PURE_FEATURE_SPACE);
+if (FREQ_LO !== undefined) params.set("freq_lo", FREQ_LO);
+if (FREQ_HI !== undefined) params.set("freq_hi", FREQ_HI);
+// Forward ONLY explicitly-set overrides; absent params fall to the mode's own
+// adapted defaults inside layouts.js.
+for (const [k, v] of Object.entries(OPT)) if (v !== undefined) params.set(k, v);
 const pageUrl = `http://127.0.0.1:${port}/examples/animation/viewer.html?${params}`;
 
 const chrome = spawn(CHROME, [
@@ -276,6 +287,9 @@ try {
   } else {
     fs.copyFileSync(silent, OUT);
   }
+  // The silent intermediate is redundant once the final mp4 exists — drop it so a
+  // batch doesn't accumulate a full second copy of every render (disk-friendly).
+  try { fs.rmSync(silent, { force: true }); } catch { /* ignore */ }
 } finally {
   try { cdp && cdp.close(); } catch { /* ignore */ }
   chrome.kill();

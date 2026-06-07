@@ -1,11 +1,6 @@
 //! pan — the public API surface.
 //!
-//! This root module pins and re-exports the public identifiers. The load-
-//! bearing type machinery (the Numeric trait, the channel-layout descriptor,
-//! the canonical port elements, the typed `PortId`, the block classifier) is
-//! real and exercised throughout; the builder/engine surface is pinned and its
-//! authoring arc type-checks, while the executor, control plane, and the
-//! layered DSP libraries are completed by later phases.
+//! This root module pins and re-exports the public identifiers.
 
 const std = @import("std");
 
