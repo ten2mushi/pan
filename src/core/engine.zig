@@ -30,8 +30,9 @@ const mux = @import("mux.zig");
 const types = @import("types.zig");
 const control = @import("control.zig");
 const config = @import("config.zig");
-const io = @import("io.zig");
-const synth = @import("synth.zig");
+const resample = @import("resample.zig");
+const device_backend = @import("backend.zig");
+const event_types = @import("events.zig");
 const parallel = @import("parallel.zig");
 const fusion = @import("fusion.zig");
 
@@ -687,9 +688,9 @@ fn buildEventLane(
     node_id: usize,
     events: *const EventDispatch,
     n: usize,
-    buf: *[synth.max_events_per_block]synth.Timed(synth.NoteEvent),
+    buf: *[event_types.max_events_per_block]event_types.Timed(event_types.NoteEvent),
 ) LaneT {
-    if (comptime LaneT.Event != synth.NoteEvent) return LaneT{};
+    if (comptime LaneT.Event != event_types.NoteEvent) return LaneT{};
     var k: usize = 0;
     for (events.items) |cmd| {
         if (cmd.node != node_id) continue;
@@ -729,7 +730,7 @@ pub fn renderThunk(comptime Block: type) RenderThunk {
             // Backing storage for an event-lane param, built once below from the
             // engine's per-block event store filtered to THIS node. Lives until the
             // kernel call (the lane only views it during `process`).
-            var event_buf: [synth.max_events_per_block]synth.Timed(synth.NoteEvent) = undefined;
+            var event_buf: [event_types.max_events_per_block]event_types.Timed(event_types.NoteEvent) = undefined;
             inline for (params[1..], 1..) |p, ai| {
                 const ParamT = p.type.?;
                 // An event-lane param is delivered out-of-band (not a pooled buffer):
@@ -871,7 +872,7 @@ fn freePdcDelayState(alloc: std.mem.Allocator, self_ptr: *anyopaque) void {
 
 /// The bound render thunk for an auto-inserted resampler coercion: resample the
 /// producer's `needed_input(N)` input samples to exactly `N` outputs through the
-/// `io.RuntimeResampler` (plane-major f32). The producer's render produced exactly
+/// `resample.RuntimeResampler` (plane-major f32). The producer's render produced exactly
 /// `needed_input(N)` samples this callback (the dynamic count, set in `renderCurrent`).
 fn resamplerThunk(
     self_ptr: *anyopaque,
@@ -883,7 +884,7 @@ fn resamplerThunk(
 ) void {
     _ = guards;
     _ = fault;
-    const rs: *io.RuntimeResampler = @ptrCast(@alignCast(self_ptr));
+    const rs: *resample.RuntimeResampler = @ptrCast(@alignCast(self_ptr));
     const n_out = op.n_or_pull_spec;
     const need = rs.needed_input(n_out);
     const ch = rs.channels;
@@ -897,7 +898,7 @@ fn resamplerThunk(
 }
 
 fn freeRuntimeResampler(alloc: std.mem.Allocator, self_ptr: *anyopaque) void {
-    const rs: *io.RuntimeResampler = @ptrCast(@alignCast(self_ptr));
+    const rs: *resample.RuntimeResampler = @ptrCast(@alignCast(self_ptr));
     rs.deinit(alloc);
     alloc.destroy(rs);
 }
@@ -1482,7 +1483,7 @@ const PlanRcu = control.Rcu(*RuntimePlan);
 pub const EventCommand = struct {
     node: usize = 0,
     at_sample: usize = 0,
-    event: synth.NoteEvent = .{ .program = 0 },
+    event: event_types.NoteEvent = .{ .program = 0 },
 };
 
 /// A note-event ring (SPSC). The engine keeps TWO of these: a **live** ring whose
@@ -1693,16 +1694,16 @@ pub const Engine = struct {
     timeline_ring: EventRing = EventRing.empty,
     /// Per-block event scratch: the drained, merged, offset-sorted events for the
     /// current callback. Bounded → no audio-thread allocation. Overwritten every render.
-    event_scratch: [synth.max_events_per_block]EventCommand = undefined,
+    event_scratch: [event_types.max_events_per_block]EventCommand = undefined,
     /// The musical transport (sample-accurate position, loop, tempo). Advances by the
     /// block length each render; the offline timeline is a pure function of it, and the
     /// timeline ring's per-block window is taken against its position.
-    transport: io.Transport = .{},
+    transport: device_backend.Transport = .{},
     op_count: usize,
     footprint_bytes: usize,
     tele: Telemetry,
     /// The audio transport, once `start` installs the callback. `null` until then.
-    backend: ?io.AudioBackend = null,
+    backend: ?device_backend.AudioBackend = null,
     /// True while a separate RT thread may be rendering (the transport is started).
     /// Gates RCU grace-period reclamation: when running, the control thread waits
     /// for the epoch to advance past a swap before freeing the old plan; when not,
@@ -1873,13 +1874,13 @@ pub const Engine = struct {
                 slot_i += 1;
             } else if (node.is_coercion) {
                 // A real sample-rate-conversion resampler coercion: a streaming
-                // polyphase `io.RuntimeResampler` at the node's out_per_in ratio. The
+                // polyphase `resample.RuntimeResampler` at the node's out_per_in ratio. The
                 // f32-lane channel count is `out_elem_size / @sizeOf(f32)` (the
                 // internal pipeline precision; non-f32 SRC is not auto-inserted).
                 const ch = node.out_elem_size / @sizeOf(f32);
-                const rs = try alloc.create(io.RuntimeResampler);
+                const rs = try alloc.create(resample.RuntimeResampler);
                 errdefer alloc.destroy(rs);
-                rs.* = try io.RuntimeResampler.init(alloc, node.out_per_in_p, node.out_per_in_q, if (ch == 0) 1 else ch, commit.resampler_half);
+                rs.* = try resample.RuntimeResampler.init(alloc, node.out_per_in_p, node.out_per_in_q, if (ch == 0) 1 else ch, commit.resampler_half);
                 op.fn_ptr = @ptrCast(&resamplerThunk);
                 op.self_ptr = rs;
                 inserted[slot_i] = .{ .ptr = rs, .free = freeRuntimeResampler };
@@ -1948,7 +1949,7 @@ pub const Engine = struct {
     /// Opening a live device + the sub-5 ms / 10-min measured gate is the
     /// on-device step (no audio HW in a sandbox); the callback path compiles and
     /// links here.
-    pub fn start(self: *Self, backend: io.AudioBackend) !void {
+    pub fn start(self: *Self, backend: device_backend.AudioBackend) !void {
         // Spawn the Tier-B workers ONCE here (off the RT path), at the engine's
         // final address — spawning is a syscall, never per callback.
         if (self.tb) |tb| try tb.ensureSpawned();
@@ -2142,7 +2143,7 @@ pub const Engine = struct {
         for (plan.ops[0..plan.op_count], 0..) |*op, i| n_dyn[i] = op.n_or_pull_spec;
         for (plan.ops[0..plan.op_count]) |*op| {
             if (!op.is_resampler) continue;
-            const rs: *io.RuntimeResampler = @ptrCast(@alignCast(op.self_ptr.?));
+            const rs: *resample.RuntimeResampler = @ptrCast(@alignCast(op.self_ptr.?));
             n_dyn[op.resampler_producer_op] = rs.needed_input(op.n_or_pull_spec);
         }
     }
@@ -2178,7 +2179,7 @@ pub const Engine = struct {
     /// callback boundary). `at_sample` is the within-block offset the consuming block
     /// honours via its internal sub-block split. Returns false if the ring is full
     /// (the producer may retry; the RT thread is never stalled). Control thread only.
-    pub fn sendEvent(self: *Self, node: usize, at_sample: usize, event: synth.NoteEvent) bool {
+    pub fn sendEvent(self: *Self, node: usize, at_sample: usize, event: event_types.NoteEvent) bool {
         return self.event_ring.enqueue(.{ .node = node, .at_sample = at_sample, .event = event });
     }
 
@@ -2190,7 +2191,7 @@ pub const Engine = struct {
     /// transport (deterministic). The producer must enqueue in non-decreasing
     /// `abs_sample` order (the SPSC scheduling convention the window drain relies on).
     /// Wait-free; returns false if the ring is full. Control thread only.
-    pub fn scheduleEventAt(self: *Self, node: usize, abs_sample: usize, event: synth.NoteEvent) bool {
+    pub fn scheduleEventAt(self: *Self, node: usize, abs_sample: usize, event: event_types.NoteEvent) bool {
         return self.timeline_ring.enqueue(.{ .node = node, .at_sample = abs_sample, .event = event });
     }
 
@@ -2560,59 +2561,6 @@ test "enterRealtimeThread sets flush-to-zero and leave restores it (ARM64/x86)" 
         try std.testing.expectEqual(@as(f32, 0.0), y);
     }
     token.leave();
-}
-
-test "Executor binds kernels and renders a source→gain→sink chain end-to-end" {
-    const filters = @import("filters.zig");
-    const numeric = @import("numeric.zig");
-    const num = comptime numeric.numericFor(.f32, .{});
-
-    // A source that fills its output from a preloaded buffer (a Map Source).
-    const BufSource = struct {
-        const Self = @This();
-        data: [*]const types.Sample(f32) = undefined,
-        pub fn process(self: *Self, out: []types.Sample(f32)) void {
-            @memcpy(out, self.data[0..out.len]);
-        }
-    };
-    // A sink that copies its input to a destination buffer.
-    const BufSink = struct {
-        const Self = @This();
-        dest: [*]types.Sample(f32) = undefined,
-        pub fn process(self: *Self, in: []const types.Sample(f32)) void {
-            @memcpy(self.dest[0..in.len], in);
-        }
-    };
-    const Gain = filters.Gain(num);
-
-    const g = comptime blk: {
-        var gg = graph.Graph.empty;
-        gg.block_size = 8;
-        const src = gg.add(BufSource);
-        const gain = gg.add(Gain);
-        const sink = gg.add(BufSink);
-        gg.connect(port.MapOutPort(BufSource), src, 0, port.MapInPort(Gain), gain, 0);
-        gg.connect(port.MapOutPort(Gain), gain, 0, port.MapInPort(BufSink), sink, 0);
-        break :blk gg;
-    };
-
-    var input: [8]types.Sample(f32) = undefined;
-    for (&input, 0..) |*s, i| s.ch[0] = @floatFromInt(i + 1);
-    var output: [8]types.Sample(f32) = undefined;
-
-    const Exec = Executor(g, &.{ BufSource, Gain, BufSink });
-    var exec: Exec = .{ .instances = .{
-        .{ .data = &input },
-        .{ .gain = 0.5 },
-        .{ .dest = &output },
-    } };
-
-    const token = enterRealtimeThread();
-    defer token.leave();
-    exec.render(token);
-
-    for (input, output) |x, y| try std.testing.expectEqual(x.ch[0] * 0.5, y.ch[0]);
-    try std.testing.expect(!exec.telemetry().fault);
 }
 
 // The runtime-engine test blocks: a buffer source, a halving gain, a copying
@@ -3020,106 +2968,4 @@ test "reconfigure (live): a max-N pre-sized pool swaps N without reallocation" {
     eng.renderInto(token);
     for (0..16) |i| try std.testing.expectEqual(input[i].ch[0] * 3.0, out_rt[i].ch[0]);
     try std.testing.expect(!eng.telemetry().fault);
-}
-
-// ===========================================================================
-// Graph-level feedback execution (P6): a DelayLine-in-a-cycle runs through the
-// comptime Executor over the persistent z⁻¹ tail, decays, and stays finite.
-// ===========================================================================
-
-const FbSample = types.Sample(f32);
-
-/// Mono source that copies a backing store into its output (a zero-input Map).
-const FbSource = struct {
-    data: [*]const FbSample = undefined,
-    pub fn process(self: *@This(), out: []FbSample) void {
-        @memcpy(out, self.data[0..out.len]);
-    }
-};
-
-/// Two-input feedback summer: `out = dry + g·wet`. The first port is the forward
-/// (dry) input; the second is the feedback (wet) z⁻¹ value, read from the
-/// persistent buffer the loop's delay element wrote last block.
-const FbSum = struct {
-    g: f32 = 0.5,
-    pub fn process(self: *@This(), dry: []const FbSample, wet: []const FbSample, out: []FbSample) void {
-        for (dry, wet, out) |d, w, *y| y.ch[0] = d.ch[0] + self.g * w.ch[0];
-    }
-};
-
-const FbSink = struct {
-    dest: [*]FbSample = undefined,
-    pub fn process(self: *@This(), in: []const FbSample) void {
-        @memcpy(self.dest[0..in.len], in);
-    }
-};
-
-test "graph-level feedback: a DelayLine-in-a-cycle decays through the persistent z⁻¹ tail" {
-    const tmod = @import("time.zig");
-    const N = 4;
-    const Delay = tmod.DelayLine(FbSample, N); // one-block delay element in the loop
-
-    // Topology: src → sum.in0 ; sum → {delay, sink} ; delay → sum.in1 (feedback).
-    // The summer's output is the wet tap (to sink) AND the loop signal (to delay);
-    // the delay's output feeds back into the summer's second input. The delay's
-    // value feeds only the feedback, so it is a persistent (pool-excluded) buffer.
-    const g = comptime blk: {
-        var gg = graph.Graph.empty;
-        gg.block_size = N;
-        const src = gg.add(FbSource);
-        const sum = gg.add(FbSum);
-        const delay = gg.add(Delay);
-        const sink = gg.add(FbSink);
-        gg.connect(port.MapOutPort(FbSource), src, 0, port.MapInPortAt(FbSum, 0), sum, 0);
-        gg.connect(port.MapOutPort(FbSum), sum, 0, port.MapInPort(Delay), delay, 0);
-        gg.connect(port.MapOutPort(FbSum), sum, 0, port.MapInPort(FbSink), sink, 0);
-        gg.connectFeedback(port.MapOutPort(Delay), delay, 0, port.MapInPortAt(FbSum, 1), sum, 1);
-        break :blk gg;
-    };
-
-    // The SCC {sum, delay} contains the delay element ⇒ commits (not DelayFreeLoop).
-    const plan = comptime try commit.commitComptime(g);
-    try std.testing.expect(plan.persistent_bytes >= N * @sizeOf(FbSample)); // a z⁻¹ tail exists
-    try std.testing.expect(plan.persistent_bytes > 0);
-
-    const Exec = Executor(g, &.{ FbSource, FbSum, Delay, FbSink });
-    var impulse: [N]FbSample = @splat(.{ .ch = .{0} });
-    impulse[0] = .{ .ch = .{1} }; // unit impulse on block 0
-    var silence: [N]FbSample = @splat(.{ .ch = .{0} });
-    var out: [N]FbSample = undefined;
-
-    var exec: Exec = .{ .instances = .{
-        .{ .data = &impulse },
-        .{ .g = 0.5 },
-        .{},
-        .{ .dest = &out },
-    } };
-    const token = enterRealtimeThread();
-    defer token.leave();
-
-    // Block 0: the impulse appears immediately (the dry path); the loop has not
-    // recirculated yet (the persistent z⁻¹ tail started silent).
-    exec.render(token);
-    try std.testing.expectEqual(@as(f32, 1), out[0].ch[0]);
-    try std.testing.expect(!exec.telemetry().fault);
-
-    // Switch the source to silence and keep rendering: the loop must keep echoing
-    // (the persistent tail carries the recirculating signal across callbacks) and
-    // the energy must DECAY (|g|<1, stable) and stay finite.
-    exec.instances[0].data = &silence;
-    var prev_peak: f32 = 1;
-    var saw_echo = false;
-    for (0..8) |_| {
-        exec.render(token);
-        var peak: f32 = 0;
-        for (out) |s| {
-            try std.testing.expect(std.math.isFinite(s.ch[0]));
-            peak = @max(peak, @abs(s.ch[0]));
-        }
-        if (peak > 0) saw_echo = true;
-        try std.testing.expect(peak <= prev_peak + 1e-6); // non-growing (stable)
-        if (peak > 0) prev_peak = peak;
-    }
-    try std.testing.expect(saw_echo); // the feedback path actually carried signal
-    try std.testing.expect(!exec.telemetry().fault);
 }

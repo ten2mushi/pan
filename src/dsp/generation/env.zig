@@ -9,7 +9,8 @@
 //! parameter's units (the body of a feature→param modulation chain).
 
 const std = @import("std");
-const types = @import("types.zig");
+const core = @import("pan_core");
+const types = core.types;
 
 /// `Adsr` — a control-rate attack/decay/sustain/release envelope: a zero-sample-
 /// input `Map` source emitting `Scalar(f32)` amplitude, with its **gate** delivered
@@ -131,7 +132,7 @@ pub const FeatureMap = struct {
 };
 
 test "Adsr: classifies as a zero-input Scalar source with a gate param" {
-    const port = @import("port.zig");
+    const port = core.port;
     try std.testing.expect(port.classify(Adsr) == .Map);
     try std.testing.expect(comptime port.isSource(Adsr));
     try std.testing.expect(port.MapOutPort(Adsr).Elem == types.Scalar(f32));
@@ -174,7 +175,7 @@ test "Adsr: gate-on climbs attack→decay→sustain; gate-off releases to zero" 
 }
 
 test "FeatureMap: affine rescale with clamp, 1:1 and aliasing-safe" {
-    const port = @import("port.zig");
+    const port = core.port;
     try std.testing.expect(port.classify(FeatureMap) == .Map);
     try std.testing.expect(FeatureMap.aliasing_safe);
 

@@ -1,5 +1,5 @@
 const std = @import("std");
-const numeric = @import("src/numeric.zig");
+const numeric = @import("src/core/numeric.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -10,19 +10,54 @@ pub fn build(b: *std.Build) void {
     // is never silent.
     std.debug.print("pan build: {d} active precision monomorphs per kernel\n", .{numeric.monomorph_count});
 
-    // ---- The public pan library (root: src/root.zig) -------------------
+    // ---- The four-module graph -----------------------------------------
+    // `pan` is an umbrella over three constituent modules:
+    //   pan_core — the DSP-agnostic graph engine,
+    //   pan_dsp  — the node libraries (depends on pan_core),
+    //   pan_io   — the I/O boundary (depends on pan_core and pan_dsp).
+    // The SAME `core_mod` object is wired into every consumer so that, e.g.,
+    // `pan.Sample` and the dsp-side `Sample` are the identical type (a module
+    // referenced through two distinct objects would mint two distinct types).
+    const core_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/core.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const dsp_mod = b.createModule(.{
+        .root_source_file = b.path("src/dsp/dsp.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "pan_core", .module = core_mod }},
+    });
+    const io_mod = b.createModule(.{
+        .root_source_file = b.path("src/io/io.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "pan_core", .module = core_mod },
+            .{ .name = "pan_dsp", .module = dsp_mod },
+        },
+    });
     const pan_mod = b.addModule("pan", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "pan_core", .module = core_mod },
+            .{ .name = "pan_dsp", .module = dsp_mod },
+            .{ .name = "pan_io", .module = io_mod },
+        },
     });
 
     // The I/O HAL's device backend is platform C interop: on macOS the CoreAudio
-    // sink calls AudioToolbox; on Linux the ALSA sink calls libasound. Link the
-    // platform's audio transport so any executable built from this module
-    // resolves those `extern` symbols. (On Linux this links libasound, present on
-    // a real Linux host; the x86_64-linux-gnu *cross-compile* gate builds the
-    // static lib only — which does not link — so it needs no sysroot libasound.)
+    // sink calls AudioToolbox; on Linux the ALSA sink calls libasound. The `extern`
+    // device-backend symbols live in `pan_io`, so link the platform's audio
+    // transport onto `io_mod`; also link the umbrella and any other artifact-root
+    // module so any executable built from them resolves those symbols. (On Linux
+    // this links libasound, present on a real Linux host; the x86_64-linux-gnu
+    // *cross-compile* gate builds the static lib only — which does not link — so it
+    // needs no sysroot libasound.)
+    linkPlatformAudio(target, io_mod);
     linkPlatformAudio(target, pan_mod);
 
     const lib = b.addLibrary(.{
@@ -58,6 +93,19 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests + the comptime-commit smoke gate");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    // Each constituent module needs its OWN test run: `addTest` only runs the
+    // in-file `test {}` blocks of files reachable by RELATIVE-path import within
+    // that module's root. Files reached through a NAMED module import
+    // (`@import("pan_core")`) are a separate compilation unit whose tests would
+    // otherwise be silently dropped. So run the three module roots directly; each
+    // root relative-imports all of its members, collecting their unit tests.
+    const core_tests = b.addTest(.{ .root_module = core_mod });
+    const dsp_tests = b.addTest(.{ .root_module = dsp_mod });
+    const io_tests = b.addTest(.{ .root_module = io_mod }); // io_mod already links platform audio
+    test_step.dependOn(&b.addRunArtifact(core_tests).step);
+    test_step.dependOn(&b.addRunArtifact(dsp_tests).step);
+    test_step.dependOn(&b.addRunArtifact(io_tests).step);
 
     // Standalone test harnesses under tests/ (each imports the src files it
     // exercises by relative path). Added as they land; each runs in the suite.
@@ -149,6 +197,7 @@ pub fn build(b: *std.Build) void {
         "tests/parallel_pure_yoneda_test.zig",
         "tests/parallel_concurrent_yoneda_test.zig",
         "tests/parallel_ratparam_yoneda_test.zig",
+        "tests/engine_integration_test.zig",
     };
     // The Tier-B suites (`parallel_*`) each spawn up to `ncores` workers that bounded-spin
     // on cross-worker ready-flags. Running several at once oversubscribes the cores, and
@@ -181,9 +230,14 @@ pub fn build(b: *std.Build) void {
     // asserting a non-zero `zig build-obj` exit. If the fixture ever compiles, the
     // gate regressed and this step fails (expected exit 1, got 0).
     const neg = b.addSystemCommand(&.{
-        b.graph.zig_exe,      "build-obj", "-fno-emit-bin",
-        "--dep",              "pan",       "-Mroot=tests/negative/missing_latency.zig",
-        "-Mpan=src/root.zig",
+        b.graph.zig_exe,                "build-obj", "-fno-emit-bin",
+        "--dep",                        "pan",       "-Mroot=tests/negative/missing_latency.zig",
+        "--dep",                        "pan_core",  "--dep",
+        "pan_dsp",                      "--dep",     "pan_io",
+        "-Mpan=src/root.zig",           "--dep",     "pan_core",
+        "--dep",                        "pan_dsp",   "-Mpan_io=src/io/io.zig",
+        "--dep",                        "pan_core",  "-Mpan_dsp=src/dsp/dsp.zig",
+        "-Mpan_core=src/core/core.zig",
     });
     neg.expectExitCode(1);
     neg.has_side_effects = true; // always re-run (it produces no cacheable output)
@@ -197,9 +251,14 @@ pub fn build(b: *std.Build) void {
     // to compile — turning the "wrong element type = compile error" guarantee from
     // ⊢-by-inspection into an active must-fail build check.
     const neg_concat = b.addSystemCommand(&.{
-        b.graph.zig_exe,      "build-obj", "-fno-emit-bin",
-        "--dep",              "pan",       "-Mroot=tests/negative/concat_type_mismatch.zig",
-        "-Mpan=src/root.zig",
+        b.graph.zig_exe,                "build-obj", "-fno-emit-bin",
+        "--dep",                        "pan",       "-Mroot=tests/negative/concat_type_mismatch.zig",
+        "--dep",                        "pan_core",  "--dep",
+        "pan_dsp",                      "--dep",     "pan_io",
+        "-Mpan=src/root.zig",           "--dep",     "pan_core",
+        "--dep",                        "pan_dsp",   "-Mpan_io=src/io/io.zig",
+        "--dep",                        "pan_core",  "-Mpan_dsp=src/dsp/dsp.zig",
+        "-Mpan_core=src/core/core.zig",
     });
     neg_concat.expectExitCode(1);
     neg_concat.has_side_effects = true;
@@ -212,9 +271,14 @@ pub fn build(b: *std.Build) void {
     // fixture references `OfflineBatch.renderChunked` on such a graph and MUST fail
     // to compile — the active form of the no-warmup-stateful-chunk commit error.
     const neg_offline = b.addSystemCommand(&.{
-        b.graph.zig_exe,      "build-obj", "-fno-emit-bin",
-        "--dep",              "pan",       "-Mroot=tests/negative/offline_no_warmup.zig",
-        "-Mpan=src/root.zig",
+        b.graph.zig_exe,                "build-obj", "-fno-emit-bin",
+        "--dep",                        "pan",       "-Mroot=tests/negative/offline_no_warmup.zig",
+        "--dep",                        "pan_core",  "--dep",
+        "pan_dsp",                      "--dep",     "pan_io",
+        "-Mpan=src/root.zig",           "--dep",     "pan_core",
+        "--dep",                        "pan_dsp",   "-Mpan_io=src/io/io.zig",
+        "--dep",                        "pan_core",  "-Mpan_dsp=src/dsp/dsp.zig",
+        "-Mpan_core=src/core/core.zig",
     });
     neg_offline.expectExitCode(1);
     neg_offline.has_side_effects = true;
@@ -227,10 +291,46 @@ pub fn build(b: *std.Build) void {
     // concrete MCU target is chosen in a later phase; freestanding native arch
     // exercises the comptime path without a sysroot.
     const free_target = b.resolveTargetQuery(.{ .os_tag = .freestanding });
+    // The smoke object imports the `pan` umbrella, so it needs the same module
+    // graph rebuilt for the freestanding target / ReleaseSmall. (linkPlatformAudio
+    // is a no-op off macOS/Linux; this is an object build with no link step, so
+    // io's device-backend externs need no resolution here.)
+    const free_core_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/core.zig"),
+        .target = free_target,
+        .optimize = .ReleaseSmall,
+    });
+    const free_dsp_mod = b.createModule(.{
+        .root_source_file = b.path("src/dsp/dsp.zig"),
+        .target = free_target,
+        .optimize = .ReleaseSmall,
+        .imports = &.{.{ .name = "pan_core", .module = free_core_mod }},
+    });
+    const free_io_mod = b.createModule(.{
+        .root_source_file = b.path("src/io/io.zig"),
+        .target = free_target,
+        .optimize = .ReleaseSmall,
+        .imports = &.{
+            .{ .name = "pan_core", .module = free_core_mod },
+            .{ .name = "pan_dsp", .module = free_dsp_mod },
+        },
+    });
     const smoke_mod = b.createModule(.{
         .root_source_file = b.path("src/smoke_freestanding.zig"),
         .target = free_target,
         .optimize = .ReleaseSmall,
+        .imports = &.{
+            .{ .name = "pan", .module = b.createModule(.{
+                .root_source_file = b.path("src/root.zig"),
+                .target = free_target,
+                .optimize = .ReleaseSmall,
+                .imports = &.{
+                    .{ .name = "pan_core", .module = free_core_mod },
+                    .{ .name = "pan_dsp", .module = free_dsp_mod },
+                    .{ .name = "pan_io", .module = free_io_mod },
+                },
+            }) },
+        },
     });
     const smoke_obj = b.addObject(.{ .name = "pan_smoke", .root_module = smoke_mod });
     const smoke_step = b.step("smoke", "Build the freestanding ReleaseSmall comptime-commit smoke object");
@@ -259,10 +359,43 @@ pub fn build(b: *std.Build) void {
     // not link, so this needs no sysroot libasound; the compile is the stand-in
     // for on-device Linux testing.
     const linux_target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
+    // The umbrella needs its module graph rebuilt for the linux target. io's ALSA
+    // seam is configured on the linux io module (a static lib does not link, so no
+    // sysroot libasound is required — the compile alone is the seam gate).
+    const linux_core_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/core.zig"),
+        .target = linux_target,
+        .optimize = optimize,
+    });
+    const linux_dsp_mod = b.createModule(.{
+        .root_source_file = b.path("src/dsp/dsp.zig"),
+        .target = linux_target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "pan_core", .module = linux_core_mod }},
+    });
+    const linux_io_mod = b.createModule(.{
+        .root_source_file = b.path("src/io/io.zig"),
+        .target = linux_target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "pan_core", .module = linux_core_mod },
+            .{ .name = "pan_dsp", .module = linux_dsp_mod },
+        },
+    });
+    // Deliberately NOT linkPlatformAudio here: a static lib does not link, so the
+    // ALSA seam needs only to COMPILE behind the I/O-HAL abstraction. Adding
+    // `-lasound` would force a dynamic-library resolution search that has no
+    // sysroot libasound on this host. io's device-backend symbols are plain
+    // `extern`s — the compile alone discharges the cross-platform-seam gate.
     const linux_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = linux_target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "pan_core", .module = linux_core_mod },
+            .{ .name = "pan_dsp", .module = linux_dsp_mod },
+            .{ .name = "pan_io", .module = linux_io_mod },
+        },
     });
     const linux_lib = b.addLibrary(.{ .name = "pan-linux", .root_module = linux_mod, .linkage = .static });
     const cross_step = b.step("cross-linux", "Cross-compile the pan lib for x86_64-linux-gnu (ALSA seam gate)");

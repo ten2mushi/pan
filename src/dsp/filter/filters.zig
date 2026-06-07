@@ -18,10 +18,11 @@
 //!     (and does not vectorize across time).
 
 const std = @import("std");
-const types = @import("types.zig");
-const numeric = @import("numeric.zig");
-const simd = @import("simd.zig");
-const control = @import("control.zig");
+const core = @import("pan_core");
+const types = core.types;
+const numeric = core.numeric;
+const simd = core.simd;
+const control = core.control;
 
 /// Is this lane a floating-point type? Selects the float vs fixed-point kernel.
 fn isFloat(comptime T: type) bool {
@@ -621,7 +622,7 @@ const testing = std.testing;
 const f32num = numeric.numericFor(.f32, .{});
 
 test "OnePole(f32) classifies as a Map with a cutoff param; a=1 passes the signal" {
-    const port = @import("port.zig");
+    const port = core.port;
     const OP = OnePole(f32num);
     try testing.expect(port.classify(OP) == .Map);
     try testing.expect(port.ParamPort(OP, "cutoff").Elem == types.Scalar(f32));
@@ -706,7 +707,7 @@ test "Biquad state carries across calls — a split render equals a whole render
 }
 
 test "Gain classifies as a Map and is aliasing_safe; Biquad is a Map that is not" {
-    const port = @import("port.zig");
+    const port = core.port;
     try testing.expect(port.classify(Gain(f32num)) == .Map);
     try testing.expect(port.classify(Biquad(f32num)) == .Map);
     try testing.expect(port.classify(Biquad(q15num)) == .Map);
@@ -750,7 +751,7 @@ test "Biquad(q15) feedback coefficient |a1|>1 is representable and the section i
 const q31num = numeric.numericFor(.i32, .{});
 
 test "StateVariable(f32) classifies as a Map with fc/q params and is not aliasing_safe" {
-    const port = @import("port.zig");
+    const port = core.port;
     const SV = StateVariable(f32num);
     try testing.expect(port.classify(SV) == .Map);
     try testing.expect(port.ParamPort(SV, "fc").Elem == types.Scalar(f32));
@@ -827,7 +828,7 @@ test "StateVariable integrator state carries across calls — a split render equ
 }
 
 test "Fir(f32) classifies as a Map and is not aliasing_safe" {
-    const port = @import("port.zig");
+    const port = core.port;
     const F = Fir(f32num, 5);
     try testing.expect(port.classify(F) == .Map);
     // Each output reads `taps` past inputs, so the colorer must not alias in place.

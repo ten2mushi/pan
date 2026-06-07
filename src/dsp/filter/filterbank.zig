@@ -42,8 +42,9 @@
 //! the fixed-point `Biquad` uses and is not ported, so the integer lane fails loud.
 
 const std = @import("std");
-const types = @import("types.zig");
-const numeric = @import("numeric.zig");
+const core = @import("pan_core");
+const types = core.types;
+const numeric = core.numeric;
 const filters = @import("filters.zig");
 
 fn isFloat(comptime T: type) bool {
@@ -463,7 +464,7 @@ fn firwinLowpassT(comptime T: type, comptime taps: usize, comptime fc: T) [taps]
 
 const testing = std.testing;
 const f32num = numeric.numericFor(.f32, .{});
-const port = @import("port.zig");
+const port = core.port;
 
 fn sampleSlice(comptime n: usize, vals: [n]f32) [n]types.Sample(f32) {
     var s: [n]types.Sample(f32) = undefined;

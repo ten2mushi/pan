@@ -36,8 +36,10 @@
 //! — a note-on allocates a *slot*, never a node.
 
 const std = @import("std");
-const types = @import("types.zig");
-const port = @import("port.zig");
+const core = @import("pan_core");
+const types = core.types;
+const port = core.port;
+const event_types = core.events;
 
 const Sample = types.Sample;
 
@@ -45,38 +47,13 @@ const Sample = types.Sample;
 // The typed event lane + the blessed NoteEvent
 // ===========================================================================
 
-/// An MPE per-note expression axis (the continuous controllers a single held note
-/// carries under MIDI Polyphonic Expression).
-pub const ExprAxis = enum { timbre, bend, slide };
-
-/// The blessed **`NoteEvent`** library union for instruments. **Pitch is in Hz**
-/// (tuning-agnostic and microtonal-friendly — a note#→Hz tuning block is library,
-/// not core, so the lane never assumes 12-TET). `note_id` is the routing key: an
-/// `expression`/`pressure`/`note_off` carries the `note_id` of the note it targets,
-/// letting `PolyVoice` route it to the exact voice slot sounding that note (MPE).
-pub const NoteEvent = union(enum) {
-    note_on: struct { note_id: u32, pitch_hz: f32, velocity: f32 },
-    note_off: struct { note_id: u32, velocity: f32 },
-    /// Polyphonic aftertouch / MPE channel pressure for one note.
-    pressure: struct { note_id: u32, value: f32 },
-    /// MPE per-note bend / timbre / slide.
-    expression: struct { note_id: u32, axis: ExprAxis, value: f32 },
-    /// A channel controller (CC number → value).
-    control: struct { cc: u16, value: f32 },
-    /// Channel pitch bend (normalised, −1..+1 of the bend range).
-    pitch_bend: f32,
-    /// Program / patch change.
-    program: u16,
-};
-
-/// One time-stamped event: an `Event` tagged with the `sample_offset` within the
-/// current render block at which it applies (`0 ≤ sample_offset < N`).
-pub fn Timed(comptime Event: type) type {
-    return struct {
-        sample_offset: u32,
-        event: Event,
-    };
-}
+/// Re-exports of the core event data types (defined in `events.zig`) so that
+/// `synth.ExprAxis` / `synth.NoteEvent` / `synth.Timed` / `synth.max_events_per_block`
+/// keep resolving for callers and for this file's own DSP-facing code.
+pub const ExprAxis = event_types.ExprAxis;
+pub const NoteEvent = event_types.NoteEvent;
+pub const Timed = event_types.Timed;
+pub const max_events_per_block = event_types.max_events_per_block;
 
 /// `EventLane(Event)` — the event-type-generic lane a block consumes. It is a thin
 /// read-only view over a **time-sorted** slice of `Timed(Event)` for the current
@@ -140,7 +117,7 @@ pub fn requireVoice(comptime Voice: type) void {
     }
 }
 
-const gen = @import("gen.zig");
+const gen = @import("../generation/gen.zig");
 
 /// `SawVoice` — a worked single voice realising the canonical subtractive-synth
 /// chain `osc → env → filter → VCA`, flattened into one struct: a band-limited
@@ -256,10 +233,6 @@ pub const StealPolicy = enum {
     /// Reuse the voice with the lowest current amplitude (needs `Voice.levelProbe`).
     quietest,
 };
-
-/// The maximum number of timed events one render block can deliver to a consuming
-/// block. Bounds the engine's per-node event scratch and the stack lane builder.
-pub const max_events_per_block = 128;
 
 /// `PolyVoice(Voice, Vmax)` — fixed-capacity intra-block polyphony as a single
 /// static op. It owns `Vmax` persistent `Voice` slots, a note→slot allocator, and a

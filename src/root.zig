@@ -9,23 +9,31 @@
 
 const std = @import("std");
 
+// The three constituent modules. `pan` is purely an umbrella: it re-exports the
+// public identifiers from `pan_core` (the DSP-agnostic graph engine), `pan_dsp`
+// (the node libraries), and `pan_io` (the boundary). The SAME `pan_core` module
+// object backs all three (and this umbrella) so that, e.g., `pan.Sample` and a
+// dsp-side `Sample` are the identical type.
+const core = @import("pan_core");
+const dsp = @import("pan_dsp");
+
 // --- configuration --------------------------------------------------------
 
 /// The Numeric trait & comptime precision switch. `precision` is comptime-known:
 /// `numericFor(p, opts)` is a comptime switch and a precision change requires a
 /// recommit.
-pub const numeric = @import("numeric.zig");
+pub const numeric = core.numeric;
 pub const Numeric = numeric.Numeric;
 pub const Precision = numeric.Precision;
 pub const NumericOptions = numeric.NumericOptions;
 pub const numericFor = numeric.numericFor;
 
-pub const config = @import("config.zig");
+pub const config = core.config;
 pub const Config = config.Config;
 
 // --- canonical port elements ----------------------------------------------
 
-pub const types = @import("types.zig");
+pub const types = core.types;
 pub const ChannelLayout = types.ChannelLayout;
 pub const Frame = types.Frame;
 pub const Sample = types.Sample;
@@ -39,7 +47,7 @@ pub const Bounded = types.Bounded;
 
 // --- comptime port machinery ----------------------------------------------
 
-pub const port = @import("port.zig");
+pub const port = core.port;
 pub const PortId = port.PortId;
 pub const ParamPortId = port.ParamPortId;
 pub const ParamPort = port.ParamPort;
@@ -52,7 +60,7 @@ pub const isSource = port.isSource;
 
 // --- the SampleMux seam (the only block ↔ transport coupling) --------------
 
-pub const mux = @import("mux.zig");
+pub const mux = core.mux;
 pub const SampleMux = mux.SampleMux;
 pub const TestSampleMux = mux.TestSampleMux;
 pub const PullTestSampleMux = mux.PullTestSampleMux;
@@ -71,7 +79,7 @@ pub const Ring = mux.Ring;
 /// the `warmup_samples` lead-in + ordered merge → O3), or pipelined stage-per-
 /// thread over `Ring`s. `offline.Source`/`offline.Sink` inject and capture the
 /// timeline.
-pub const offline = @import("offline.zig");
+pub const offline = core.offline;
 pub const OfflineBatch = offline.OfflineBatch;
 /// `OfflineBatch` with automatic comptime loop-fusion applied: a drop-in that runs
 /// the same Tier-C machinery on the fused graph, recovering the single-pass /
@@ -83,7 +91,7 @@ pub const OfflineBatchFused = offline.OfflineBatchFused;
 /// Tier-C `OfflineBatch`) over an offline-style endpoint graph, plus `renderJobs`
 /// for file-level offline parallelism. It delegates to the existing executors —
 /// it unifies only the entry seam, not the tier internals.
-pub const facade = @import("facade.zig");
+pub const facade = core.facade;
 pub const render = facade.render;
 pub const renderJobs = facade.renderJobs;
 pub const RenderOptions = facade.RenderOptions;
@@ -91,9 +99,9 @@ pub const RenderOptions = facade.RenderOptions;
 // --- graph, commit, engine ------------------------------------------------
 
 /// The low-level comptime graph IR (the substrate the commit pass consumes).
-pub const graph = @import("graph.zig");
+pub const graph = core.graph;
 
-pub const commit = @import("commit.zig");
+pub const commit = core.commit;
 pub const RenderOp = commit.RenderOp;
 pub const Plan = commit.Plan;
 pub const CommitError = commit.CommitError;
@@ -114,7 +122,7 @@ pub const insertPdc = commit.insertPdc;
 
 /// The developer-facing graph builder — `pan.Graph.init / add / connect /
 /// commit`. Wraps the IR and the commit pass.
-pub const builder = @import("builder.zig");
+pub const builder = core.builder;
 pub const Graph = builder.Graph;
 pub const NodeHandle = builder.NodeHandle;
 pub const Endpoint = builder.Endpoint;
@@ -122,7 +130,7 @@ pub const Endpoint = builder.Endpoint;
 /// The lock-free control plane: the SPSC `CommandRing` (`schedule`), the atomic
 /// `Param` + `Ramp` (`set`), and the `Rcu` plan-swap cell (`edit → commit`) — each
 /// at its exact memory ordering, wait-free on the audio thread.
-pub const control = @import("control.zig");
+pub const control = core.control;
 pub const CommandRing = control.CommandRing;
 pub const Command = control.Command;
 pub const Param = control.Param;
@@ -134,7 +142,7 @@ pub const Rcu = control.Rcu;
 /// `io.TapSource` (consume, on the tapping root).
 pub const SpscRing = control.SpscRing;
 
-pub const engine = @import("engine.zig");
+pub const engine = core.engine;
 pub const Engine = engine.Engine;
 pub const RuntimePlan = engine.RuntimePlan;
 pub const BoundNode = engine.BoundNode;
@@ -152,7 +160,7 @@ pub const renderInto = engine.renderInto;
 /// chains into one block-size-1 `combinators.Subgraph` pass, plus the
 /// `engine.FusedExecutor` that applies it transparently. Never an author API: an
 /// author writes plain separate blocks; `FusedExecutor` just opts in to the win.
-pub const fusion = @import("fusion.zig");
+pub const fusion = core.fusion;
 pub const FusedExecutor = engine.FusedExecutor;
 pub const FusedExecutorMode = engine.FusedExecutorModeOnly;
 pub const ParanoidFusedExecutor = engine.ParanoidFusedExecutor;
@@ -170,7 +178,7 @@ pub const ParanoidExecutor = engine.ParanoidExecutor;
 /// workgroup HAL, cost-model gate, op-DAG, level-barrier + HEFT schedules,
 /// point-to-point ready flags, auto-demote). An opt-in, measured layer over the
 /// frozen Tier-A ground truth: bit-identical output, auto-demoting under load.
-pub const parallel = @import("parallel.zig");
+pub const parallel = core.parallel;
 pub const Workgroup = parallel.Workgroup;
 pub const GateConfig = parallel.GateConfig;
 pub const GateDecision = parallel.GateDecision;
@@ -179,7 +187,7 @@ pub const TierBExecutor = parallel.Executor;
 
 // --- the Compute HAL (portable @Vector kernels) ---------------------------
 
-pub const simd = @import("simd.zig");
+pub const simd = core.simd;
 
 // --- namespaced layered-library roots -------------------------------------
 
@@ -189,11 +197,11 @@ pub const simd = @import("simd.zig");
 /// seam, and the embedded I2S-DMA ping-pong transport (`pan.io.I2sDma` +
 /// `pan.io.I2sDmaSource`/`I2sDmaSink`) whose half-/transfer-complete IRQ is the
 /// render callback on an MCU.
-pub const io = @import("io.zig");
+pub const io = @import("pan_io");
 /// First DSP filters — `Gain` (aliasing-safe), `Biquad` (per-sample Mealy), and
 /// `OnePole` (a low-pass whose cutoff is a parameter port — the canonical filter an
 /// LFO/envelope sweeps).
-pub const filters = @import("filters.zig");
+pub const filters = dsp.filters;
 pub const OnePole = filters.OnePole;
 /// `StateVariable` (TPT/zero-delay-feedback SVF — lowpass/bandpass/highpass from one
 /// pass; cutoff/Q are parameter ports) and `Fir` (windowed-sinc / arbitrary-tap FIR,
@@ -211,7 +219,7 @@ pub const firwinBandstop = filters.firwinBandstop;
 /// `Balance`/`Width` (stereo field, layout-preserving); `Upmix`/`Downmix`/`MixMatrix`
 /// (the registered canonical up/down-mix matrices — geometry is block data, not the
 /// stream type; an unregistered layout pair has no canonical matrix and is rejected).
-pub const spatial = @import("spatial.zig");
+pub const spatial = dsp.spatial;
 pub const ConstantPowerPan = spatial.ConstantPowerPan;
 pub const Balance = spatial.Balance;
 pub const Width = spatial.Width;
@@ -228,7 +236,7 @@ pub const AmbisonicDecode = spatial.AmbisonicDecode;
 /// Mix / routing `Map` blocks — `SummingMixer` (additive N→1, wide-accumulator on the
 /// integer path), `Splitter` (1→N fan-out), `MatrixRouter` (N→M weighted routing
 /// matrix), `DryWet` (a `mix`-parameter crossfade of a dry and a wet input).
-pub const dsp_mix = @import("dsp_mix.zig");
+pub const dsp_mix = dsp.dsp_mix;
 pub const SummingMixer = dsp_mix.SummingMixer;
 pub const Splitter = dsp_mix.Splitter;
 pub const MatrixRouter = dsp_mix.MatrixRouter;
@@ -241,7 +249,7 @@ pub const realtime = struct {
 
 /// Time-domain delay primitives — element-generic `UnitDelay` / `DelayLine`. The
 /// persistent (pool-excluded) delay state a feedback cycle is built on.
-pub const time = @import("time.zig");
+pub const time = dsp.time;
 pub const UnitDelay = time.UnitDelay;
 pub const DelayLine = time.DelayLine;
 /// Multi-channel (planar) delays — the `Frame(C>1)` / `Frame(.discrete(N))` form a
@@ -252,7 +260,7 @@ pub const PlanarDelayLine = time.PlanarDelayLine;
 /// single-`Map` blocks running a sample-accurate per-sample feedback loop over
 /// internal state. `FdnMatrix` is the mixing core of a graph-level FDN reverb (the
 /// matrix-mix `Map` over a `Frame(.discrete(N))` bus closed by feedback edges).
-pub const fx = @import("fx.zig");
+pub const fx = dsp.fx;
 pub const Comb = fx.Comb;
 pub const Allpass = fx.Allpass;
 pub const KarplusStrong = fx.KarplusStrong;
@@ -293,7 +301,7 @@ pub const Trim = fx.Trim;
 /// latency: the `Framer`/`Stft`/`iStft` analysis-synthesis pair (radix-2 FFT, Hann
 /// COLA reconstruction), the type-changing `PowerSpectrum` `Map`, and a windowed-
 /// sinc rational `Resampler`. The blocks the per-rate-domain PDC pass compensates.
-pub const spectral = @import("spectral.zig");
+pub const spectral = dsp.spectral;
 pub const Spectrum = spectral.Spectrum;
 pub const TimeFrame = spectral.TimeFrame;
 pub const Framer = spectral.Framer;
@@ -322,7 +330,7 @@ pub const SpectralEq = spectral.SpectralEq;
 /// Multi-rate filterbanks — a CASCADE/bank of uniform-rate `Rate` stages (NOT one
 /// block): `WaveletAnalysis`/`WaveletSynthesis` (Haar 2-band, perfect-reconstruction),
 /// `DwtOctaveTree` (octave-band cascade) and `Cqt` (constant-Q bandpass bank).
-pub const filterbank = @import("filterbank.zig");
+pub const filterbank = dsp.filterbank;
 pub const WaveletAnalysis = filterbank.WaveletAnalysis;
 pub const WaveletSynthesis = filterbank.WaveletSynthesis;
 pub const DwtOctaveTree = filterbank.DwtOctaveTree;
@@ -331,12 +339,12 @@ pub const Cqt = filterbank.Cqt;
 /// Control-side generators — the modulation *producers* that drive parameter ports.
 /// `Lfo` is a control-rate low-frequency oscillator: a zero-sample-input `Map`
 /// source emitting `Scalar(f32)` (`connect(lfo, x.param.cutoff)`).
-pub const gen = @import("gen.zig");
+pub const gen = dsp.gen;
 pub const Lfo = gen.Lfo;
 /// Envelope generators & feature→parameter maps. `Adsr` is a gate→amplitude control
 /// source (gate via a parameter port); `FeatureMap` is the affine `Scalar → Scalar`
 /// rescale at the body of a feature→param modulation chain.
-pub const env = @import("env.zig");
+pub const env = dsp.env;
 pub const Adsr = env.Adsr;
 pub const FeatureMap = env.FeatureMap;
 // Layered-library roots filled by later phases.
@@ -346,7 +354,7 @@ pub const mix = struct {};
 /// (`EventLane(Event)`) and the blessed `NoteEvent` union; a worked `SawVoice`
 /// (PolyBLEP osc → ADSR → VCA); and fixed-capacity intra-block polyphony as one
 /// static op: `PolyVoice(Voice, Vmax)` (fused, internal-skip) / `VoiceMap` (replicated).
-pub const synth = @import("synth.zig");
+pub const synth = dsp.synth;
 /// The blessed instrument event union (pitch in Hz; note_on/off, pressure, MPE
 /// expression, control, bend, program). The event lane is event-generic; this is
 /// the library type instruments consume.
@@ -374,7 +382,7 @@ pub const MidiEventSource = io.MidiEventSource;
 /// `SpectralCentroid`/`SpectralFlux`/`Rms` (→ `Scalar(f32)`), and `DominantBand`
 /// (→ `Scalar(u16)`, a dominant-band (color/frequency-index) descriptor). Tested against an external
 /// NumPy/librosa-equivalent oracle, not proven.
-pub const feat = @import("feat.zig");
+pub const feat = dsp.feat;
 
 /// Graph combinators. `Concat` is the named fan-in: a comptime
 /// struct-of-(name → element-type) spec mints one typed input port per name
@@ -382,7 +390,7 @@ pub const feat = @import("feat.zig");
 /// canonical column order. `ChannelMap` replicates a mono block across C channels.
 /// (Accessed as `pan.combinators.Concat` / `pan.feat.Mfcc` — not aliased at the
 /// root to avoid shadowing the short block names a DSP author uses locally.)
-pub const combinators = @import("combinators.zig");
+pub const combinators = core.combinators;
 
 /// The analysis pull root + feature collection surface. `FeatureCollectorSink` is
 /// the growable, non-RT-only time-series sink (law A8 — rejected on a realtime

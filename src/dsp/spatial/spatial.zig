@@ -21,9 +21,11 @@
 //! √½ ≈ 0.7071`.
 
 const std = @import("std");
-const types = @import("types.zig");
-const numeric = @import("numeric.zig");
-const simd = @import("simd.zig");
+const core = @import("pan_core");
+const types = core.types;
+const numeric = core.numeric;
+const simd = core.simd;
+const layout = core.layout;
 
 fn isFloat(comptime T: type) bool {
     return @typeInfo(T) == .float;
@@ -115,89 +117,10 @@ fn inPlane(comptime Lane: type, comptime L: types.ChannelLayout, v: types.Planar
 // Canonical up/down-mix matrix registry — geometry as block data, not in the type
 // ===========================================================================
 
-/// The canonical up/down-mix coefficient matrix for a REGISTERED positional
-/// layout pair, expressed in pan's canonical (SMPTE) channel order — stereo is
-/// `[L, R]`; 5.1 is `[FL, FR, FC, LFE, Ls, Rs]`; 7.1 is
-/// `[FL, FR, FC, LFE, Lb, Rb, Ls, Rs]`. The result `m[o][i]` is the gain from
-/// input channel `i` to output channel `o`, so an output plane is
-/// `out[o] = Σ_i m[o][i]·in[i]`. Returns `null` for any unregistered pair
-/// (ambisonic, discrete bus, custom set) — those need an explicit spatial block,
-/// never a silent coercion. The downmix rows fold the centre and surrounds in at
-/// the standard −3 dB (`1/√2`) so a centred or surround signal keeps roughly
-/// constant power across the fold; the stereo→surround upmix places L/R on the
-/// front pair and leaves the new channels silent (the conservative, phase-safe
-/// widening, distinct from a decorrelating "fake surround").
-pub fn canonicalMixMatrix(comptime from: types.ChannelLayout, comptime to: types.ChannelLayout) ?[to.count()][from.count()]f32 {
-    const ci = comptime from.count();
-    const co = comptime to.count();
-    // Only the positional layouts (mono/stereo/5.1/7.1, counts 1/2/6/8) are
-    // registered; an order/count outside that set is an unregistered pair.
-    if (comptime !isPositional(from) or !isPositional(to)) return null;
-    {
-        var m: [co][ci]f32 = [_][ci]f32{[_]f32{0} ** ci} ** co;
-        switch (comptime ci * 100 + co) {
-            // mono → stereo: copy the mono source to both fronts (equal-gain dual mono).
-            1 * 100 + 2 => {
-                m[0][0] = 1.0;
-                m[1][0] = 1.0;
-            },
-            // stereo → mono: average (−6 dB sum, never clips a coherent pair).
-            2 * 100 + 1 => {
-                m[0][0] = 0.5;
-                m[0][1] = 0.5;
-            },
-            // stereo → 5.1: front pair carries L/R; centre/LFE/surrounds silent.
-            2 * 100 + 6 => {
-                m[0][0] = 1.0; // FL ← L
-                m[1][1] = 1.0; // FR ← R
-            },
-            // stereo → 7.1: same — front pair only.
-            2 * 100 + 8 => {
-                m[0][0] = 1.0;
-                m[1][1] = 1.0;
-            },
-            // 5.1 → stereo (ITU-R BS.775): Lo = FL + .707·FC + .707·Ls; LFE dropped.
-            6 * 100 + 2 => {
-                m[0][0] = 1.0;
-                m[0][2] = inv_sqrt2;
-                m[0][4] = inv_sqrt2; // Ls
-                m[1][1] = 1.0;
-                m[1][2] = inv_sqrt2;
-                m[1][5] = inv_sqrt2; // Rs
-            },
-            // 5.1 → 7.1: FL,FR,FC,LFE pass straight; 5.1 side pair lands on the 7.1
-            // side pair (indices 6,7); the back pair is left silent.
-            6 * 100 + 8 => {
-                m[0][0] = 1.0; // FL
-                m[1][1] = 1.0; // FR
-                m[2][2] = 1.0; // FC
-                m[3][3] = 1.0; // LFE
-                m[6][4] = 1.0; // Ls → Ls
-                m[7][5] = 1.0; // Rs → Rs
-            },
-            // 7.1 → 5.1: FL,FR,FC,LFE pass; fold each back channel into its side.
-            8 * 100 + 6 => {
-                m[0][0] = 1.0; // FL
-                m[1][1] = 1.0; // FR
-                m[2][2] = 1.0; // FC
-                m[3][3] = 1.0; // LFE
-                m[4][6] = 1.0; // Ls ← Ls
-                m[4][4] = inv_sqrt2; // Ls ← Lb (−3 dB)
-                m[5][7] = 1.0; // Rs ← Rs
-                m[5][5] = inv_sqrt2; // Rs ← Rb
-            },
-            else => return null,
-        }
-        return m;
-    }
-}
-
-fn isPositional(comptime L: types.ChannelLayout) bool {
-    return switch (L) {
-        .mono, .stereo, .surround_5_1, .surround_7_1 => true,
-        else => false,
-    };
-}
+/// The canonical up/down-mix coefficient matrix registry lives in `layout.zig`
+/// (the channel-layout coercion algebra). Re-exported here so existing callers
+/// of `spatial.canonicalMixMatrix` continue to resolve.
+pub const canonicalMixMatrix = layout.canonicalMixMatrix;
 
 /// `MixMatrix(num, L_in, L_out)` — a layout-changing `Map` that mixes the `C_in`
 /// input planes into the `C_out` output planes through a coefficient matrix
@@ -213,7 +136,7 @@ pub fn MixMatrix(comptime num: numeric.Numeric, comptime L_in: types.ChannelLayo
     const Ci = L_in.count();
     const Co = L_out.count();
     const default_matrix: [Co][Ci]T = blk: {
-        const canon = canonicalMixMatrix(L_in, L_out) orelse
+        const canon = layout.canonicalMixMatrix(L_in, L_out) orelse
             @compileError("pan: no registered up/down-mix matrix for this layout pair" ++
                 " — supply an explicit `matrix` field, or use a dedicated spatial block" ++
                 " (VBAP/ambisonic). Negotiation rejects the same pair as a hard mismatch.");
@@ -615,7 +538,7 @@ const testing = std.testing;
 const f32num = numeric.numericFor(.f32, .{});
 
 test "ConstantPowerPan centers to equal √½ gains and is layout-changing mono→stereo" {
-    const port = @import("port.zig");
+    const port = core.port;
     const Pan = ConstantPowerPan(f32num);
     try testing.expect(port.classify(Pan) == .Map);
     try testing.expect(port.MapInPort(Pan).Elem == types.Sample(f32));
@@ -691,7 +614,7 @@ fn oracleMix(
 }
 
 test "MixMatrix mono→stereo / stereo→mono classify as layout-changing Maps" {
-    const port = @import("port.zig");
+    const port = core.port;
     const Up = Upmix(f32num, .mono, .stereo);
     const Dn = Downmix(f32num, .stereo, .mono);
     try testing.expect(port.classify(Up) == .Map);
@@ -717,7 +640,7 @@ test "canonical 5.1→stereo downmix matches the independent matrix-vector oracl
     blk.process(in, out);
 
     // Oracle over the SAME canonical matrix, computed independently.
-    const m = canonicalMixMatrix(.surround_5_1, .stereo).?;
+    const m = layout.canonicalMixMatrix(.surround_5_1, .stereo).?;
     var oin: [6][]const f32 = undefined;
     for (0..6) |c| oin[c] = in_buf[c * n ..][0..n];
     var oout_buf: [2 * n]f32 = undefined;
@@ -760,14 +683,14 @@ test "canonical 5.1↔7.1 up/down-mix round-trips the front bed and folds the su
 
 test "canonicalMixMatrix registers only the positional pairs (the L2 boundary)" {
     // Registered positional pairs return a matrix.
-    try testing.expect(canonicalMixMatrix(.mono, .stereo) != null);
-    try testing.expect(canonicalMixMatrix(.stereo, .surround_5_1) != null);
-    try testing.expect(canonicalMixMatrix(.surround_7_1, .surround_5_1) != null);
+    try testing.expect(layout.canonicalMixMatrix(.mono, .stereo) != null);
+    try testing.expect(layout.canonicalMixMatrix(.stereo, .surround_5_1) != null);
+    try testing.expect(layout.canonicalMixMatrix(.surround_7_1, .surround_5_1) != null);
     // An unregistered layout (discrete bus / ambisonic) has no canonical matrix —
     // the data behind negotiation rejecting the pair as a hard mismatch.
     const amb: types.ChannelLayout = .{ .ambisonic = .{ .order = 1, .ordering = .acn, .norm = .sn3d } };
-    try testing.expect(canonicalMixMatrix(.stereo, amb) == null);
-    try testing.expect(canonicalMixMatrix(.{ .discrete = 2 }, .stereo) == null);
+    try testing.expect(layout.canonicalMixMatrix(.stereo, amb) == null);
+    try testing.expect(layout.canonicalMixMatrix(.{ .discrete = 2 }, .stereo) == null);
 }
 
 test "Balance attenuates one channel only; center is unity" {
@@ -821,7 +744,7 @@ test "Width: unity preserves, zero collapses to mid, double drops the mid at the
 // --- VBAP ------------------------------------------------------------------
 
 test "Vbap classifies as a layout-changing Map mono→5.1" {
-    const port = @import("port.zig");
+    const port = core.port;
     const V = Vbap(f32num, .surround_5_1);
     try testing.expect(port.classify(V) == .Map);
     try testing.expect(port.MapInPort(V).Elem == types.Sample(f32));
@@ -899,7 +822,7 @@ fn oracleOrder1(az_deg: f32, el_deg: f32) [4]f32 {
 }
 
 test "AmbisonicEncode classifies as a layout-changing Map mono→ambisonic1" {
-    const port = @import("port.zig");
+    const port = core.port;
     const E = AmbisonicEncode(f32num, 1);
     const amb1: types.ChannelLayout = .{ .ambisonic = .{ .order = 1, .ordering = .acn, .norm = .sn3d } };
     try testing.expect(port.classify(E) == .Map);
@@ -937,7 +860,7 @@ test "AmbisonicEncode: the omni W channel is direction-independent (always the i
 // --- AmbisonicDecode -------------------------------------------------------
 
 test "AmbisonicDecode classifies as a layout-changing Map ambisonic1→stereo" {
-    const port = @import("port.zig");
+    const port = core.port;
     const D = AmbisonicDecode(f32num, 1, .stereo);
     const amb1: types.ChannelLayout = .{ .ambisonic = .{ .order = 1, .ordering = .acn, .norm = .sn3d } };
     try testing.expect(port.classify(D) == .Map);

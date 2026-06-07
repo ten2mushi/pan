@@ -50,7 +50,9 @@
 //!     so the modulation is zipper-free.
 
 const std = @import("std");
-const types = @import("types.zig");
+const core = @import("pan_core");
+const types = core.types;
+const primitives = @import("../primitives.zig");
 
 /// The LFO output value at normalized phase `p ∈ [0, 1)`, before `amplitude`/
 /// `offset` scaling. `sine` is the only bandlimited member; `triangle`/`saw`/
@@ -107,13 +109,13 @@ pub const Lfo = struct {
         for (out) |*o| o.value = v;
         // Advance phase by the block length and wrap into [0, 1).
         var p = self.phase + self.increment * @as(f32, @floatFromInt(out.len));
-        p -= @floor(p);
+        p = primitives.wrapPhase(p);
         self.phase = p;
     }
 };
 
 test "Lfo: classifies as a zero-input Scalar source" {
-    const port = @import("port.zig");
+    const port = core.port;
     try std.testing.expect(port.classify(Lfo) == .Map);
     try std.testing.expect(comptime port.isSource(Lfo));
     try std.testing.expect(port.MapOutPort(Lfo).Elem == types.Scalar(f32));
@@ -197,7 +199,7 @@ pub const Sine = struct {
     /// One sample, advancing the phase. The per-sample core a `Voice` drives.
     pub fn tick(self: *Self) f32 {
         const v = @sin(tau * self.phase);
-        self.phase = self.phase + self.increment - @floor(self.phase + self.increment);
+        self.phase = primitives.advancePhase(self.phase, self.increment);
         return v;
     }
     /// out.len == pull N (the source's length comes from the demand, SR1).
@@ -227,7 +229,7 @@ pub const PolyBlepSaw = struct {
     pub fn tick(self: *Self) f32 {
         const naive = 2.0 * self.phase - 1.0;
         const v = naive - polyBlep(self.phase, self.increment);
-        self.phase = self.phase + self.increment - @floor(self.phase + self.increment);
+        self.phase = primitives.advancePhase(self.phase, self.increment);
         return v;
     }
     pub fn process(self: *Self, out: []types.Sample(f32)) void {
@@ -259,9 +261,9 @@ pub const PolyBlepSquare = struct {
         v += polyBlep(self.phase, self.increment); // rising edge at phase 0
         // falling edge sits at phase 0.5 — correct it at the half-shifted phase.
         var t2 = self.phase + 0.5;
-        t2 -= @floor(t2);
+        t2 = primitives.wrapPhase(t2);
         v -= polyBlep(t2, self.increment);
-        self.phase = self.phase + self.increment - @floor(self.phase + self.increment);
+        self.phase = primitives.advancePhase(self.phase, self.increment);
         return v;
     }
     pub fn process(self: *Self, out: []types.Sample(f32)) void {
@@ -343,7 +345,7 @@ pub const Wavetable = struct {
         const a = self.table[idx % len];
         const b = self.table[(idx + 1) % len];
         const v = a + (b - a) * frac;
-        self.phase = self.phase + self.increment - @floor(self.phase + self.increment);
+        self.phase = primitives.advancePhase(self.phase, self.increment);
         return v;
     }
     pub fn process(self: *Self, out: []types.Sample(f32)) void {
@@ -352,7 +354,7 @@ pub const Wavetable = struct {
 };
 
 test "audio sources: classify as zero-input Sample(f32) sources" {
-    const port = @import("port.zig");
+    const port = core.port;
     inline for (.{ Sine, PolyBlepSaw, PolyBlepSquare, Noise, Constant, Wavetable }) |Osc| {
         try std.testing.expect(port.classify(Osc) == .Map);
         try std.testing.expect(comptime port.isSource(Osc));

@@ -18,7 +18,7 @@
 //!      pool and the two `2N` DMA ping-pong buffers all live in static `.bss`; the
 //!      render entry is shaped like the I2S DMA interrupt that drives it on an MCU.
 
-const root = @import("root.zig");
+const root = @import("pan");
 
 // --- Obligation 1: comptime-evaluable commit (f32 smoke graph) --------------
 
@@ -42,9 +42,9 @@ const num = root.embedded.num;
 const N = root.embedded.N;
 
 /// The RX I2S DMA transport (codec → graph): a `2N`-frame circular buffer in `.bss`.
-var rx: @import("io.zig").I2sDma(num, N) = .{};
+var rx: root.io.I2sDma(num, N) = .{};
 /// The TX I2S DMA transport (graph → codec).
-var tx: @import("io.zig").I2sDma(num, N) = .{};
+var tx: root.io.I2sDma(num, N) = .{};
 
 /// The fully-monomorphized q15 executor. Its colored pool (`exec.pool`) is the
 /// static render memory in `.bss`; the four instances are seeded here — a q15 gain

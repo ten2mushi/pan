@@ -26,11 +26,23 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const types = @import("types.zig");
-const numeric = @import("numeric.zig");
-const engine = @import("engine.zig");
-const control = @import("control.zig");
-const synth = @import("synth.zig");
+const core = @import("pan_core");
+const dsp = @import("pan_dsp");
+const types = core.types;
+const numeric = core.numeric;
+const engine = core.engine;
+const control = core.control;
+const synth = dsp.synth;
+const resample = core.resample;
+const backend = core.backend;
+
+/// Re-exports of the resampler and transport/backend seam (moved to the core
+/// layer in `resample.zig` / `backend.zig`) so this file's platform backends and
+/// external callers keep resolving these names unchanged.
+pub const RuntimeResampler = resample.RuntimeResampler;
+pub const RenderFn = backend.RenderFn;
+pub const AudioBackend = backend.AudioBackend;
+pub const Transport = backend.Transport;
 
 // ===========================================================================
 // LPCM sample formats
@@ -737,127 +749,6 @@ pub fn writeFeatureMatrix(path: []const u8, matrix: anytype) !void {
     });
 }
 
-/// `RuntimeResampler` — a streaming rational `p:q` (out:in) windowed-sinc polyphase
-/// resampler with a RUNTIME ratio (the rates come from the negotiation pass, not a
-/// comptime monomorph like `spectral.Resampler`), the sample-rate-conversion
-/// citizen at the I/O boundary where the device rate meets the pipeline rate.
-///
-/// It is **drift-free by construction**: `needed_input(want)` is **phase-stateful**
-/// — `(acc + want·q) / p` against the live phase accumulator — so it reports the
-/// EXACT number of input samples needed for `want` outputs *this* call (470 or 471
-/// for 160:147 at N=512, averaging 470.4 with no accumulation). The caller produces
-/// exactly that many; `process` consumes exactly that many and emits exactly `want`.
-/// A fixed per-callback input count (e.g. the static op-list's `ceil`) would drift
-/// for a non-integer ratio — that is why a correct mid-graph resampler needs the
-/// dynamic per-callback count the runtime render computes from this method.
-///
-/// State: a windowed-sinc prototype (built once at `init` from `p:q`), a per-channel
-/// circular history of the last `ksup` input samples (the FIR support, zero-primed →
-/// the `algorithmic_latency` group-delay priming), and the phase `acc ∈ [0,p)`.
-/// Buffers are plane-major f32 (`channels` planes); each plane resamples in lockstep.
-pub const RuntimeResampler = struct {
-    proto: []f32, // taps coefficients, upsampled-grid
-    taps: usize,
-    p: usize, // out_per_in numerator (output rate factor)
-    q: usize, // out_per_in denominator (input rate factor)
-    channels: usize,
-    ksup: usize, // FIR taps per polyphase subfilter = ceil(taps/p)
-    hist: []f32, // channels * ksup, per-channel circular history (cursor shared)
-    cursor: usize = 0, // next slot to overwrite (oldest)
-    acc: usize = 0, // phase accumulator in [0, p)
-    half: usize, // prototype half-width (taps each side), for the group delay
-
-    pub fn init(alloc: std.mem.Allocator, p: usize, q: usize, channels: usize, half: usize) !RuntimeResampler {
-        std.debug.assert(p >= 1 and q >= 1 and channels >= 1 and half >= 1);
-        const up = @max(p, q);
-        const taps = 2 * half * up + 1;
-        const ksup = (taps + p - 1) / p;
-        const proto = try alloc.alloc(f32, taps);
-        buildProto(proto, taps, half, up, p);
-        const hist = try alloc.alloc(f32, channels * ksup);
-        @memset(hist, 0);
-        return .{ .proto = proto, .taps = taps, .p = p, .q = q, .channels = channels, .ksup = ksup, .hist = hist, .half = half };
-    }
-
-    pub fn deinit(self: *RuntimeResampler, alloc: std.mem.Allocator) void {
-        alloc.free(self.proto);
-        alloc.free(self.hist);
-    }
-
-    /// Group delay in OUTPUT samples. The linear-phase prototype centre sits at
-    /// `half·up` upsampled samples; with this `process`'s compute-then-consume
-    /// ordering an impulse at input 0 peaks at output `(half·up + p)/q` (verified by
-    /// the impulse latency probe). Exact for ratios where `q | (half·up + p)`.
-    pub fn latency(self: *const RuntimeResampler) usize {
-        const up = @max(self.p, self.q);
-        return (self.half * up + self.p) / self.q;
-    }
-
-    /// EXACT input samples needed to produce `want` outputs from the current phase
-    /// (drift-free). The caller (the dynamic-count render) produces precisely this.
-    pub fn needed_input(self: *const RuntimeResampler, want: usize) usize {
-        return (self.acc + want * self.q) / self.p;
-    }
-
-    /// Resample `want` outputs, consuming exactly `needed_input(want)` inputs.
-    /// `in`/`out` are plane-major f32 (`channels` planes of `in_count`/`want`).
-    pub fn process(self: *RuntimeResampler, in: []const f32, in_count: usize, out: []f32, want: usize) void {
-        var consumed: usize = 0;
-        var j: usize = 0;
-        while (j < want) : (j += 1) {
-            // Output j at the current history + phase `acc`.
-            var c: usize = 0;
-            while (c < self.channels) : (c += 1) {
-                var y: f32 = 0;
-                var i: usize = 0;
-                var k: usize = self.acc;
-                while (k < self.taps) : (k += self.p) {
-                    y += self.proto[k] * self.histGet(c, i);
-                    i += 1;
-                }
-                out[c * want + j] = y;
-            }
-            // Advance the phase; consume one input each time it wraps past p.
-            self.acc += self.q;
-            while (self.acc >= self.p) {
-                self.acc -= self.p;
-                var cc: usize = 0;
-                while (cc < self.channels) : (cc += 1)
-                    self.hist[cc * self.ksup + self.cursor] = in[cc * in_count + consumed];
-                self.cursor += 1;
-                if (self.cursor == self.ksup) self.cursor = 0;
-                consumed += 1;
-            }
-        }
-    }
-
-    /// The `i`-th most recent input sample of channel `c` (0 = newest); reads zero
-    /// before the stream has supplied it (the priming pre-roll).
-    fn histGet(self: *const RuntimeResampler, c: usize, i: usize) f32 {
-        const slot = (self.cursor + self.ksup - 1 - (i % self.ksup)) % self.ksup;
-        return self.hist[c * self.ksup + slot];
-    }
-};
-
-/// Build a windowed-sinc prototype FIR of `taps` taps, centre at `half·up`, cutoff
-/// `π/up`, normalized to unity DC gain × `gain` (the upsample-energy compensation).
-fn buildProto(proto: []f32, taps: usize, half: usize, up: usize, gain: usize) void {
-    const center: f64 = @floatFromInt(half * up);
-    const fc: f64 = 1.0 / @as(f64, @floatFromInt(up));
-    var sum: f64 = 0;
-    for (proto, 0..) |*coef, i| {
-        const n: f64 = @as(f64, @floatFromInt(i)) - center;
-        const sinc: f64 = if (n == 0) fc else @sin(std.math.pi * fc * n) / (std.math.pi * n);
-        const wphase = 2.0 * std.math.pi * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(taps - 1));
-        const win: f64 = 0.5 * (1.0 - @cos(wphase));
-        const v = sinc * win;
-        coef.* = @floatCast(v);
-        sum += v;
-    }
-    const g: f64 = @as(f64, @floatFromInt(gain)) / sum;
-    for (proto) |*coef| coef.* = @floatCast(@as(f64, coef.*) * g);
-}
-
 // ===========================================================================
 // Asrc — the device-boundary adaptive (asynchronous) sample-rate converter
 // ===========================================================================
@@ -1116,38 +1007,6 @@ pub fn SamplePlayer(comptime num: numeric.Numeric) type {
 // ===========================================================================
 // The device-transport HAL — one interface, two desktop backends
 // ===========================================================================
-
-/// The render callback the device invokes: it is the realtime `PullRoot`. The
-/// backend mints a `RealtimeToken` on its own audio thread (closing the FTZ
-/// footgun) and hands it to the user render function along with the output frame
-/// buffer and the frame count for this callback.
-pub const RenderFn = *const fn (user: ?*anyopaque, token: engine.RealtimeToken, out: []f32, frames: usize) void;
-
-/// A device backend: open a stream of `(sample_rate, channels, block_size)`,
-/// start/stop the callback-driven transport, close. Implemented per platform; the
-/// engine drives any backend through this seam unchanged.
-pub const AudioBackend = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const Config = struct {
-        sample_rate: u32 = 48_000,
-        channels: u16 = 2,
-        block_size: usize = 512,
-    };
-
-    pub const VTable = struct {
-        start: *const fn (ptr: *anyopaque, cfg: Config, render: RenderFn, user: ?*anyopaque) anyerror!void,
-        stop: *const fn (ptr: *anyopaque) void,
-    };
-
-    pub fn start(self: AudioBackend, cfg: Config, render: RenderFn, user: ?*anyopaque) !void {
-        return self.vtable.start(self.ptr, cfg, render, user);
-    }
-    pub fn stop(self: AudioBackend) void {
-        self.vtable.stop(self.ptr);
-    }
-};
 
 /// The platform's default output sink, selected at comptime by target OS. On an
 /// unsupported target it is the no-op backend (the seam still compiles, so the
@@ -1760,7 +1619,7 @@ test "I2sDma ping-pong: HT/TC select the half the processing side owns" {
 }
 
 test "I2sDmaSource/Sink are a Source/Sink that bridge the active DMA half" {
-    const pport = @import("port.zig");
+    const pport = core.port;
     const num = numeric.numericFor(.i16, .{});
     const N = 4;
     // A Source has zero sample inputs (its output length is the pull demand);
@@ -1785,59 +1644,6 @@ test "I2sDmaSource/Sink are a Source/Sink that bridge the active DMA half" {
 // ===========================================================================
 // Transport / timeline + MIDI event ingestion (the Instrument front-end)
 // ===========================================================================
-
-/// `Transport` — the musical timeline: a sample-accurate play position the event
-/// lane timestamps against, plus tempo and loop points. The engine advances it by
-/// the block length each render, so an offline bounce is a **pure function of the
-/// transport** (bit-reproducible regardless of wall-clock). Seekable and loopable;
-/// external sync (MIDI clock / Ableton Link) would sit here (not implemented).
-pub const Transport = struct {
-    /// Sample-accurate play position (samples since transport start or last seek).
-    position: u64 = 0,
-    /// The render sample rate, for the seconds / PPQ conversions.
-    sample_rate: f64 = 48_000,
-    /// Tempo in quarter notes per minute (BPM).
-    tempo_bpm: f64 = 120,
-    /// Whether the transport is rolling (a stopped transport holds its position).
-    playing: bool = true,
-    /// Loop region: when enabled and `position` reaches `loop_end`, it wraps back to
-    /// `loop_start` (sample-accurate, the loop length preserved across the wrap).
-    loop_enabled: bool = false,
-    loop_start: u64 = 0,
-    loop_end: u64 = 0,
-
-    /// Advance by `n` samples (one render block). A no-op while stopped. Wraps inside
-    /// an active loop region so a looped bounce repeats deterministically.
-    pub fn advance(self: *Transport, n: usize) void {
-        if (!self.playing) return;
-        self.position += n;
-        if (self.loop_enabled and self.loop_end > self.loop_start and self.position >= self.loop_end) {
-            const span = self.loop_end - self.loop_start;
-            self.position = self.loop_start + (self.position - self.loop_start) % span;
-        }
-    }
-    /// Jump to an absolute sample position (sample-accurate seek).
-    pub fn seek(self: *Transport, pos: u64) void {
-        self.position = pos;
-    }
-    pub fn setTempo(self: *Transport, bpm: f64) void {
-        self.tempo_bpm = bpm;
-    }
-    /// Enable a loop region `[start, end)`; `end ≤ start` disables looping.
-    pub fn setLoop(self: *Transport, start: u64, end: u64) void {
-        self.loop_start = start;
-        self.loop_end = end;
-        self.loop_enabled = end > start;
-    }
-    /// Elapsed seconds at the current position.
-    pub fn seconds(self: Transport) f64 {
-        return @as(f64, @floatFromInt(self.position)) / self.sample_rate;
-    }
-    /// Musical position in quarter notes (PPQ) = seconds · tempo / 60.
-    pub fn ppq(self: Transport) f64 {
-        return self.seconds() * self.tempo_bpm / 60.0;
-    }
-};
 
 /// `MidiEventSource(Event)` — the MIDI-ingestion adapter that bridges a live device
 /// (or a parsed MIDI file / offline timeline) into the engine's out-of-band event
@@ -1912,7 +1718,7 @@ test "MidiEventSource: buffers and exposes a lane of NoteEvents" {
 }
 
 test "PrefetchSource: pops FIFO, holds last on underrun, exhausts on EOS+drain" {
-    const pport = @import("port.zig");
+    const pport = core.port;
     const num = numeric.numericFor(.f32, .{});
     const Src = PrefetchSource(num, 8);
     // Zero-sample-input Map Source (roots its path like LpcmSource).

@@ -29,8 +29,9 @@
 //! by a `switch` over the count.
 
 const std = @import("std");
-const types = @import("types.zig");
-const numeric = @import("numeric.zig");
+const core = @import("pan_core");
+const types = core.types;
+const numeric = core.numeric;
 
 /// Is this lane a floating-point type? Selects the float vs fixed-point kernel.
 fn isFloat(comptime T: type) bool {
@@ -1957,7 +1958,7 @@ pub fn DryWet(comptime num: numeric.Numeric) type {
 // ===========================================================================
 
 const testing = std.testing;
-const port = @import("port.zig");
+const port = core.port;
 
 const f32num = numeric.numericFor(.f32, .{});
 const i16num = numeric.numericFor(.i16, .{});

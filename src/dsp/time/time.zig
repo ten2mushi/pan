@@ -36,7 +36,8 @@
 //! hop, never once per render call.
 
 const std = @import("std");
-const types = @import("types.zig");
+const core = @import("pan_core");
+const types = core.types;
 
 /// `DelayLine(Elem, len)` — a pure `len`-sample delay: `out[n] = in[n − len]`,
 /// with the first `len` outputs drawn from the zero-initialized ring (silence
@@ -232,7 +233,7 @@ test "PlanarUnitDelay is a one-sample z^-1 over stereo and carries state across 
 }
 
 test "PlanarDelayLine declares delay_len and classifies as a delay element Map" {
-    const port = @import("port.zig");
+    const port = core.port;
     const PD = PlanarDelayLine(f32, .{ .discrete = 4 }, 64);
     try testing.expect(port.classify(PD) == .Map);
     try testing.expect(@hasDecl(PD, "delay_len"));

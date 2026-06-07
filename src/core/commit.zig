@@ -69,11 +69,11 @@ const std = @import("std");
 const graph = @import("graph.zig");
 const port = @import("port.zig");
 const types = @import("types.zig");
-const spatial = @import("spatial.zig");
+const layout = @import("layout.zig");
 
 /// The registered positional layout pairs whose canonical up/down-mix matrix the
 /// negotiation pass may auto-insert. The coefficients come from ONE source of
-/// truth — the comptime `spatial.canonicalMixMatrix` — so the auto-inserted matrix
+/// truth — the comptime `layout.canonicalMixMatrix` — so the auto-inserted matrix
 /// is exactly the explicit `Upmix`/`Downmix` block's matrix.
 const RegLayoutPair = struct { from: types.ChannelLayout, to: types.ChannelLayout };
 const registered_layout_pairs = [_]RegLayoutPair{
@@ -89,7 +89,7 @@ const registered_layout_pairs = [_]RegLayoutPair{
 /// Fill `out` (row-major, `to_ch` rows of `from_ch`) with the canonical up/down-mix
 /// coefficients for the `(from_ch, to_ch)` registered positional pair; returns the
 /// coefficient count (`to_ch·from_ch`), or `null` if the pair is not registered. The
-/// runtime sibling of `spatial.canonicalMixMatrix` (a runtime coercion kernel cannot
+/// runtime sibling of `layout.canonicalMixMatrix` (a runtime coercion kernel cannot
 /// take a comptime layout), keyed by channel count — the registered positional
 /// layouts have distinct counts (1/2/6/8) so the count pair is unambiguous.
 pub fn runtimeMixMatrix(from_ch: usize, to_ch: usize, out: []f32) ?usize {
@@ -97,7 +97,7 @@ pub fn runtimeMixMatrix(from_ch: usize, to_ch: usize, out: []f32) ?usize {
         const fc = comptime pair.from.count();
         const tc = comptime pair.to.count();
         if (from_ch == fc and to_ch == tc) {
-            const m = comptime spatial.canonicalMixMatrix(pair.from, pair.to).?;
+            const m = comptime layout.canonicalMixMatrix(pair.from, pair.to).?;
             var idx: usize = 0;
             inline for (0..tc) |o| {
                 inline for (0..fc) |i| {
@@ -220,7 +220,7 @@ pub const RenderOp = struct {
     param_input_slots: [port.max_ports_per_direction]u8 = [_]u8{0} ** port.max_ports_per_direction,
     param_input_count: usize = 0,
     /// RUNTIME-bound marker: this op is an auto-inserted RESAMPLER coercion whose
-    /// `self_ptr` is an `io.RuntimeResampler`. The runtime render reads its
+    /// `self_ptr` is an `resample.RuntimeResampler`. The runtime render reads its
     /// phase-stateful `needed_input` to set the producer op's per-callback output
     /// count (the dynamic count that makes a non-integer SRC drift-free). False on
     /// the comptime path (no coercions are auto-inserted there). Carried IN the plan
@@ -358,7 +358,7 @@ fn gcd(a: usize, b: usize) usize {
 
 /// The windowed-sinc prototype half-width an auto-inserted resampler coercion uses.
 /// Shared between this pass (its declared `algorithmic_latency`) and the runtime
-/// engine's bound `io.RuntimeResampler` kernel, so the declared latency matches the
+/// engine's bound `resample.RuntimeResampler` kernel, so the declared latency matches the
 /// kernel's actual group delay.
 pub const resampler_half: usize = 16;
 
