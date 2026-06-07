@@ -30,9 +30,6 @@ An experiment is named `<input>_<mode>`. **Inputs** (in `experiments.py`): `ande
 — add your own by dropping a file in `data/input/` and one line in `INPUTS`. **Modes** are
 listed below. `--list` prints every registered combination.
 
-> New here? Read **`PIPELINES.md`** for a step-by-step dump (preprocess → render) of
-> exactly what happens, with parameters — enough to reproduce by hand.
-
 `render.py` resolves the experiment, then runs **decode → frequency pre-scan →
 analyze → GPU capture → stamp config**, caching every stage. The output folder is
 
@@ -61,7 +58,6 @@ and every forwarded viewer parameter.
 | `capture_webgl.mjs` | Headless-Chrome frame capture (DevTools Protocol, zero npm deps) → mp4 with audio muxed (silent intermediate auto-deleted). |
 | `probe.py` | Thin mono/stereo probe: is this input *usably* stereo? Used to gate `channels=stereo`. |
 | `spectrogram.py` | Wide, high-res STFT spectrogram PNG from the same feature matrix (`python spectrogram.py <input>`; see below). |
-| `PIPELINES.md` | Concise step-by-step dump of the whole pipeline (preprocess + render) with parameters — the quickest way to understand the system. |
 
 ## Modes
 
